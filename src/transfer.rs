@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use futures::stream::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -10,6 +11,8 @@ use crate::config::BigstoreConfig;
 use crate::filter;
 use crate::git;
 use crate::types::{HashFunction, Hexdigest, Pointer};
+
+const DEFAULT_CONCURRENCY: usize = 8;
 
 /// The result of a push/pull operation.
 pub struct TransferSummary {
@@ -289,17 +292,34 @@ pub async fn push(tracked: &[(String, String)]) -> Result<TransferSummary> {
     let cfg = BigstoreConfig::find_and_load(&repo_root)?;
     let store = backend::from_config(&cfg)?;
 
+    // Resolve pointers sequentially (fast local git calls)
+    let mut work: Vec<(String, Pointer)> = Vec::new();
+    for (path, _filter) in tracked {
+        if let Some(p) = filter::read_pointer_from_git(path)? {
+            work.push((path.clone(), p));
+        }
+    }
+
     let mp = MultiProgress::new();
-    let pb = mp.add(progress_bar(tracked.len() as u64));
+    let pb = mp.add(progress_bar(work.len() as u64));
     let mut summary = TransferSummary::new();
 
-    for (path, _filter) in tracked {
-        let pointer = match filter::read_pointer_from_git(path)? {
-            Some(p) => p,
-            None => continue,
-        };
+    let results: Vec<_> = futures::stream::iter(work.iter().map(|(path, pointer)| {
+        let store = &store;
+        let cfg = &cfg;
+        let git_dir = &git_dir;
+        let pb = &pb;
+        async move {
+            let outcome = upload_one(store, cfg, git_dir, path, pointer, pb).await;
+            (path.clone(), outcome)
+        }
+    }))
+    .buffer_unordered(DEFAULT_CONCURRENCY)
+    .collect()
+    .await;
 
-        match upload_one(&store, &cfg, &git_dir, path, &pointer, &pb).await {
+    for (path, result) in results {
+        match result {
             Ok(UploadOutcome::Uploaded) => summary.uploaded += 1,
             Ok(UploadOutcome::Skipped) => summary.skipped += 1,
             Ok(UploadOutcome::NotCached) => {
@@ -308,7 +328,7 @@ pub async fn push(tracked: &[(String, String)]) -> Result<TransferSummary> {
             }
             Err(e) => {
                 summary.failed.push(TransferError {
-                    path: path.clone(),
+                    path,
                     error: format!("{e:#}"),
                 });
             }
@@ -325,17 +345,35 @@ pub async fn pull(tracked: &[(String, String)]) -> Result<TransferSummary> {
     let cfg = BigstoreConfig::find_and_load(&repo_root)?;
     let store = backend::from_config(&cfg)?;
 
+    // Resolve pointers sequentially (fast local git calls)
+    let mut work: Vec<(String, Pointer)> = Vec::new();
+    for (path, _filter) in tracked {
+        if let Some(p) = filter::read_pointer_from_git(path)? {
+            work.push((path.clone(), p));
+        }
+    }
+
     let mp = MultiProgress::new();
-    let pb = mp.add(progress_bar(tracked.len() as u64));
+    let pb = mp.add(progress_bar(work.len() as u64));
     let mut summary = TransferSummary::new();
 
-    for (path, _filter) in tracked {
-        let pointer = match filter::read_pointer_from_git(path)? {
-            Some(p) => p,
-            None => continue,
-        };
+    let results: Vec<_> = futures::stream::iter(work.iter().map(|(path, pointer)| {
+        let store = &store;
+        let cfg = &cfg;
+        let git_dir = &git_dir;
+        let repo_root = &repo_root;
+        let pb = &pb;
+        async move {
+            let outcome = download_one(store, cfg, git_dir, repo_root, path, pointer, pb).await;
+            (path.clone(), outcome)
+        }
+    }))
+    .buffer_unordered(DEFAULT_CONCURRENCY)
+    .collect()
+    .await;
 
-        match download_one(&store, &cfg, &git_dir, &repo_root, path, &pointer, &pb).await {
+    for (path, result) in results {
+        match result {
             Ok(DownloadOutcome::Downloaded) => {
                 summary.downloaded += 1;
                 summary.verified += 1;
@@ -343,13 +381,13 @@ pub async fn pull(tracked: &[(String, String)]) -> Result<TransferSummary> {
             Ok(DownloadOutcome::Skipped) => summary.skipped += 1,
             Ok(DownloadOutcome::NotFound) => {
                 summary.failed.push(TransferError {
-                    path: path.clone(),
+                    path,
                     error: "not found on remote".to_string(),
                 });
             }
             Err(e) => {
                 summary.failed.push(TransferError {
-                    path: path.clone(),
+                    path,
                     error: format!("{e:#}"),
                 });
             }
