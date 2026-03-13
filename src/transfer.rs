@@ -12,7 +12,7 @@ use crate::filter;
 use crate::git;
 use crate::types::{HashFunction, Hexdigest, Pointer};
 
-const DEFAULT_CONCURRENCY: usize = 8;
+pub const DEFAULT_CONCURRENCY: usize = 8;
 
 /// The result of a push/pull operation.
 pub struct TransferSummary {
@@ -286,7 +286,7 @@ enum UploadOutcome {
 // Public API
 // ──────────────────────────────────────────────────
 
-pub async fn push(tracked: &[(String, String)]) -> Result<TransferSummary> {
+pub async fn push(tracked: &[(String, String)], concurrency: usize) -> Result<TransferSummary> {
     let repo_root = git::repo_root()?;
     let git_dir = git::git_dir()?;
     let cfg = BigstoreConfig::find_and_load(&repo_root)?;
@@ -314,7 +314,7 @@ pub async fn push(tracked: &[(String, String)]) -> Result<TransferSummary> {
             (path.clone(), outcome)
         }
     }))
-    .buffer_unordered(DEFAULT_CONCURRENCY)
+    .buffer_unordered(concurrency)
     .collect()
     .await;
 
@@ -339,7 +339,7 @@ pub async fn push(tracked: &[(String, String)]) -> Result<TransferSummary> {
     Ok(summary)
 }
 
-pub async fn pull(tracked: &[(String, String)]) -> Result<TransferSummary> {
+pub async fn pull(tracked: &[(String, String)], concurrency: usize) -> Result<TransferSummary> {
     let repo_root = git::repo_root()?;
     let git_dir = git::git_dir()?;
     let cfg = BigstoreConfig::find_and_load(&repo_root)?;
@@ -368,7 +368,7 @@ pub async fn pull(tracked: &[(String, String)]) -> Result<TransferSummary> {
             (path.clone(), outcome)
         }
     }))
-    .buffer_unordered(DEFAULT_CONCURRENCY)
+    .buffer_unordered(concurrency)
     .collect()
     .await;
 
