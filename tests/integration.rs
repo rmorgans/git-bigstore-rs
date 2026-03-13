@@ -917,3 +917,326 @@ fn log_copy_shows_c_with_both_paths() {
         "modified original should show ~ in same commit: {output}"
     );
 }
+
+// ──────────────────────────────────────────────────
+// DVC .dir tests
+// ──────────────────────────────────────────────────
+
+/// Helper: create a synthetic DVC .dir setup with N files in the DVC cache.
+/// Returns (dvc_file_path, Vec<(md5, relpath, content)>).
+fn setup_dvc_dir(t: &TestRepo, dvc_name: &str, files: &[(&str, &[u8])]) -> Vec<(String, String)> {
+    let dvc_cache_dir = t.repo_dir.join(".dvc/cache/files/md5");
+
+    // Create manifest entries and cache each file
+    let mut manifest_entries = Vec::new();
+    let mut info = Vec::new();
+    for (relpath, content) in files {
+        let md5_hash = format!("{:x}", md5::Md5::digest(content));
+
+        // Put blob in DVC cache
+        let shard = &md5_hash[..2];
+        let rest = &md5_hash[2..];
+        let cache_obj_dir = dvc_cache_dir.join(shard);
+        std::fs::create_dir_all(&cache_obj_dir).unwrap();
+        std::fs::write(cache_obj_dir.join(rest), content).unwrap();
+
+        manifest_entries.push(format!(r#"{{"md5":"{md5_hash}","relpath":"{relpath}"}}"#));
+        info.push((md5_hash, relpath.to_string()));
+    }
+
+    // Write manifest JSON to DVC cache
+    let manifest_json = format!("[{}]", manifest_entries.join(","));
+    let manifest_md5 = format!("{:x}", md5::Md5::digest(manifest_json.as_bytes()));
+    let shard = &manifest_md5[..2];
+    let rest = &manifest_md5[2..];
+    let manifest_cache_dir = dvc_cache_dir.join(shard);
+    std::fs::create_dir_all(&manifest_cache_dir).unwrap();
+    // Store without .dir extension (standard DVC cache layout)
+    std::fs::write(manifest_cache_dir.join(rest), &manifest_json).unwrap();
+
+    // Write the .dvc file
+    t.write_file(
+        dvc_name,
+        format!(
+            "outs:\n- md5: {manifest_md5}.dir\n  size: {}\n  nfiles: {}\n  hash: md5\n  path: models\n",
+            manifest_json.len(),
+            files.len()
+        )
+        .as_bytes(),
+    );
+
+    info
+}
+
+#[test]
+fn dvc_ls_lists_dir_entries() {
+    let t = TestRepo::new();
+    let files: &[(&str, &[u8])] = &[
+        ("weights/model.pt", b"model weights data"),
+        ("exports/out.onnx", b"onnx export data"),
+    ];
+    setup_dvc_dir(&t, "models.dvc", files);
+
+    let output = bigstore_ok(&t.repo_dir, &["dvc-ls", "models.dvc"]);
+    assert!(output.contains("weights/model.pt"), "should list model.pt: {output}");
+    assert!(output.contains("exports/out.onnx"), "should list out.onnx: {output}");
+}
+
+#[test]
+fn dvc_ls_rejects_single_file_dvc() {
+    let t = TestRepo::new();
+    let content = b"single file\n";
+    let md5_hash = format!("{:x}", md5::Md5::digest(content));
+    t.write_file(
+        "data.dvc",
+        format!("outs:\n- md5: {md5_hash}\n  size: {}\n  path: data.bin\n", content.len())
+            .as_bytes(),
+    );
+
+    let output = bigstore(&t.repo_dir, &["dvc-ls", "data.dvc"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("single-file") || stderr.contains("ref"),
+        "should suggest using ref instead: {stderr}"
+    );
+}
+
+#[test]
+fn import_dvc_dir_imports_multiple_files() {
+    let t = TestRepo::new();
+    let files: &[(&str, &[u8])] = &[
+        ("weights/model.pt", b"model weights data"),
+        ("exports/out.onnx", b"onnx export data"),
+        ("config.json", b"config data"),
+    ];
+    let info = setup_dvc_dir(&t, "models.dvc", files);
+
+    let output = bigstore(&t.repo_dir, &["import-dvc-dir", "models.dvc", "imported-models"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "import should succeed: {stderr}"
+    );
+
+    // Verify pointer files were written
+    for (_md5, relpath) in &info {
+        let pointer_path = t.repo_dir.join("imported-models").join(relpath);
+        assert!(pointer_path.exists(), "pointer should exist at {relpath}");
+        let content = std::fs::read_to_string(&pointer_path).unwrap();
+        assert!(content.starts_with("bigstore\n"), "should be a pointer: {content}");
+        assert!(content.contains("md5\n"), "should use md5 hash: {content}");
+    }
+
+    // Verify bigstore cache has the objects
+    for (md5, _relpath) in &info {
+        let bs_cache = t.repo_dir
+            .join(".git/bigstore/objects/md5")
+            .join(&md5[..2])
+            .join(&md5[2..]);
+        assert!(bs_cache.exists(), "object {md5} should be in bigstore cache");
+    }
+
+    // Verify suggested .gitattributes pattern
+    assert!(
+        stderr.contains("imported-models/**"),
+        "should suggest directory-scoped gitattributes: {stderr}"
+    );
+}
+
+#[test]
+fn import_dvc_dir_rejects_parent_dir_in_relpath() {
+    let t = TestRepo::new();
+
+    // Manually create a malicious manifest
+    let content = b"safe content";
+    let md5_hash = format!("{:x}", md5::Md5::digest(content));
+    let dvc_cache_dir = t.repo_dir.join(".dvc/cache/files/md5");
+    let shard = &md5_hash[..2];
+    let rest = &md5_hash[2..];
+    std::fs::create_dir_all(dvc_cache_dir.join(shard)).unwrap();
+    std::fs::write(dvc_cache_dir.join(shard).join(rest), content).unwrap();
+
+    let manifest_json = format!(r#"[{{"md5":"{md5_hash}","relpath":"../../../etc/passwd"}}]"#);
+    let manifest_md5 = format!("{:x}", md5::Md5::digest(manifest_json.as_bytes()));
+    let mshard = &manifest_md5[..2];
+    let mrest = &manifest_md5[2..];
+    std::fs::create_dir_all(dvc_cache_dir.join(mshard)).unwrap();
+    std::fs::write(dvc_cache_dir.join(mshard).join(mrest), &manifest_json).unwrap();
+
+    t.write_file(
+        "evil.dvc",
+        format!(
+            "outs:\n- md5: {manifest_md5}.dir\n  size: {}\n  nfiles: 1\n  hash: md5\n  path: data\n",
+            manifest_json.len()
+        )
+        .as_bytes(),
+    );
+
+    let output = bigstore(&t.repo_dir, &["import-dvc-dir", "evil.dvc", "safe-dest"]);
+    assert!(!output.status.success(), "should reject path traversal");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".."), "error should mention '..': {stderr}");
+}
+
+#[test]
+fn import_dvc_dir_fails_on_missing_cache_blob() {
+    let t = TestRepo::new();
+    let dvc_cache_dir = t.repo_dir.join(".dvc/cache/files/md5");
+
+    // Create manifest pointing to a blob that doesn't exist in cache
+    let fake_md5 = "aa".repeat(16);
+    let manifest_json = format!(r#"[{{"md5":"{fake_md5}","relpath":"missing.bin"}}]"#);
+    let manifest_md5 = format!("{:x}", md5::Md5::digest(manifest_json.as_bytes()));
+    let shard = &manifest_md5[..2];
+    let rest = &manifest_md5[2..];
+    std::fs::create_dir_all(dvc_cache_dir.join(shard)).unwrap();
+    std::fs::write(dvc_cache_dir.join(shard).join(rest), &manifest_json).unwrap();
+
+    t.write_file(
+        "models.dvc",
+        format!(
+            "outs:\n- md5: {manifest_md5}.dir\n  size: {}\n  nfiles: 1\n  hash: md5\n  path: models\n",
+            manifest_json.len()
+        )
+        .as_bytes(),
+    );
+
+    let output = bigstore(&t.repo_dir, &["import-dvc-dir", "models.dvc", "dest"]);
+    assert!(!output.status.success(), "should fail for missing blob");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("FAILED") && stderr.contains("missing.bin"),
+        "should report which file failed: {stderr}"
+    );
+}
+
+#[test]
+fn import_dvc_dir_fails_on_existing_destination() {
+    let t = TestRepo::new();
+    let files: &[(&str, &[u8])] = &[
+        ("model.pt", b"model data"),
+    ];
+    setup_dvc_dir(&t, "models.dvc", files);
+
+    // Create a conflicting file at the destination
+    t.write_file("dest/model.pt", b"existing content");
+
+    let output = bigstore(&t.repo_dir, &["import-dvc-dir", "models.dvc", "dest"]);
+    assert!(!output.status.success(), "should fail when dest exists");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already exist"),
+        "should mention existing files: {stderr}"
+    );
+
+    // Verify original file was not overwritten
+    let content = std::fs::read_to_string(t.repo_dir.join("dest/model.pt")).unwrap();
+    assert_eq!(content, "existing content");
+}
+
+#[test]
+fn import_dvc_dir_force_overwrites() {
+    let t = TestRepo::new();
+    let files: &[(&str, &[u8])] = &[
+        ("model.pt", b"model data"),
+    ];
+    setup_dvc_dir(&t, "models.dvc", files);
+
+    // Create conflicting file
+    t.write_file("dest/model.pt", b"old content");
+
+    let output = bigstore(&t.repo_dir, &["import-dvc-dir", "models.dvc", "dest", "--force"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "force should succeed: {stderr}");
+
+    // Verify it was replaced with a pointer
+    let content = std::fs::read_to_string(t.repo_dir.join("dest/model.pt")).unwrap();
+    assert!(content.starts_with("bigstore\n"), "should be a pointer now: {content}");
+}
+
+#[test]
+fn import_dvc_dir_filters_by_pattern() {
+    let t = TestRepo::new();
+    let files: &[(&str, &[u8])] = &[
+        ("weights/model.pt", b"weights data"),
+        ("exports/out.onnx", b"onnx data"),
+        ("exports/backup.onnx", b"backup data"),
+        ("config.json", b"config"),
+    ];
+    setup_dvc_dir(&t, "models.dvc", files);
+
+    let output = bigstore(
+        &t.repo_dir,
+        &["import-dvc-dir", "models.dvc", "dest", "exports/*.onnx"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "filtered import should succeed: {stderr}");
+
+    // Only exports/*.onnx should be imported
+    assert!(t.repo_dir.join("dest/exports/out.onnx").exists());
+    assert!(t.repo_dir.join("dest/exports/backup.onnx").exists());
+    assert!(!t.repo_dir.join("dest/weights/model.pt").exists());
+    assert!(!t.repo_dir.join("dest/config.json").exists());
+}
+
+#[test]
+fn dvc_ls_rejects_path_traversal() {
+    let t = TestRepo::new();
+    let output = bigstore(&t.repo_dir, &["dvc-ls", "../../../etc/passwd"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".."), "should reject path traversal: {stderr}");
+
+    let output = bigstore(&t.repo_dir, &["dvc-ls", "/etc/passwd"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("relative"),
+        "should reject absolute path: {stderr}"
+    );
+}
+
+#[test]
+fn import_dvc_dir_rejects_source_path_traversal() {
+    let t = TestRepo::new();
+    let output = bigstore(
+        &t.repo_dir,
+        &["import-dvc-dir", "../../../etc/passwd", "dest"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".."), "should reject source traversal: {stderr}");
+}
+
+#[test]
+fn import_dvc_dir_rejects_dest_path_traversal() {
+    let t = TestRepo::new();
+    let files: &[(&str, &[u8])] = &[("f.bin", b"data")];
+    setup_dvc_dir(&t, "models.dvc", files);
+
+    let output = bigstore(
+        &t.repo_dir,
+        &["import-dvc-dir", "models.dvc", "../../../tmp/evil"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".."), "should reject dest traversal: {stderr}");
+}
+
+#[test]
+fn import_dvc_dir_suggests_directory_scoped_gitattributes() {
+    let t = TestRepo::new();
+    let files: &[(&str, &[u8])] = &[
+        ("file.bin", b"data"),
+    ];
+    setup_dvc_dir(&t, "models.dvc", files);
+
+    let output = bigstore(&t.repo_dir, &["import-dvc-dir", "models.dvc", "my-models"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "should succeed: {stderr}");
+    assert!(
+        stderr.contains("my-models/** filter=bigstore"),
+        "should suggest directory-scoped pattern, not per-file: {stderr}"
+    );
+}

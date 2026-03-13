@@ -77,6 +77,30 @@ enum Commands {
         dest: String,
     },
 
+    /// List files in a DVC .dir manifest
+    #[command(name = "dvc-ls")]
+    DvcLs {
+        /// Path to .dvc file (must be a .dir type)
+        source: String,
+    },
+
+    /// Import files from a DVC .dir manifest into bigstore
+    #[command(name = "import-dvc-dir")]
+    ImportDvcDir {
+        /// Path to .dvc file (must be a .dir type)
+        source: String,
+
+        /// Destination root directory for pointer files
+        dest_root: String,
+
+        /// Only import files matching these glob patterns (default: all)
+        patterns: Vec<String>,
+
+        /// Overwrite existing destination files
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Internal: clean filter (stdin -> stdout)
     #[command(name = "filter-clean", hide = true)]
     FilterClean,
@@ -103,6 +127,13 @@ async fn main() -> Result<()> {
         Commands::MigrateConfig { force } => cmd_migrate_config(force),
         Commands::Log { paths } => cmd_log(&paths),
         Commands::Ref { source, dest } => cmd_ref(&source, &dest),
+        Commands::DvcLs { source } => cmd_dvc_ls(&source),
+        Commands::ImportDvcDir {
+            source,
+            dest_root,
+            patterns,
+            force,
+        } => cmd_import_dvc_dir(&source, &dest_root, &patterns, force),
         Commands::FilterClean => filter::clean(),
         Commands::FilterSmudge => filter::smudge(),
     }
@@ -525,49 +556,27 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
     let git_dir = git::git_dir()?;
 
     // Reject paths that escape the repository
-    for (label, p) in [("source", source), ("dest", dest)] {
-        let path = Path::new(p);
-        anyhow::ensure!(!path.is_absolute(), "{label} must be a relative path: {p:?}");
-        anyhow::ensure!(
-            !path.components().any(|c| matches!(c, std::path::Component::ParentDir)),
-            "{label} must not contain '..': {p:?}"
-        );
-    }
+    validate_relative_path("source", source)?;
+    validate_relative_path("dest", dest)?;
 
     let source_path = repo_root.join(source);
     let (pointer, dvc_out_path) = dvc::parse_dvc_pointer(&source_path)?;
 
     // Try to import the object from DVC cache into bigstore cache
-    let dvc_cache = cache::dvc_cache_path(&repo_root, &pointer.hexdigest);
-    let bs_cache = cache::object_path(&git_dir, &pointer.hexdigest, pointer.hash_fn);
-
-    if dvc_cache.exists() && !bs_cache.exists() {
-        // Verify hash before importing
-        let actual = transfer::hash_file(&dvc_cache, pointer.hash_fn)?;
-        anyhow::ensure!(
-            actual == pointer.hexdigest,
-            "DVC cache integrity check failed: expected {}, got {actual}",
-            pointer.hexdigest
-        );
-
-        if let Some(parent) = bs_cache.parent() {
-            std::fs::create_dir_all(parent)?;
+    match cache::import_md5_from_dvc_cache(&repo_root, &git_dir, &pointer.hexdigest)? {
+        cache::DvcImportResult::Imported => {
+            eprintln!("Imported from DVC cache (verified): {dvc_out_path}");
         }
-        // Atomic persist — never leave partial files in cache
-        match cache::copy_atomically_noclobber(&dvc_cache, &bs_cache) {
-            Ok(()) => {}
-            Err(e) if bs_cache.exists() => {}
-            Err(e) => return Err(e),
+        cache::DvcImportResult::AlreadyCached => {
+            eprintln!("Already in bigstore cache: {dvc_out_path}");
         }
-        eprintln!("Imported from DVC cache (verified): {dvc_out_path}");
-    } else if bs_cache.exists() {
-        eprintln!("Already in bigstore cache: {dvc_out_path}");
-    } else {
-        anyhow::bail!(
-            "object not found in DVC cache at {}\n\
-             Run `dvc pull {source}` first to populate the DVC cache, then retry.",
-            cache::dvc_cache_path(&repo_root, &pointer.hexdigest).display()
-        );
+        cache::DvcImportResult::NotInDvcCache => {
+            anyhow::bail!(
+                "object not found in DVC cache at {}\n\
+                 Run `dvc pull {source}` first to populate the DVC cache, then retry.",
+                cache::dvc_cache_path(&repo_root, &pointer.hexdigest).display()
+            );
+        }
     }
 
     // Write the pointer file
@@ -585,6 +594,207 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
     eprintln!("  3. git commit -m 'add {dest}'");
     eprintln!("  4. git bigstore push");
 
+    Ok(())
+}
+
+fn cmd_dvc_ls(source: &str) -> Result<()> {
+    validate_relative_path("source", source)?;
+    let repo_root = git::repo_root()?;
+    let source_path = repo_root.join(source);
+    let (manifest_hash, entries) = resolve_dir_manifest(&repo_root, &source_path)?;
+
+    eprintln!(
+        "{} entries in {} (manifest md5:{manifest_hash})",
+        entries.len(),
+        source,
+    );
+    eprintln!();
+    for entry in &entries {
+        println!("  {}  {}", entry.md5, entry.relpath);
+    }
+
+    Ok(())
+}
+
+fn cmd_import_dvc_dir(
+    source: &str,
+    dest_root: &str,
+    patterns: &[String],
+    force: bool,
+) -> Result<()> {
+    validate_relative_path("source", source)?;
+    validate_relative_path("dest_root", dest_root)?;
+    let repo_root = git::repo_root()?;
+    let git_dir = git::git_dir()?;
+
+    let source_path = repo_root.join(source);
+    let (_manifest_hash, entries) = resolve_dir_manifest(&repo_root, &source_path)?;
+
+    // Filter entries by patterns (if any)
+    let entries = if patterns.is_empty() {
+        entries
+    } else {
+        let matchers: Vec<_> = patterns
+            .iter()
+            .map(|p| {
+                Glob::new(p)
+                    .with_context(|| format!("invalid glob pattern: {p:?}"))
+                    .map(|g| g.compile_matcher())
+            })
+            .collect::<Result<_>>()?;
+        entries
+            .into_iter()
+            .filter(|e| matchers.iter().any(|m| m.is_match(&e.relpath)))
+            .collect()
+    };
+
+    if entries.is_empty() {
+        eprintln!("No matching entries to import.");
+        return Ok(());
+    }
+
+    // Pre-check: fail if any destination exists (unless --force)
+    if !force {
+        let mut conflicts = Vec::new();
+        for entry in &entries {
+            let dest = repo_root.join(dest_root).join(&entry.relpath);
+            if dest.exists() {
+                conflicts.push(entry.relpath.clone());
+            }
+        }
+        if !conflicts.is_empty() {
+            eprintln!("Destination files already exist (use --force to overwrite):");
+            for c in &conflicts {
+                eprintln!("  {dest_root}/{c}");
+            }
+            anyhow::bail!(
+                "{} destination file(s) already exist",
+                conflicts.len()
+            );
+        }
+    }
+
+    // Import each entry
+    let mut imported = 0u64;
+    let mut cached = 0u64;
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for entry in &entries {
+        let hexdigest = &entry.md5;
+        let relpath = &entry.relpath;
+        let dest_path = repo_root.join(dest_root).join(relpath);
+
+        // Import from DVC cache into bigstore cache
+        match cache::import_md5_from_dvc_cache(&repo_root, &git_dir, hexdigest) {
+            Ok(cache::DvcImportResult::Imported) => imported += 1,
+            Ok(cache::DvcImportResult::AlreadyCached) => cached += 1,
+            Ok(cache::DvcImportResult::NotInDvcCache) => {
+                failed.push((
+                    relpath.clone(),
+                    format!(
+                        "not found in DVC cache at {}",
+                        cache::dvc_cache_path(&repo_root, hexdigest).display()
+                    ),
+                ));
+                continue;
+            }
+            Err(e) => {
+                failed.push((relpath.clone(), format!("{e:#}")));
+                continue;
+            }
+        }
+
+        // Write pointer file
+        let pointer = types::Pointer::new(types::HashFunction::Md5, hexdigest.clone());
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest_path, pointer.encode())?;
+    }
+
+    // Summary
+    let total = imported + cached;
+    eprintln!();
+    if imported > 0 {
+        eprintln!("{imported} file(s) imported from DVC cache (verified)");
+    }
+    if cached > 0 {
+        eprintln!("{cached} file(s) already in bigstore cache");
+    }
+    eprintln!("{total} pointer(s) written under {dest_root}/");
+
+    if !failed.is_empty() {
+        eprintln!();
+        for (path, err) in &failed {
+            eprintln!("FAILED: {path} — {err}");
+        }
+        anyhow::bail!("{} of {} entries failed", failed.len(), failed.len() + total as usize);
+    }
+
+    eprintln!();
+    eprintln!("Next steps:");
+    eprintln!("  1. echo '{dest_root}/** filter=bigstore' >> .gitattributes");
+    eprintln!("  2. git add {dest_root}/ .gitattributes");
+    eprintln!("  3. git commit -m 'import {dest_root} from DVC'");
+    eprintln!("  4. git bigstore push");
+
+    Ok(())
+}
+
+/// Parse a .dvc file as a .dir type and load its manifest entries from the DVC cache.
+fn resolve_dir_manifest(
+    repo_root: &Path,
+    source_path: &Path,
+) -> Result<(String, Vec<dvc::DirEntry>)> {
+    let kind = dvc::parse_dvc_file(source_path)?;
+    let (manifest_hash, _output_path) = match kind {
+        dvc::DvcKind::Dir {
+            manifest_hash,
+            output_path,
+        } => (manifest_hash, output_path),
+        dvc::DvcKind::File(..) => {
+            anyhow::bail!(
+                "{} is a single-file .dvc — use `git bigstore ref` instead",
+                source_path.display()
+            );
+        }
+    };
+
+    // Find the manifest in DVC cache
+    let manifest_digest = types::Hexdigest::new(&manifest_hash, types::HashFunction::Md5)?;
+    let manifest_path = cache::dvc_cache_path(repo_root, &manifest_digest);
+
+    // Also try with .dir suffix (some DVC versions store it this way)
+    let manifest_path_dir = manifest_path.with_extension("dir");
+
+    let actual_path = if manifest_path.exists() {
+        manifest_path
+    } else if manifest_path_dir.exists() {
+        manifest_path_dir
+    } else {
+        anyhow::bail!(
+            "DVC .dir manifest not found in cache.\n\
+             Expected at: {}\n\
+             Run `dvc pull {}` first to populate the DVC cache.",
+            manifest_path.display(),
+            source_path.display()
+        );
+    };
+
+    let entries = dvc::parse_dir_manifest(&actual_path)?;
+    Ok((manifest_hash, entries))
+}
+
+/// Reject absolute paths and path traversal.
+fn validate_relative_path(label: &str, p: &str) -> Result<()> {
+    let path = Path::new(p);
+    anyhow::ensure!(!path.is_absolute(), "{label} must be a relative path: {p:?}");
+    anyhow::ensure!(
+        !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "{label} must not contain '..': {p:?}"
+    );
     Ok(())
 }
 

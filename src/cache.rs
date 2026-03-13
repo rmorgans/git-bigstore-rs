@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::transfer;
 use crate::types::{HashFunction, Hexdigest};
 
 /// Root cache directory inside .git
@@ -68,6 +69,57 @@ pub fn copy_atomically_noclobber(src: &Path, dest: &Path) -> Result<()> {
 /// Copy a cached object to the working tree atomically.
 pub fn copy_to_working_tree(cache_path: &Path, dest: &Path) -> Result<()> {
     copy_atomically(cache_path, dest)
+}
+
+/// Result of attempting to import an MD5 object from the local DVC cache.
+pub enum DvcImportResult {
+    /// Object was verified and imported into bigstore cache.
+    Imported,
+    /// Object was already in bigstore cache (DVC cache not consulted).
+    AlreadyCached,
+    /// Object not found in DVC cache (and not in bigstore cache).
+    NotInDvcCache,
+}
+
+/// Import an MD5 object from the local DVC cache into the bigstore cache.
+///
+/// MD5-specific by design: DVC cache paths are always MD5-sharded,
+/// so this function only accepts MD5 hexdigests.
+///
+/// On success, the object is hash-verified and atomically persisted.
+/// Returns `Err` for integrity failures or I/O errors.
+pub fn import_md5_from_dvc_cache(
+    repo_root: &Path,
+    git_dir: &Path,
+    hexdigest: &Hexdigest,
+) -> Result<DvcImportResult> {
+    let bs_cache = object_path(git_dir, hexdigest, HashFunction::Md5);
+    if bs_cache.exists() {
+        return Ok(DvcImportResult::AlreadyCached);
+    }
+
+    let dvc_path = dvc_cache_path(repo_root, hexdigest);
+    if !dvc_path.exists() {
+        return Ok(DvcImportResult::NotInDvcCache);
+    }
+
+    // Verify hash before trusting DVC cache
+    let actual = transfer::hash_file(&dvc_path, HashFunction::Md5)
+        .context("failed to hash DVC cache object")?;
+    anyhow::ensure!(
+        actual == *hexdigest,
+        "DVC cache integrity check failed: expected {hexdigest}, got {actual}"
+    );
+
+    // Atomic persist to bigstore cache
+    if let Some(parent) = bs_cache.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match copy_atomically_noclobber(&dvc_path, &bs_cache) {
+        Ok(()) => Ok(DvcImportResult::Imported),
+        Err(_) if bs_cache.exists() => Ok(DvcImportResult::AlreadyCached),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
