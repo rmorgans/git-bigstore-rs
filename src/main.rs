@@ -15,7 +15,7 @@ mod transfer;
 mod types;
 
 #[derive(Parser)]
-#[command(name = "git-bigstore", version, about = "Large files in git, your bucket, one binary.")]
+#[command(name = "git-bigstore", version, about = "Large files in git, your bucket, one binary.", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -37,12 +37,20 @@ enum Commands {
     Push {
         /// Only push files matching these patterns
         patterns: Vec<String>,
+
+        /// Number of concurrent transfers (default: 8, env: BIGSTORE_JOBS)
+        #[arg(short, long)]
+        jobs: Option<usize>,
     },
 
     /// Download objects from remote storage (with integrity verification)
     Pull {
         /// Only pull files matching these patterns
         patterns: Vec<String>,
+
+        /// Number of concurrent transfers (default: 8, env: BIGSTORE_JOBS)
+        #[arg(short, long)]
+        jobs: Option<usize>,
     },
 
     /// Show status of tracked large files
@@ -89,8 +97,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { url, endpoint } => cmd_init(&url, endpoint.as_deref()).await,
-        Commands::Push { patterns } => cmd_push(&patterns).await,
-        Commands::Pull { patterns } => cmd_pull(&patterns).await,
+        Commands::Push { patterns, jobs } => cmd_push(&patterns, jobs).await,
+        Commands::Pull { patterns, jobs } => cmd_pull(&patterns, jobs).await,
         Commands::Status => cmd_status().await,
         Commands::MigrateConfig { force } => cmd_migrate_config(force),
         Commands::Log { paths } => cmd_log(&paths),
@@ -124,10 +132,11 @@ async fn cmd_init(url: &str, endpoint: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_push(patterns: &[String]) -> Result<()> {
+async fn cmd_push(patterns: &[String], jobs: Option<usize>) -> Result<()> {
     let repo_root = git::repo_root()?;
     let tracked = tracked_files(&repo_root, patterns)?;
-    let summary = transfer::push(&tracked).await?;
+    let concurrency = resolve_jobs(jobs)?;
+    let summary = transfer::push(&tracked, concurrency).await?;
     summary.print();
     if !summary.failed.is_empty() {
         anyhow::bail!("{} file(s) failed", summary.failed.len());
@@ -135,10 +144,11 @@ async fn cmd_push(patterns: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_pull(patterns: &[String]) -> Result<()> {
+async fn cmd_pull(patterns: &[String], jobs: Option<usize>) -> Result<()> {
     let repo_root = git::repo_root()?;
     let tracked = tracked_files(&repo_root, patterns)?;
-    let summary = transfer::pull(&tracked).await?;
+    let concurrency = resolve_jobs(jobs)?;
+    let summary = transfer::pull(&tracked, concurrency).await?;
     summary.print();
     if !summary.failed.is_empty() {
         anyhow::bail!("{} file(s) failed", summary.failed.len());
@@ -576,6 +586,21 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
     eprintln!("  4. git bigstore push");
 
     Ok(())
+}
+
+/// Resolve concurrency: --jobs flag > BIGSTORE_JOBS env > default (8).
+fn resolve_jobs(flag: Option<usize>) -> Result<usize> {
+    let jobs = match flag {
+        Some(n) => n,
+        None => match std::env::var("BIGSTORE_JOBS") {
+            Ok(s) => s
+                .parse::<usize>()
+                .context("BIGSTORE_JOBS must be a positive integer")?,
+            Err(_) => transfer::DEFAULT_CONCURRENCY,
+        },
+    };
+    anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
+    Ok(jobs)
 }
 
 /// Parse .gitattributes for bigstore filter patterns, then list matching tracked files.
