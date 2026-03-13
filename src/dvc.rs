@@ -56,7 +56,7 @@ mod tests {
         .unwrap();
         let (pointer, out_path) = parse_dvc_pointer(tmp.path()).unwrap();
         assert_eq!(pointer.hash_fn, HashFunction::Md5);
-        assert_eq!(pointer.hexdigest.as_str(), md5);
+        assert_eq!(pointer.hexdigest.to_string(), md5);
         assert_eq!(out_path, "model.bin");
     }
 

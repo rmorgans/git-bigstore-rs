@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use globset::Glob;
-use std::io::Write;
 use std::path::Path;
 
 mod backend;
@@ -270,7 +269,7 @@ fn cmd_log(paths: &[String]) -> Result<()> {
             // Path filter
             if !path_matchers.is_empty() {
                 let matches = path_matchers.iter().any(|m| m.is_match(new_path))
-                    || old_path.map_or(false, |op| path_matchers.iter().any(|m| m.is_match(op)));
+                    || old_path.is_some_and(|op| path_matchers.iter().any(|m| m.is_match(op)));
                 if !matches {
                     continue;
                 }
@@ -449,7 +448,7 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
         // Verify hash before importing
         let actual = transfer::hash_file(&dvc_cache, pointer.hash_fn)?;
         anyhow::ensure!(
-            &actual == &pointer.hexdigest,
+            actual == pointer.hexdigest,
             "DVC cache integrity check failed: expected {}, got {actual}",
             pointer.hexdigest
         );
@@ -458,15 +457,10 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         // Atomic persist — never leave partial files in cache
-        let mut tmp = tempfile::NamedTempFile::new_in(
-            bs_cache.parent().expect("cache path has parent"),
-        )?;
-        std::io::copy(&mut std::fs::File::open(&dvc_cache)?, &mut tmp)?;
-        tmp.flush()?;
-        match tmp.persist_noclobber(&bs_cache) {
-            Ok(_) => {}
-            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.error.into()),
+        match cache::copy_atomically_noclobber(&dvc_cache, &bs_cache) {
+            Ok(()) => {}
+            Err(e) if bs_cache.exists() => {}
+            Err(e) => return Err(e),
         }
         eprintln!("Imported from DVC cache (verified): {dvc_out_path}");
     } else if bs_cache.exists() {
@@ -529,11 +523,11 @@ fn tracked_files(repo_root: &Path, patterns: &[String]) -> Result<Vec<(String, S
     let mut results = Vec::new();
     for file in files.lines() {
         for (matcher, filter_name) in &attr_matchers {
-            if matcher.is_match(file) {
-                if user_matchers.is_empty() || user_matchers.iter().any(|m| m.is_match(file)) {
-                    results.push((file.to_string(), filter_name.clone()));
-                    break;
-                }
+            if matcher.is_match(file)
+                && (user_matchers.is_empty() || user_matchers.iter().any(|m| m.is_match(file)))
+            {
+                results.push((file.to_string(), filter_name.clone()));
+                break;
             }
         }
     }

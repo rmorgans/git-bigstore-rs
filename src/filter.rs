@@ -124,10 +124,11 @@ pub fn smudge() -> Result<()> {
     Ok(())
 }
 
-/// Read a pointer from git's stored content for a tracked file.
+/// Read a pointer from git's index (staging area) for a tracked file.
+/// Uses `:path` which reads the staged version, not HEAD.
 pub fn read_pointer_from_git(path: &str) -> Result<Option<Pointer>> {
     let output = std::process::Command::new("git")
-        .args(["show", &format!("HEAD:{path}")])
+        .args(["cat-file", "blob", &format!(":{path}")])
         .output()?;
 
     if !output.status.success() {

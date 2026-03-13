@@ -74,9 +74,6 @@ impl Hexdigest {
         &self.0[2..]
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl fmt::Display for Hexdigest {
@@ -147,12 +144,6 @@ impl Layout {
         Ok(Self(template.to_string()))
     }
 
-    /// Whether this layout supports multiple hash functions.
-    /// Layouts without `{hash_fn}` are sha256-only (backward compatible).
-    pub fn supports_hash_fn(&self, hash_fn: HashFunction) -> bool {
-        self.0.contains("{hash_fn}") || hash_fn == HashFunction::Sha256
-    }
-
     /// Format an object key from a hexdigest. Safe: Hexdigest is validated.
     ///
     /// For layouts without `{hash_fn}`, only sha256 is supported — the
@@ -171,9 +162,6 @@ impl Layout {
             .replace("{rest}", hexdigest.rest()))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// DVC-compatible default layout.
@@ -235,7 +223,7 @@ mod tests {
     fn hexdigest_normalizes_to_lowercase() {
         let hex = "A".repeat(64);
         let d = Hexdigest::new(&hex, HashFunction::Sha256).unwrap();
-        assert_eq!(d.as_str(), "a".repeat(64));
+        assert_eq!(d.to_string(), "a".repeat(64));
     }
 
     #[test]
@@ -286,7 +274,7 @@ mod tests {
         let data = format!("bigstore\nsha256\n{hex}\n");
         let p = Pointer::parse(data.as_bytes()).unwrap().unwrap();
         assert_eq!(p.hash_fn, HashFunction::Sha256);
-        assert_eq!(p.hexdigest.as_str(), hex);
+        assert_eq!(p.hexdigest.to_string(), hex);
     }
 
     #[test]
@@ -373,7 +361,7 @@ mod tests {
     #[test]
     fn layout_default_is_dvc_compatible() {
         let l = Layout::default();
-        assert!(l.as_str().starts_with("files/"));
+        assert!(l.to_string().starts_with("files/"));
     }
 
     #[test]

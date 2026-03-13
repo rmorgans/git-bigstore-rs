@@ -103,7 +103,7 @@ async fn download_one(
             // Verify hash before trusting DVC cache
             let actual = hash_file(&dvc_path, pointer.hash_fn)?;
             anyhow::ensure!(
-                &actual == &pointer.hexdigest,
+                actual == pointer.hexdigest,
                 "DVC cache integrity check failed for {path}: expected {}, got {actual}",
                 pointer.hexdigest
             );
@@ -112,15 +112,10 @@ async fn download_one(
             if let Some(parent) = cache_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut tmp = tempfile::NamedTempFile::new_in(
-                cache_path.parent().expect("cache path has parent"),
-            )?;
-            std::io::copy(&mut std::fs::File::open(&dvc_path)?, &mut tmp)?;
-            tmp.flush()?;
-            match tmp.persist_noclobber(&cache_path) {
-                Ok(_) => {}
-                Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.error.into()),
+            match cache::copy_atomically_noclobber(&dvc_path, &cache_path) {
+                Ok(()) => {}
+                Err(e) if cache_path.exists() => {}
+                Err(e) => return Err(e),
             }
 
             let full_path = repo_root.join(path);
@@ -291,7 +286,7 @@ enum UploadOutcome {
 pub async fn push(tracked: &[(String, String)]) -> Result<TransferSummary> {
     let repo_root = git::repo_root()?;
     let git_dir = git::git_dir()?;
-    let cfg = config_load(&repo_root)?;
+    let cfg = BigstoreConfig::find_and_load(&repo_root)?;
     let store = backend::from_config(&cfg)?;
 
     let mp = MultiProgress::new();
@@ -327,7 +322,7 @@ pub async fn push(tracked: &[(String, String)]) -> Result<TransferSummary> {
 pub async fn pull(tracked: &[(String, String)]) -> Result<TransferSummary> {
     let repo_root = git::repo_root()?;
     let git_dir = git::git_dir()?;
-    let cfg = config_load(&repo_root)?;
+    let cfg = BigstoreConfig::find_and_load(&repo_root)?;
     let store = backend::from_config(&cfg)?;
 
     let mp = MultiProgress::new();
@@ -365,9 +360,6 @@ pub async fn pull(tracked: &[(String, String)]) -> Result<TransferSummary> {
     Ok(summary)
 }
 
-fn config_load(repo_root: &Path) -> Result<BigstoreConfig> {
-    BigstoreConfig::find_and_load(repo_root)
-}
 
 /// Create a hasher for the given hash function.
 enum Hasher {
