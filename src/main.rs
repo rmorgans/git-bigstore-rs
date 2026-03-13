@@ -54,7 +54,11 @@ enum Commands {
     },
 
     /// Show status of tracked large files
-    Status,
+    Status {
+        /// Verify integrity of cached objects by re-hashing
+        #[arg(long)]
+        verify: bool,
+    },
 
     /// Migrate .bigstore config to .bigstore.toml
     MigrateConfig {
@@ -123,7 +127,7 @@ async fn main() -> Result<()> {
         Commands::Init { url, endpoint } => cmd_init(&url, endpoint.as_deref()).await,
         Commands::Push { patterns, jobs } => cmd_push(&patterns, jobs).await,
         Commands::Pull { patterns, jobs } => cmd_pull(&patterns, jobs).await,
-        Commands::Status => cmd_status().await,
+        Commands::Status { verify } => cmd_status(verify).await,
         Commands::MigrateConfig { force } => cmd_migrate_config(force),
         Commands::Log { paths } => cmd_log(&paths),
         Commands::Ref { source, dest } => cmd_ref(&source, &dest),
@@ -147,14 +151,21 @@ async fn cmd_init(url: &str, endpoint: Option<&str>) -> Result<()> {
     let config_path = repo_root.join(".bigstore.toml");
     cfg.save(&config_path)?;
 
-    git::config_set("filter.bigstore.clean", "git-bigstore filter-clean")?;
-    git::config_set("filter.bigstore.smudge", "git-bigstore filter-smudge")?;
+    // Only set filter config if not already configured (preserve custom paths)
+    let had_filter = git::config_get("filter.bigstore.clean").is_some();
+    if !had_filter {
+        git::config_set("filter.bigstore.clean", "git-bigstore filter-clean")?;
+        git::config_set("filter.bigstore.smudge", "git-bigstore filter-smudge")?;
+    }
     git::config_set("filter.bigstore.required", "true")?;
 
     cache::ensure_cache_dir(&git_dir)?;
 
     eprintln!("Initialized bigstore with backend: {}", cfg.backend_type());
     eprintln!("Config written to .bigstore.toml");
+    if had_filter {
+        eprintln!("Filter config preserved (already configured)");
+    }
     eprintln!();
     eprintln!("Add patterns to .gitattributes:");
     eprintln!("  echo '*.bin filter=bigstore' >> .gitattributes");
@@ -187,30 +198,67 @@ async fn cmd_pull(patterns: &[String], jobs: Option<usize>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status() -> Result<()> {
+async fn cmd_status(verify: bool) -> Result<()> {
     let repo_root = git::repo_root()?;
     let git_dir = git::git_dir()?;
     let _cfg = config::BigstoreConfig::find_and_load(&repo_root)?;
 
     let tracked = tracked_files(&repo_root, &[])?;
+    let mut corrupted: Vec<String> = Vec::new();
 
     for (path, _filter) in &tracked {
         let pointer = filter::read_pointer_from_git(path);
         let status = match pointer {
             Ok(Some(p)) => {
-                let cached = cache::object_path(&git_dir, &p.hexdigest, p.hash_fn).exists();
+                let cache_path = cache::object_path(&git_dir, &p.hexdigest, p.hash_fn);
+                let cached = cache_path.exists();
                 let full_path = repo_root.join(path);
                 let smudged = full_path.exists() && !filter::is_pointer_file(&full_path);
-                match (cached, smudged) {
-                    (true, true) => "ok",
-                    (true, false) => "cached (not checked out)",
-                    (false, true) => "local only (not cached)",
-                    (false, false) => "pointer only (needs pull)",
+
+                if verify && cached {
+                    match transfer::hash_file(&cache_path, p.hash_fn) {
+                        Ok(actual) if actual == p.hexdigest => match (true, smudged) {
+                            (true, true) => "ok (verified)",
+                            (true, false) => "cached (not checked out, verified)",
+                            _ => unreachable!(),
+                        },
+                        Ok(_) => {
+                            corrupted.push(path.clone());
+                            "CORRUPTED (hash mismatch)"
+                        }
+                        Err(_) => {
+                            corrupted.push(path.clone());
+                            "CORRUPTED (unreadable)"
+                        }
+                    }
+                } else {
+                    match (cached, smudged) {
+                        (true, true) => "ok",
+                        (true, false) => "cached (not checked out)",
+                        (false, true) => "local only (not cached)",
+                        (false, false) => "pointer only (needs pull)",
+                    }
                 }
             }
             _ => "not a bigstore file",
         };
-        println!("{status:>30}  {path}");
+        println!("{status:>40}  {path}");
+    }
+
+    if !corrupted.is_empty() {
+        eprintln!();
+        eprintln!(
+            "{} corrupted cache object(s) found. To repair:",
+            corrupted.len()
+        );
+        for path in &corrupted {
+            eprintln!("  {path}");
+        }
+        eprintln!();
+        eprintln!("Delete corrupted cache and re-pull:");
+        eprintln!("  rm -rf .git/bigstore/objects");
+        eprintln!("  git bigstore pull");
+        anyhow::bail!("{} corrupted object(s)", corrupted.len());
     }
 
     Ok(())
@@ -586,7 +634,17 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
     }
     std::fs::write(&dest_path, pointer.encode())?;
 
-    eprintln!("Created pointer: {dest} -> {source} (md5:{})", pointer.hexdigest);
+    // Restore content from cache so working tree has real data (not pointer text).
+    // The clean filter will convert back to pointer on `git add`.
+    let cache_path = cache::object_path(&git_dir, &pointer.hexdigest, pointer.hash_fn);
+    if cache_path.exists() {
+        cache::copy_to_working_tree(&cache_path, &dest_path)?;
+        eprintln!("Created: {dest} (content restored from cache)");
+    } else {
+        eprintln!("Created pointer: {dest} (run `git bigstore pull` to restore content)");
+    }
+
+    eprintln!("  Source: {source} (md5:{})", pointer.hexdigest);
     eprintln!();
     eprintln!("Next steps:");
     eprintln!("  1. Ensure {dest} is tracked: echo '{dest} filter=bigstore' >> .gitattributes");
@@ -704,12 +762,20 @@ fn cmd_import_dvc_dir(
             }
         }
 
-        // Write pointer file
+        // Write pointer file, then restore content from cache
         let pointer = types::Pointer::new(types::HashFunction::Md5, hexdigest.clone());
         if let Some(parent) = dest_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&dest_path, pointer.encode())?;
+
+        // Restore real content so working tree has data, not pointer text.
+        // The clean filter will convert back to pointer on `git add`.
+        let cache_path =
+            cache::object_path(&git_dir, hexdigest, types::HashFunction::Md5);
+        if cache_path.exists() {
+            cache::copy_to_working_tree(&cache_path, &dest_path)?;
+        }
     }
 
     // Summary

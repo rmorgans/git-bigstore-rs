@@ -129,6 +129,30 @@ fn init_creates_config_and_sets_git_filters() {
 }
 
 #[test]
+fn init_preserves_existing_filter_config() {
+    let t = TestRepo::new();
+
+    // TestRepo::new already ran init + set custom filter paths.
+    // Capture the current custom filter paths.
+    let custom_clean = git(&t.repo_dir, &["config", "filter.bigstore.clean"]);
+    let custom_smudge = git(&t.repo_dir, &["config", "filter.bigstore.smudge"]);
+    assert!(custom_clean.contains('/'), "should be a full path: {custom_clean}");
+
+    // Re-run init — should NOT clobber the custom filter paths
+    let storage_url = format!("local://{}", t.storage_dir.display());
+    let output = bigstore(&t.repo_dir, &["init", &storage_url]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("preserved"), "should mention filter was preserved: {stderr}");
+
+    // Verify filters are still the custom paths
+    let clean_after = git(&t.repo_dir, &["config", "filter.bigstore.clean"]);
+    let smudge_after = git(&t.repo_dir, &["config", "filter.bigstore.smudge"]);
+    assert_eq!(clean_after, custom_clean, "clean filter should be preserved");
+    assert_eq!(smudge_after, custom_smudge, "smudge filter should be preserved");
+}
+
+#[test]
 fn clean_filter_produces_pointer_file() {
     let t = TestRepo::new();
 
@@ -274,6 +298,68 @@ fn status_shows_file_states() {
 }
 
 #[test]
+fn status_verify_passes_for_valid_cache() {
+    let t = TestRepo::new();
+
+    t.write_file(".gitattributes", b"*.bin filter=bigstore\n");
+    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
+    git(&t.repo_dir, &["commit", "-m", "init"]);
+
+    t.write_file("test.bin", b"content for verify\n");
+    git(&t.repo_dir, &["add", "test.bin"]);
+    git(&t.repo_dir, &["commit", "-m", "add"]);
+
+    let output = bigstore_ok(&t.repo_dir, &["status", "--verify"]);
+    assert!(
+        output.contains("verified"),
+        "should show verified status: {output}"
+    );
+}
+
+#[test]
+fn status_verify_detects_corrupted_cache() {
+    let t = TestRepo::new();
+
+    t.write_file(".gitattributes", b"*.bin filter=bigstore\n");
+    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
+    git(&t.repo_dir, &["commit", "-m", "init"]);
+
+    t.write_file("test.bin", b"good content\n");
+    git(&t.repo_dir, &["add", "test.bin"]);
+    git(&t.repo_dir, &["commit", "-m", "add"]);
+
+    // Corrupt the cache object
+    let cache_dir = t.repo_dir.join(".git/bigstore/objects/sha256");
+    // Find the cache file
+    let mut found = false;
+    for entry in walkdir::WalkDir::new(&cache_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        std::fs::write(entry.path(), b"corrupted data").unwrap();
+        found = true;
+    }
+    assert!(found, "should have found a cache object to corrupt");
+
+    let output = bigstore(&t.repo_dir, &["status", "--verify"]);
+    assert!(
+        !output.status.success(),
+        "status --verify should fail with corrupted cache"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("CORRUPTED"),
+        "should report corruption: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("corrupted"),
+        "should suggest repair: {stderr}"
+    );
+}
+
+#[test]
 fn multiple_files_tracked() {
     let t = TestRepo::new();
 
@@ -339,13 +425,16 @@ fn ref_creates_md5_pointer_from_dvc_file() {
     // Run ref command
     bigstore_ok(&t.repo_dir, &["ref", "model.bin.dvc", "model.bin"]);
 
-    // Verify the pointer was created with correct content
-    let pointer_content = t.read_file("model.bin");
-    let pointer_str = String::from_utf8(pointer_content).unwrap();
-    let lines: Vec<&str> = pointer_str.lines().collect();
-    assert_eq!(lines[0], "bigstore");
-    assert_eq!(lines[1], "md5");
-    assert_eq!(lines[2], md5_hash);
+    // Content is restored from cache — working tree has real data, not pointer text
+    let restored = t.read_file("model.bin");
+    assert_eq!(restored, content, "working tree should have real content after ref");
+
+    // Bigstore cache should have the object
+    let bs_cache = t.repo_dir
+        .join(".git/bigstore/objects/md5")
+        .join(&md5_hash[..2])
+        .join(&md5_hash[2..]);
+    assert!(bs_cache.exists(), "object should be in bigstore cache");
 }
 
 #[test]
@@ -1019,13 +1108,14 @@ fn import_dvc_dir_imports_multiple_files() {
         "import should succeed: {stderr}"
     );
 
-    // Verify pointer files were written
+    // Content is restored from cache — working tree has real data, not pointer text
+    let expected_contents: std::collections::HashMap<&str, &[u8]> = files.iter().copied().collect();
     for (_md5, relpath) in &info {
-        let pointer_path = t.repo_dir.join("imported-models").join(relpath);
-        assert!(pointer_path.exists(), "pointer should exist at {relpath}");
-        let content = std::fs::read_to_string(&pointer_path).unwrap();
-        assert!(content.starts_with("bigstore\n"), "should be a pointer: {content}");
-        assert!(content.contains("md5\n"), "should use md5 hash: {content}");
+        let file_path = t.repo_dir.join("imported-models").join(relpath);
+        assert!(file_path.exists(), "file should exist at {relpath}");
+        let actual = std::fs::read(&file_path).unwrap();
+        let expected = expected_contents[relpath.as_str()];
+        assert_eq!(actual, expected, "working tree should have real content for {relpath}");
     }
 
     // Verify bigstore cache has the objects
@@ -1150,9 +1240,9 @@ fn import_dvc_dir_force_overwrites() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "force should succeed: {stderr}");
 
-    // Verify it was replaced with a pointer
-    let content = std::fs::read_to_string(t.repo_dir.join("dest/model.pt")).unwrap();
-    assert!(content.starts_with("bigstore\n"), "should be a pointer now: {content}");
+    // Content is restored — working tree has real data, not old content
+    let content = std::fs::read(t.repo_dir.join("dest/model.pt")).unwrap();
+    assert_eq!(content, b"model data", "should have restored content, not old data");
 }
 
 #[test]
