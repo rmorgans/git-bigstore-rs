@@ -36,13 +36,38 @@ pub fn dvc_cache_path(repo_root: &Path, hexdigest: &Hexdigest) -> PathBuf {
         .join(hexdigest.rest())
 }
 
-/// Copy a cached object to the working tree.
-pub fn copy_to_working_tree(cache_path: &Path, dest: &Path) -> Result<()> {
+/// Atomically copy a file into place.
+/// Writes to a temp file in the destination directory, then renames.
+pub fn copy_atomically(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(cache_path, dest)?;
+    let parent = dest.parent().expect("dest has a parent directory");
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut std::fs::File::open(src)?, &mut tmp)?;
+    std::io::Write::flush(&mut tmp)?;
+    tmp.persist(dest)?;
     Ok(())
+}
+
+/// Atomically copy a file into place, failing if the destination already exists.
+pub fn copy_atomically_noclobber(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let parent = dest.parent().expect("dest has a parent directory");
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut std::fs::File::open(src)?, &mut tmp)?;
+    std::io::Write::flush(&mut tmp)?;
+    match tmp.persist_noclobber(dest) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.error.into()),
+    }
+}
+
+/// Copy a cached object to the working tree atomically.
+pub fn copy_to_working_tree(cache_path: &Path, dest: &Path) -> Result<()> {
+    copy_atomically(cache_path, dest)
 }
 
 #[cfg(test)]
