@@ -100,32 +100,17 @@ async fn download_one(
 
     // Step 2b: DVC cache fallback (md5 only)
     if pointer.hash_fn == HashFunction::Md5 {
-        let dvc_path = cache::dvc_cache_path(repo_root, &pointer.hexdigest);
-        if dvc_path.exists() {
-            pb.set_message(format!("{path} (dvc cache, verifying)"));
-            // Verify hash before trusting DVC cache
-            let actual = hash_file(&dvc_path, pointer.hash_fn)?;
-            anyhow::ensure!(
-                actual == pointer.hexdigest,
-                "DVC cache integrity check failed for {path}: expected {}, got {actual}",
-                pointer.hexdigest
-            );
-
-            // Verified — atomic persist to bigstore cache
-            if let Some(parent) = cache_path.parent() {
-                std::fs::create_dir_all(parent)?;
+        match cache::import_md5_from_dvc_cache(repo_root, git_dir, &pointer.hexdigest)
+            .with_context(|| format!("DVC cache import failed for {path}"))?
+        {
+            cache::DvcImportResult::Imported | cache::DvcImportResult::AlreadyCached => {
+                let full_path = repo_root.join(path);
+                cache::copy_to_working_tree(&cache_path, &full_path)?;
+                pb.set_message(format!("{path} (from dvc cache, verified)"));
+                pb.inc(1);
+                return Ok(DownloadOutcome::Downloaded);
             }
-            match cache::copy_atomically_noclobber(&dvc_path, &cache_path) {
-                Ok(()) => {}
-                Err(e) if cache_path.exists() => {}
-                Err(e) => return Err(e),
-            }
-
-            let full_path = repo_root.join(path);
-            cache::copy_to_working_tree(&cache_path, &full_path)?;
-            pb.set_message(format!("{path} (from dvc cache, verified)"));
-            pb.inc(1);
-            return Ok(DownloadOutcome::Downloaded);
+            cache::DvcImportResult::NotInDvcCache => {}
         }
     }
 
