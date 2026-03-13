@@ -871,3 +871,49 @@ fn log_root_commit_with_bigstore_file() {
         "root commit should show + for bigstore file: {output}"
     );
 }
+
+// Note: RenamedAdded (R + None→Some) and RenamedDeleted (R + Some→None) are
+// handled in the classifier but are practically unreachable through normal git
+// operations. The clean filter transforms content so drastically (raw bytes →
+// 81-byte pointer) that git's rename detection never fires across a tracking
+// boundary change. These states exist as defensive handling only.
+
+#[test]
+fn log_copy_shows_c_with_both_paths() {
+    let t = TestRepo::new();
+
+    t.write_file(".gitattributes", b"*.bin filter=bigstore\n");
+    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
+    git(&t.repo_dir, &["commit", "-m", "init"]);
+
+    // Add a bigstore file
+    t.write_file("original.bin", b"content for copy test\n");
+    git(&t.repo_dir, &["add", "original.bin"]);
+    git(&t.repo_dir, &["commit", "-m", "add original"]);
+
+    // To trigger copy detection with -C, the source must also be modified
+    // in the same changeset. So: copy original.bin -> copy.bin AND modify
+    // original.bin in the same commit.
+    std::fs::copy(
+        t.repo_dir.join("original.bin"),
+        t.repo_dir.join("copy.bin"),
+    )
+    .unwrap();
+    t.write_file("original.bin", b"modified original for copy test\n");
+    git(&t.repo_dir, &["add", "copy.bin", "original.bin"]);
+    git(&t.repo_dir, &["commit", "-m", "copy and modify"]);
+
+    let output = bigstore_ok(&t.repo_dir, &["log"]);
+
+    // diff-tree -C detects this as a copy since original.bin was also modified
+    assert!(
+        output.contains("C original.bin -> copy.bin"),
+        "copy should show C with source -> dest: {output}"
+    );
+
+    // original.bin modification should also appear in the same commit
+    assert!(
+        output.contains("~ original.bin"),
+        "modified original should show ~ in same commit: {output}"
+    );
+}

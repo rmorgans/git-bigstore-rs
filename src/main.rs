@@ -1,7 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use globset::Glob;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 mod backend;
 mod cache;
@@ -205,9 +207,9 @@ fn cmd_migrate_config(force: bool) -> Result<()> {
 
 fn cmd_log(paths: &[String]) -> Result<()> {
     // Get commit list (first-parent only to avoid merge noise)
-    let mut rev_list_cmd = std::process::Command::new("git");
-    rev_list_cmd.args(["rev-list", "--first-parent", "HEAD"]);
-    let rev_output = rev_list_cmd.output()?;
+    let rev_output = Command::new("git")
+        .args(["rev-list", "--first-parent", "HEAD"])
+        .output()?;
     anyhow::ensure!(rev_output.status.success(), "git rev-list failed");
     let commits = String::from_utf8(rev_output.stdout)?;
 
@@ -217,28 +219,28 @@ fn cmd_log(paths: &[String]) -> Result<()> {
         .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
         .collect();
 
+    // Single long-lived process for all blob reads
+    let mut cat_file = CatFileBatch::start()?;
     let mut found_any = false;
 
     for commit in commits.lines() {
-        // Get changed files with rename detection
-        // --root handles the initial commit (diffs against empty tree)
         // Check if this is a root commit (no parents)
-        let parent_check = std::process::Command::new("git")
+        let parent_check = Command::new("git")
             .args(["rev-parse", "--verify", &format!("{commit}^")])
+            .stderr(Stdio::null())
             .output()?;
         let is_root = !parent_check.status.success();
 
         // For root commits: diff against empty tree (--root)
         // For all others (including merges): diff against first parent explicitly
         let diff_output = if is_root {
-            std::process::Command::new("git")
-                .args(["diff-tree", "--root", "-r", "-M", "--name-status", commit])
+            Command::new("git")
+                .args(["diff-tree", "--root", "-r", "-M", "-C", "--name-status", commit])
                 .output()?
         } else {
-            // Explicit two-tree diff: first-parent vs this commit
             let parent = format!("{commit}~1");
-            std::process::Command::new("git")
-                .args(["diff-tree", "-r", "-M", "--name-status", &parent, commit])
+            Command::new("git")
+                .args(["diff-tree", "-r", "-M", "-C", "--name-status", &parent, commit])
                 .output()?
         };
         if !diff_output.status.success() {
@@ -246,7 +248,6 @@ fn cmd_log(paths: &[String]) -> Result<()> {
         }
         let diff_text = String::from_utf8_lossy(&diff_output.stdout);
 
-        // Parse diff-tree output into file changes
         let mut changes: Vec<LogChange> = Vec::new();
 
         for line in diff_text.lines() {
@@ -257,7 +258,6 @@ fn cmd_log(paths: &[String]) -> Result<()> {
 
             let status = parts[0];
             let (old_path, new_path) = if status.starts_with('R') || status.starts_with('C') {
-                // Rename/Copy: R100\told\tnew
                 if parts.len() < 3 {
                     continue;
                 }
@@ -275,38 +275,47 @@ fn cmd_log(paths: &[String]) -> Result<()> {
                 }
             }
 
-            // Read blob content to detect bigstore pointers.
-            // Only read sides that exist for the given status.
             let status_char = status.chars().next().unwrap_or('M');
 
             let new_pointer = if status_char == 'D' {
-                None // Deleted — blob doesn't exist at this commit
+                None
             } else {
-                read_blob_pointer(commit, new_path)
+                cat_file.read_pointer(commit, new_path)?
             };
 
             let old_pointer = if status_char == 'A' {
-                None // Added — no previous version
+                None
             } else {
                 let old_ref = format!("{commit}~1");
                 let check_path = old_path.unwrap_or(new_path);
-                read_blob_pointer(&old_ref, check_path)
+                cat_file.read_pointer(&old_ref, check_path)?
             };
 
-            // Only emit if at least one side is a bigstore pointer
             if new_pointer.is_none() && old_pointer.is_none() {
                 continue;
             }
 
+            // For copies, old path still exists — only the new path matters.
+            // If the copy didn't produce a pointer, it's not a bigstore event.
+            if status_char == 'C' && new_pointer.is_none() {
+                continue;
+            }
+
             let kind = match (status_char, &old_pointer, &new_pointer) {
-                // File added as pointer, or normal file converted to pointer
-                ('A', _, Some(_)) | ('M', None, Some(_)) => ChangeKind::Added,
-                // File deleted, or pointer replaced with normal file
-                ('D', Some(_), _) | ('M', Some(_), None) => ChangeKind::Deleted,
+                // File added as pointer, or non-pointer converted to pointer
+                ('A', _, Some(_)) | ('M' | 'T', None, Some(_)) => ChangeKind::Added,
+                // File deleted, or pointer converted to non-pointer
+                ('D', Some(_), _) | ('M' | 'T', Some(_), None) => ChangeKind::Deleted,
+                // Copy produced a pointer (old path still exists, this is a new pointer)
+                ('C', _, Some(_)) => ChangeKind::Copied,
+                // Rename where bigstore tracking was added
+                ('R', None, Some(_)) => ChangeKind::RenamedAdded,
+                // Rename where bigstore tracking was removed
+                ('R', Some(_), None) => ChangeKind::RenamedDeleted,
                 // Pure rename (same content hash)
-                ('R' | 'C', _, _) if old_pointer.as_ref().map(|p| &p.hexdigest)
+                ('R', _, _) if old_pointer.as_ref().map(|p| &p.hexdigest)
                     == new_pointer.as_ref().map(|p| &p.hexdigest) => ChangeKind::Renamed,
-                // Rename + content change, or regular modification
+                // Everything else: content change
                 _ => ChangeKind::Modified,
             };
 
@@ -324,7 +333,7 @@ fn cmd_log(paths: &[String]) -> Result<()> {
         }
 
         // Get commit metadata
-        let meta_output = std::process::Command::new("git")
+        let meta_output = Command::new("git")
             .args(["log", "-1", "--format=%h %ai %s", commit])
             .output()?;
         let meta = String::from_utf8_lossy(&meta_output.stdout).trim().to_string();
@@ -336,10 +345,11 @@ fn cmd_log(paths: &[String]) -> Result<()> {
 
         for c in &changes {
             let symbol = match c.kind {
-                ChangeKind::Added => "+",
-                ChangeKind::Deleted => "-",
+                ChangeKind::Added | ChangeKind::RenamedAdded => "+",
+                ChangeKind::Deleted | ChangeKind::RenamedDeleted => "-",
                 ChangeKind::Modified => "~",
                 ChangeKind::Renamed => "R",
+                ChangeKind::Copied => "C",
             };
 
             match c.kind {
@@ -351,6 +361,18 @@ fn cmd_log(paths: &[String]) -> Result<()> {
                 ChangeKind::Deleted => {
                     if let Some(p) = &c.old_pointer {
                         println!("    {symbol} {}  {}:{}", c.path, p.hash_fn, short_hash(&p.hexdigest));
+                    }
+                }
+                ChangeKind::RenamedAdded | ChangeKind::Copied => {
+                    let old = c.old_path.as_deref().unwrap_or("?");
+                    if let Some(p) = &c.new_pointer {
+                        println!("    {symbol} {old} -> {}  {}:{}", c.path, p.hash_fn, short_hash(&p.hexdigest));
+                    }
+                }
+                ChangeKind::RenamedDeleted => {
+                    let old = c.old_path.as_deref().unwrap_or("?");
+                    if let Some(p) = &c.old_pointer {
+                        println!("    {symbol} {old} -> {}  {}:{}", c.path, p.hash_fn, short_hash(&p.hexdigest));
                     }
                 }
                 ChangeKind::Modified => {
@@ -379,6 +401,8 @@ fn cmd_log(paths: &[String]) -> Result<()> {
         found_any = true;
     }
 
+    drop(cat_file);
+
     if !found_any {
         eprintln!("No bigstore file changes found in history.");
     }
@@ -386,17 +410,77 @@ fn cmd_log(paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Try to read a blob at commit:path and parse it as a bigstore pointer.
-/// Returns None if the blob doesn't exist or isn't a pointer.
-fn read_blob_pointer(commit: &str, path: &str) -> Option<types::Pointer> {
-    let output = std::process::Command::new("git")
-        .args(["show", &format!("{commit}:{path}")])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+// ──────────────────────────────────────────────────
+// git cat-file --batch wrapper
+// ──────────────────────────────────────────────────
+//
+// Single long-lived process for all blob reads during log.
+// Protocol: write "<ref>\n" to stdin, read response from stdout.
+// Response is either:
+//   <sha> blob <size>\n<content>\n   (object found)
+//   <ref> missing\n                  (object not found)
+
+struct CatFileBatch {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl CatFileBatch {
+    fn start() -> Result<Self> {
+        let mut child = Command::new("git")
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to start git cat-file --batch")?;
+
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout was piped"));
+
+        Ok(Self { child, stdin: Some(stdin), stdout })
     }
-    types::Pointer::parse(&output.stdout).ok().flatten()
+
+    /// Read a blob and try to parse it as a bigstore pointer.
+    /// Returns Ok(None) if the blob doesn't exist or isn't a pointer.
+    fn read_pointer(&mut self, rev: &str, path: &str) -> Result<Option<types::Pointer>> {
+        let stdin = self.stdin.as_mut().context("cat-file already closed")?;
+        let ref_spec = format!("{rev}:{path}\n");
+        stdin.write_all(ref_spec.as_bytes())?;
+        stdin.flush()?;
+
+        // Read header line: "<sha> <type> <size>\n" or "<ref> missing\n"
+        let mut header = String::new();
+        self.stdout.read_line(&mut header)?;
+
+        if header.trim_end().ends_with("missing") {
+            return Ok(None);
+        }
+
+        let size: usize = header
+            .trim_end()
+            .rsplit_once(' ')
+            .and_then(|(_, s)| s.parse().ok())
+            .context("failed to parse cat-file header")?;
+
+        // Read content + trailing newline.
+        // Pointers are ~81 bytes. For tracked files, blobs are always pointers
+        // (clean filter ensures this), so size is always small.
+        let mut buf = vec![0u8; size + 1]; // +1 for trailing LF
+        std::io::Read::read_exact(&mut self.stdout, &mut buf)?;
+        buf.truncate(size); // drop trailing LF
+
+        Ok(types::Pointer::parse(&buf).ok().flatten())
+    }
+}
+
+impl Drop for CatFileBatch {
+    fn drop(&mut self) {
+        // Close stdin so cat-file sees EOF and exits
+        self.stdin.take();
+        let _ = self.child.wait();
+    }
 }
 
 fn short_hash(hexdigest: &types::Hexdigest) -> String {
@@ -413,6 +497,9 @@ enum ChangeKind {
     Deleted,
     Modified,
     Renamed,
+    RenamedAdded,   // Rename + became a pointer
+    RenamedDeleted, // Rename + stopped being a pointer
+    Copied,         // Copy produced a pointer (source still exists)
 }
 
 struct LogChange {
