@@ -196,25 +196,99 @@ git bigstore push              # uses 16
 git bigstore push --jobs 4     # CLI flag wins
 ```
 
-## DVC interop
+## DVC migration
 
-bigstore can import files tracked by DVC:
+bigstore can import files tracked by DVC, verified against the DVC cache.
+
+### Cache discovery
+
+bigstore resolves the DVC cache location by running `dvc cache dir`. This means
+shared/global caches (`dvc cache dir --global ~/.dvc/cache`) work automatically.
+If `dvc` is not installed, bigstore falls back to `.dvc/cache` in the DVC
+project directory.
+
+### Single-file migration
 
 ```bash
-# Import a single .dvc file
 git bigstore ref model.bin.dvc model.bin
-
-# The object is imported from .dvc/cache/ with hash verification.
-# If the DVC cache is empty, run `dvc pull model.bin.dvc` first.
+echo 'model.bin filter=bigstore' >> .gitattributes
+git add model.bin .gitattributes
+git commit -m "migrate model from DVC"
+git bigstore push
 ```
 
+### Directory migration
+
+Most DVC repos use `.dir` tracking. Inspect first, then import:
+
+```bash
+# List contents
+git bigstore dvc-ls models.dvc
+
+# Import all (or use glob patterns for selective import)
+git bigstore import-dvc-dir models.dvc models/
+
+# Stage, commit, push
+echo 'models/** filter=bigstore' >> .gitattributes
+git add models/ .gitattributes
+git commit -m "migrate models from DVC"
+git bigstore push
+```
+
+### Migration playbook
+
+Tested against a real monorepo with 34 .dvc files across nested DVC projects.
+
+**Prerequisites:**
+
+1. **Consolidate DVC cache** (recommended for multi-worktree repos):
+   ```bash
+   dvc cache dir --global ~/.dvc/cache
+   # Move per-project caches into global cache
+   ```
+
+2. **Populate the DVC cache** — objects must be pulled locally before import:
+   ```bash
+   dvc pull path/to/file.dvc
+   ```
+
+3. **Set credentials** — `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for push.
+
+**Per-artifact workflow:**
+
+1. Classify: `single-file` (use `ref`) or `.dir` (use `import-dvc-dir`)
+2. Import — objects are md5-verified from DVC cache
+3. **Edit DVC `.gitignore`** — DVC auto-generates `.gitignore` files next to
+   `.dvc` files that ignore the output paths. Remove the relevant entries so
+   `git add` can stage the bigstore-tracked files.
+4. `git add` — the clean filter re-hashes content as sha256 (bigstore's native
+   hash). The md5 cache entries from DVC import remain for deduplication.
+5. `git bigstore status --verify` — confirm all files are ok
+6. Commit and push
+
+**What to watch for:**
+
+- DVC sibling `.gitignore` files must be edited per migrated output path.
+  Without this, `git add` silently ignores the imported files.
+- Content is auto-restored to the working tree after import (real data, not
+  pointer text). The clean filter converts back to pointers on `git add`.
+- If `git-bigstore` is not in PATH, set full filter paths before `git add`:
+  ```bash
+  git config filter.bigstore.clean "/path/to/git-bigstore filter-clean"
+  git config filter.bigstore.smudge "/path/to/git-bigstore filter-smudge"
+  ```
+
+### Pull fallback
+
 During `git bigstore pull`, if an md5-hashed object is not on the remote but
-exists in the local DVC cache (`.dvc/cache/files/md5/`), bigstore will import
-it automatically (with verification).
+exists in the local DVC cache, bigstore imports it automatically with
+verification.
+
+### Storage compatibility
 
 The default storage layout (`files/{hash_fn}/{prefix}/{rest}`) is
-DVC-compatible, so objects uploaded by bigstore can coexist with DVC objects in
-the same bucket.
+DVC-compatible. Objects uploaded by bigstore can coexist with DVC objects in the
+same bucket.
 
 ## Legacy config
 
