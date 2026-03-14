@@ -371,12 +371,46 @@ pointer formats, different transfer mechanisms.
 **Same file path cannot use both filters.** Both bigstore and LFS use git
 clean/smudge, so applying both to the same path will break.
 
-**Future: LFS transfer adapter.** Git LFS supports standalone custom transfer
-agents that bypass the LFS API server entirely. A `git-bigstore-lfs-adapter`
-could let LFS clients upload/download from bigstore's bucket using the shared
-SHA-256 object keys — storage-layer bridge without pointer-format bridging.
-This would enable LFS-native teams to pull from bigstore storage during
-migration. Not yet implemented.
+### LFS transfer adapter
+
+`git-bigstore-lfs-adapter` is a standalone Git LFS custom transfer agent that
+lets LFS clients upload/download from bigstore's bucket. No LFS API server
+needed — LFS talks directly to your object store.
+
+**Setup** (in an LFS-configured repo):
+
+```bash
+git config lfs.standalonetransferagent bigstore
+git config lfs.customtransfer.bigstore.path git-bigstore-lfs-adapter
+```
+
+**Config resolution:**
+
+1. `.bigstore.toml` (if present in repo)
+2. `git config bigstore-lfs.url` + `bigstore-lfs.endpoint` (for LFS-only repos)
+
+```bash
+# LFS-only repo without .bigstore.toml:
+git config bigstore-lfs.url s3://my-bucket/bigstore
+git config bigstore-lfs.endpoint https://t3.storage.dev
+```
+
+**Object mapping:** LFS `oid sha256:<hex>` maps to `files/sha256/<2>/<rest>` —
+the same key bigstore uses natively. Shared bytes, separate pointer formats.
+
+**Scope and limits:**
+
+- SHA-256 only (LFS OIDs are SHA-256; bigstore's native hash)
+- Shared remote objects, separate local caches (LFS cache != bigstore cache)
+- No locking support
+- No pointer-format bridging — LFS pointers stay LFS, bigstore pointers stay bigstore
+- Credentials via `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (same as bigstore)
+
+**When to use it:**
+
+- Migrating a team from hosted LFS to owned bucket storage
+- Letting LFS-native collaborators pull from a bigstore-managed bucket
+- Coexisting LFS and bigstore in one org with shared object storage
 
 ## Legacy config
 
