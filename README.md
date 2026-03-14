@@ -371,6 +371,13 @@ pointer formats, different transfer mechanisms.
 **Same file path cannot use both filters.** Both bigstore and LFS use git
 clean/smudge, so applying both to the same path will break.
 
+**Future: LFS transfer adapter.** Git LFS supports standalone custom transfer
+agents that bypass the LFS API server entirely. A `git-bigstore-lfs-adapter`
+could let LFS clients upload/download from bigstore's bucket using the shared
+SHA-256 object keys — storage-layer bridge without pointer-format bridging.
+This would enable LFS-native teams to pull from bigstore storage during
+migration. Not yet implemented.
+
 ## Legacy config
 
 If your repo has a `.bigstore` file (no `.toml` extension), bigstore will load
