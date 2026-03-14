@@ -74,11 +74,13 @@ impl TransferSummary {
 // The cache never contains unverified content.
 
 /// Download a single object: remote → verified cache → working tree.
+#[allow(clippy::too_many_arguments)]
 async fn download_one(
     store: &Backend,
     cfg: &BigstoreConfig,
     git_dir: &Path,
     repo_root: &Path,
+    dvc_cache_root: &Path,
     path: &str,
     pointer: &Pointer,
     pb: &ProgressBar,
@@ -100,7 +102,7 @@ async fn download_one(
 
     // Step 2b: DVC cache fallback (md5 only)
     if pointer.hash_fn == HashFunction::Md5 {
-        match cache::import_md5_from_dvc_cache(repo_root, git_dir, &pointer.hexdigest)
+        match cache::import_md5_from_dvc_cache(dvc_cache_root, git_dir, &pointer.hexdigest)
             .with_context(|| format!("DVC cache import failed for {path}"))?
         {
             cache::DvcImportResult::Imported | cache::DvcImportResult::AlreadyCached => {
@@ -338,6 +340,15 @@ pub async fn pull(tracked: &[(String, String)], concurrency: usize) -> Result<Tr
         }
     }
 
+    // Resolve DVC cache for md5 fallback. Pull operates repo-wide,
+    // so find the DVC project from the repo root. If no DVC project
+    // exists, use default path (import_md5_from_dvc_cache will just
+    // return NotInDvcCache for all lookups).
+    let dvc_cache_root = match cache::find_dvc_project_root(&repo_root) {
+        Some(dvc_root) => cache::resolve_dvc_cache_root(&dvc_root)?,
+        None => repo_root.join(".dvc/cache"),
+    };
+
     let mp = MultiProgress::new();
     let pb = mp.add(progress_bar(work.len() as u64));
     let mut summary = TransferSummary::new();
@@ -347,9 +358,12 @@ pub async fn pull(tracked: &[(String, String)], concurrency: usize) -> Result<Tr
         let cfg = &cfg;
         let git_dir = &git_dir;
         let repo_root = &repo_root;
+        let dvc_cache_root = &dvc_cache_root;
         let pb = &pb;
         async move {
-            let outcome = download_one(store, cfg, git_dir, repo_root, path, pointer, pb).await;
+            let outcome =
+                download_one(store, cfg, git_dir, repo_root, dvc_cache_root, path, pointer, pb)
+                    .await;
             (path.clone(), outcome)
         }
     }))

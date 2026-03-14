@@ -613,8 +613,10 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
     let source_path = repo_root.join(source);
     let (pointer, dvc_out_path) = dvc::parse_dvc_pointer(&source_path)?;
 
+    let dvc_cache_root = resolve_dvc_cache(&source_path)?;
+
     // Try to import the object from DVC cache into bigstore cache
-    match cache::import_md5_from_dvc_cache(&repo_root, &git_dir, &pointer.hexdigest)? {
+    match cache::import_md5_from_dvc_cache(&dvc_cache_root, &git_dir, &pointer.hexdigest)? {
         cache::DvcImportResult::Imported => {
             eprintln!("Imported from DVC cache (verified): {dvc_out_path}");
         }
@@ -625,7 +627,7 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
             anyhow::bail!(
                 "object not found in DVC cache at {}\n\
                  Run `dvc pull {source}` first to populate the DVC cache, then retry.",
-                cache::dvc_cache_path(&repo_root, &pointer.hexdigest).display()
+                cache::dvc_cache_path(&dvc_cache_root, &pointer.hexdigest).display()
             );
         }
     }
@@ -662,7 +664,8 @@ fn cmd_dvc_ls(source: &str) -> Result<()> {
     validate_relative_path("source", source)?;
     let repo_root = git::repo_root()?;
     let source_path = repo_root.join(source);
-    let (manifest_hash, entries) = resolve_dir_manifest(&repo_root, &source_path)?;
+    let dvc_cache_root = resolve_dvc_cache(&source_path)?;
+    let (manifest_hash, entries) = resolve_dir_manifest(&dvc_cache_root, &source_path)?;
 
     eprintln!(
         "{} entries in {} (manifest md5:{manifest_hash})",
@@ -689,7 +692,8 @@ fn cmd_import_dvc_dir(
     let git_dir = git::git_dir()?;
 
     let source_path = repo_root.join(source);
-    let (_manifest_hash, entries) = resolve_dir_manifest(&repo_root, &source_path)?;
+    let dvc_cache_root = resolve_dvc_cache(&source_path)?;
+    let (_manifest_hash, entries) = resolve_dir_manifest(&dvc_cache_root, &source_path)?;
 
     // Filter entries by patterns (if any)
     let entries = if patterns.is_empty() {
@@ -746,7 +750,7 @@ fn cmd_import_dvc_dir(
         let dest_path = repo_root.join(dest_root).join(relpath);
 
         // Import from DVC cache into bigstore cache
-        match cache::import_md5_from_dvc_cache(&repo_root, &git_dir, hexdigest) {
+        match cache::import_md5_from_dvc_cache(&dvc_cache_root, &git_dir, hexdigest) {
             Ok(cache::DvcImportResult::Imported) => imported += 1,
             Ok(cache::DvcImportResult::AlreadyCached) => cached += 1,
             Ok(cache::DvcImportResult::NotInDvcCache) => {
@@ -754,7 +758,7 @@ fn cmd_import_dvc_dir(
                     relpath.clone(),
                     format!(
                         "not found in DVC cache at {}",
-                        cache::dvc_cache_path(&repo_root, hexdigest).display()
+                        cache::dvc_cache_path(&dvc_cache_root, hexdigest).display()
                     ),
                 ));
                 continue;
@@ -812,7 +816,7 @@ fn cmd_import_dvc_dir(
 
 /// Parse a .dvc file as a .dir type and load its manifest entries from the DVC cache.
 fn resolve_dir_manifest(
-    repo_root: &Path,
+    dvc_cache_root: &Path,
     source_path: &Path,
 ) -> Result<(String, Vec<dvc::DirEntry>)> {
     let kind = dvc::parse_dvc_file(source_path)?;
@@ -831,7 +835,7 @@ fn resolve_dir_manifest(
 
     // Find the manifest in DVC cache
     let manifest_digest = types::Hexdigest::new(&manifest_hash, types::HashFunction::Md5)?;
-    let manifest_path = cache::dvc_cache_path(repo_root, &manifest_digest);
+    let manifest_path = cache::dvc_cache_path(dvc_cache_root, &manifest_digest);
 
     // Also try with .dir suffix (some DVC versions store it this way)
     let manifest_path_dir = manifest_path.with_extension("dir");
@@ -852,6 +856,20 @@ fn resolve_dir_manifest(
 
     let entries = dvc::parse_dir_manifest(&actual_path)?;
     Ok((manifest_hash, entries))
+}
+
+/// Find the DVC project root from a .dvc source file and resolve its cache directory.
+/// If no DVC project exists (no `.dvc/` directory), falls back to repo-local `.dvc/cache`.
+fn resolve_dvc_cache(source_path: &Path) -> Result<std::path::PathBuf> {
+    match cache::find_dvc_project_root(source_path) {
+        Some(dvc_root) => cache::resolve_dvc_cache_root(&dvc_root),
+        None => {
+            // No DVC project — use default location relative to repo root.
+            // import_md5_from_dvc_cache will return NotInDvcCache if nothing's there.
+            let repo_root = git::repo_root()?;
+            Ok(repo_root.join(".dvc/cache"))
+        }
+    }
 }
 
 /// Reject absolute paths and path traversal.
