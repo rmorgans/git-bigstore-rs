@@ -14,10 +14,6 @@ path = "src/lib.rs"
 name = "git-bigstore"
 path = "src/main.rs"
 
-[[bin]]
-name = "git-bigstore-lfs-adapter"
-path = "src/lfs_adapter.rs"
-
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

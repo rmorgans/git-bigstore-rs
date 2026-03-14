@@ -15,7 +15,7 @@
 //!   2. git config bigstore-lfs.url (fallback for LFS-only repos)
 
 use anyhow::{Context, Result};
-use bigstore::{backend, config, types};
+use crate::{backend, config, types};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -294,7 +294,7 @@ fn handle_upload(
 // Main loop
 // ──────────────────────────────────────────────────
 
-fn main() -> Result<()> {
+pub fn run() -> Result<()> {
     let stdin = std::io::stdin();
     let reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout().lock();

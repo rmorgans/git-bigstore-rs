@@ -111,16 +111,30 @@ enum Commands {
     /// Internal: smudge filter (stdin -> stdout)
     #[command(name = "filter-smudge", hide = true)]
     FilterSmudge,
+
+    /// Internal: Git LFS custom transfer adapter (stdin/stdout JSON protocol)
+    #[command(name = "lfs-adapter", hide = true)]
+    LfsAdapter,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    if matches!(cli.command, Commands::LfsAdapter) {
+        return bigstore::lfs_adapter::run();
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Init { url, endpoint } => cmd_init(&url, endpoint.as_deref()).await,
@@ -139,6 +153,7 @@ async fn main() -> Result<()> {
         } => cmd_import_dvc_dir(&source, &dest_root, &patterns, force),
         Commands::FilterClean => filter::clean(),
         Commands::FilterSmudge => filter::smudge(),
+        Commands::LfsAdapter => unreachable!("dispatched before async runtime"),
     }
 }
 
