@@ -6,6 +6,8 @@ use object_store::ObjectStore;
 
 use crate::config::BackendConfig;
 
+/// Build an ObjectStore client from backend config. Used by both bigstore
+/// and the LFS transfer adapter.
 pub fn build_object_store(backend: &BackendConfig) -> Result<Box<dyn ObjectStore>> {
     match backend {
         BackendConfig::S3 {
