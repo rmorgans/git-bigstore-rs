@@ -249,11 +249,20 @@ fn handle_upload(
         Ok(()) // skip upload
     } else {
         rt.block_on(async {
-            let data = std::fs::read(path)
-                .with_context(|| format!("failed to read source file: {path}"))?;
-            let bytes = object_store::PutPayload::from(data);
-            cfg.store.put(&obj_path, bytes).await
-                .with_context(|| format!("failed to upload: {obj_path}"))?;
+            use tokio::io::AsyncReadExt;
+            let mut upload = cfg.store.put_multipart(&obj_path).await
+                .with_context(|| format!("failed to start upload: {obj_path}"))?;
+            let mut file = tokio::fs::File::open(path).await
+                .with_context(|| format!("failed to open source file: {path}"))?;
+            loop {
+                let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
+                let n = file.read(&mut buf).await?;
+                if n == 0 { break; }
+                buf.truncate(n);
+                upload.put_part(buf.into()).await?;
+            }
+            upload.complete().await
+                .with_context(|| format!("failed to complete upload: {obj_path}"))?;
             Ok(())
         })
     };
