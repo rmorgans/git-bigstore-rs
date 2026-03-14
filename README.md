@@ -14,10 +14,12 @@ corrupted repos during collaboration. bigstore fixed that with a simple,
 idempotent pointer format and direct cloud storage. It was a Python script, a
 `.gitattributes` line, and your S3 credentials. Nothing else.
 
-This rewrite keeps that philosophy — one binary, no server, no lock-in — and
-adds what a decade of real use demanded: concurrent transfers, integrity
-verification, DVC migration, LFS interop, and a storage-layer bridge that lets
-Git LFS clients pull from the same bucket without knowing bigstore exists.
+This rewrite is an exploration of the modern state of git and big data — what's
+possible now with Rust, async object-store crates, and the DVC/LFS ecosystem
+that didn't exist when Dan wrote the original. Git itself may absorb much of
+this soon. Until then: one binary, no server, no lock-in, and a storage-layer
+bridge that lets Git LFS clients pull from the same bucket without knowing
+bigstore exists.
 
 ## Install
 
