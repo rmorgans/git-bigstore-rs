@@ -373,15 +373,16 @@ clean/smudge, so applying both to the same path will break.
 
 ### LFS transfer adapter
 
-`git-bigstore-lfs-adapter` is a standalone Git LFS custom transfer agent that
-lets LFS clients upload/download from bigstore's bucket. No LFS API server
-needed — LFS talks directly to your object store.
+`git bigstore lfs-adapter` is a Git LFS custom transfer agent that lets LFS
+clients upload/download from bigstore's bucket. No LFS API server needed — LFS
+talks directly to your object store.
 
 **Setup** (in an LFS-configured repo):
 
 ```bash
 git config lfs.standalonetransferagent bigstore
-git config lfs.customtransfer.bigstore.path git-bigstore-lfs-adapter
+git config lfs.customtransfer.bigstore.path git-bigstore
+git config lfs.customtransfer.bigstore.args lfs-adapter
 ```
 
 **Config resolution:**

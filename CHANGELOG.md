@@ -35,7 +35,7 @@ models, pushed to Tigris, and verified on fresh clone.
 
 ### LFS interop
 
-- `git-bigstore-lfs-adapter` — standalone LFS custom transfer agent
+- `git bigstore lfs-adapter` — LFS custom transfer agent (hidden subcommand)
 - Lets Git LFS clients upload/download from bigstore's bucket (no LFS server needed)
 - SHA-256 object keys shared between LFS and bigstore
 - Storage-layer bridge only — no pointer-format bridging, no locking

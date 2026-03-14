@@ -6,7 +6,8 @@
 //!
 //! Git config:
 //!   [lfs "customtransfer.bigstore"]
-//!       path = git-bigstore-lfs-adapter
+//!       path = git-bigstore
+//!       args = lfs-adapter
 //!   [lfs]
 //!       standalonetransferagent = bigstore
 //!
@@ -348,7 +349,7 @@ pub fn run() -> Result<()> {
             "terminate" => break,
 
             other => {
-                eprintln!("git-bigstore-lfs-adapter: unknown event: {other}");
+                eprintln!("git-bigstore lfs-adapter: unknown event: {other}");
             }
         }
     }
