@@ -88,7 +88,7 @@ git bigstore pull "*.bin"      # pull only .bin files
 git bigstore pull --jobs 4     # limit to 4 concurrent downloads
 ```
 
-### `git bigstore status`
+### `git bigstore status [--verify]`
 
 Show the state of each tracked large file:
 
@@ -97,6 +97,15 @@ Show the state of each tracked large file:
         cached (not checked out)  models/gpt2.bin
               pointer only (needs pull)  data/train.bin
 ```
+
+Use `--verify` to re-hash cached objects and detect corruption:
+
+```bash
+git bigstore status --verify
+```
+
+Reports `CORRUPTED (hash mismatch)` for bad cache entries and exits non-zero
+with repair guidance.
 
 ### `git bigstore log [paths...]`
 
@@ -123,6 +132,33 @@ echo 'model.bin filter=bigstore' >> .gitattributes
 git add model.bin .gitattributes
 git commit -m "migrate model from DVC"
 git bigstore push
+```
+
+### `git bigstore dvc-ls <source.dvc>`
+
+List files in a DVC `.dir` manifest:
+
+```bash
+git bigstore dvc-ls models.dvc
+# 17 entries in models.dvc (manifest md5:0f0d92...)
+#   28a6a97b...  exports/model.onnx
+#   46ce4109...  exports/model.onnx.data
+```
+
+### `git bigstore import-dvc-dir <source.dvc> <dest> [patterns...]`
+
+Import files from a DVC `.dir` manifest into bigstore. Content is restored to
+the working tree automatically.
+
+```bash
+# Import everything
+git bigstore import-dvc-dir models.dvc models/
+
+# Import selectively
+git bigstore import-dvc-dir models.dvc models/ "exports/*.onnx"
+
+# Overwrite existing files
+git bigstore import-dvc-dir models.dvc models/ --force
 ```
 
 ### `git bigstore migrate-config`

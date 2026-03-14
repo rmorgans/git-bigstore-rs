@@ -49,10 +49,21 @@ pub fn find_dvc_project_root(start: &Path) -> Option<PathBuf> {
 /// Resolve the effective DVC cache root by asking DVC itself.
 ///
 /// Runs `dvc cache dir` from `dvc_project_root` (the directory containing `.dvc/`).
-/// Falls back to `{dvc_project_root}/.dvc/cache` only if the `dvc` binary is not
-/// installed. Real config errors are propagated.
+/// Only shells out when the DVC project has a config file (`.dvc/config`),
+/// since `dvc cache dir` returns the global cache even for bare `.dvc/` directories.
+/// Falls back to `{dvc_project_root}/.dvc/cache` when dvc is not installed or
+/// when no DVC config exists.
 pub fn resolve_dvc_cache_root(dvc_project_root: &Path) -> Result<PathBuf> {
     use std::io::ErrorKind;
+
+    // Only ask DVC if a config file exists — bare .dvc/ directories
+    // (e.g. created by mkdir -p .dvc/cache) should use the default path.
+    let has_config = dvc_project_root.join(".dvc/config").exists()
+        || dvc_project_root.join(".dvc/config.local").exists();
+
+    if !has_config {
+        return Ok(dvc_project_root.join(".dvc/cache"));
+    }
 
     match std::process::Command::new("dvc")
         .args(["cache", "dir"])
