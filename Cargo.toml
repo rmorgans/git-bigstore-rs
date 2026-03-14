@@ -6,6 +6,10 @@ rust-version = "1.75"
 description = "Large files in git, your bucket, one binary, zero config."
 license = "Apache-2.0"
 
+[lib]
+name = "bigstore"
+path = "src/lib.rs"
+
 [[bin]]
 name = "git-bigstore"
 path = "src/main.rs"

@@ -5,14 +5,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-mod backend;
+use bigstore::{backend, config, types};
+
 mod cache;
-mod config;
 mod dvc;
 mod filter;
 mod git;
 mod transfer;
-mod types;
 
 #[derive(Parser)]
 #[command(name = "git-bigstore", version, about = "Large files in git, your bucket, one binary.", long_about = None)]

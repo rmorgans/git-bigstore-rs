@@ -1,4 +1,4 @@
-mod rclone;
+pub(crate) mod rclone;
 pub mod store;
 
 use anyhow::Result;
