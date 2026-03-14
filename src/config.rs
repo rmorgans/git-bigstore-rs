@@ -145,6 +145,15 @@ impl BigstoreConfig {
         )
     }
 
+    pub fn bucket_prefix(&self) -> &str {
+        match &self.backend {
+            BackendConfig::S3 { prefix, .. }
+            | BackendConfig::Gcs { prefix, .. }
+            | BackendConfig::Azure { prefix, .. } => prefix.as_str(),
+            _ => "",
+        }
+    }
+
     pub fn backend_type(&self) -> &str {
         match &self.backend {
             BackendConfig::S3 { .. } => "s3",

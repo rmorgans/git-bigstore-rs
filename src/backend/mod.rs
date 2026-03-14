@@ -1,5 +1,5 @@
 mod rclone;
-mod store;
+pub mod store;
 
 use anyhow::Result;
 use object_store::ObjectStore;
