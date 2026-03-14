@@ -28,11 +28,70 @@ pub fn ensure_cache_dir(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Path to a DVC cache object.
-/// Layout: .dvc/cache/files/md5/<first2>/<rest>
-pub fn dvc_cache_path(repo_root: &Path, hexdigest: &Hexdigest) -> PathBuf {
-    repo_root
-        .join(".dvc/cache/files/md5")
+/// Find the DVC project root by walking up from `start` to find the nearest
+/// ancestor containing a `.dvc/` directory. Returns None if no DVC project found.
+pub fn find_dvc_project_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        if dir.join(".dvc").is_dir() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Resolve the effective DVC cache root by asking DVC itself.
+///
+/// Runs `dvc cache dir` from `dvc_project_root` (the directory containing `.dvc/`).
+/// Falls back to `{dvc_project_root}/.dvc/cache` only if the `dvc` binary is not
+/// installed. Real config errors are propagated.
+pub fn resolve_dvc_cache_root(dvc_project_root: &Path) -> Result<PathBuf> {
+    use std::io::ErrorKind;
+
+    match std::process::Command::new("dvc")
+        .args(["cache", "dir"])
+        .current_dir(dvc_project_root)
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_empty() {
+                anyhow::bail!(
+                    "`dvc cache dir` returned empty output in {}",
+                    dvc_project_root.display()
+                );
+            }
+            Ok(PathBuf::from(path))
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "`dvc cache dir` failed in {}:\n{stderr}",
+                dvc_project_root.display()
+            );
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // dvc not installed — fall back to default location
+            Ok(dvc_project_root.join(".dvc/cache"))
+        }
+        Err(e) => {
+            anyhow::bail!("failed to run `dvc cache dir`: {e}");
+        }
+    }
+}
+
+/// Path to a DVC cache object under a resolved cache root.
+/// Layout: {dvc_cache_root}/files/md5/<first2>/<rest>
+pub fn dvc_cache_path(dvc_cache_root: &Path, hexdigest: &Hexdigest) -> PathBuf {
+    dvc_cache_root
+        .join("files/md5")
         .join(hexdigest.prefix())
         .join(hexdigest.rest())
 }
@@ -86,10 +145,12 @@ pub enum DvcImportResult {
 /// MD5-specific by design: DVC cache paths are always MD5-sharded,
 /// so this function only accepts MD5 hexdigests.
 ///
+/// `dvc_cache_root` is the resolved DVC cache directory (from `resolve_dvc_cache_root`).
+///
 /// On success, the object is hash-verified and atomically persisted.
 /// Returns `Err` for integrity failures or I/O errors.
 pub fn import_md5_from_dvc_cache(
-    repo_root: &Path,
+    dvc_cache_root: &Path,
     git_dir: &Path,
     hexdigest: &Hexdigest,
 ) -> Result<DvcImportResult> {
@@ -98,7 +159,7 @@ pub fn import_md5_from_dvc_cache(
         return Ok(DvcImportResult::AlreadyCached);
     }
 
-    let dvc_path = dvc_cache_path(repo_root, hexdigest);
+    let dvc_path = dvc_cache_path(dvc_cache_root, hexdigest);
     if !dvc_path.exists() {
         return Ok(DvcImportResult::NotInDvcCache);
     }
