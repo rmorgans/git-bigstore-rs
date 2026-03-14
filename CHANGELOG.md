@@ -33,6 +33,13 @@ models, pushed to Tigris, and verified on fresh clone.
 - `status` — shows cached/checked-out/pointer-only state per file
 - `status --verify` — re-hashes cached objects, reports corruption with repair guidance
 
+### LFS interop
+
+- `git-bigstore-lfs-adapter` — standalone LFS custom transfer agent
+- Lets Git LFS clients upload/download from bigstore's bucket (no LFS server needed)
+- SHA-256 object keys shared between LFS and bigstore
+- Storage-layer bridge only — no pointer-format bridging, no locking
+
 ### Configuration safety
 
 - `init` preserves existing filter config on re-run
