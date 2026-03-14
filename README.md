@@ -1,11 +1,23 @@
-# bigstore
+# git-bigstore-rs
 
 Large files in git, your bucket, one binary.
 
-bigstore is a single-binary alternative to Git LFS. It stores large files in
-user-owned cloud storage (S3, GCS, Azure, R2, Tigris, or any rclone remote)
-using git clean/smudge filters. Files are content-addressed, integrity-verified,
-and deduplicated.
+A Rust rewrite of Dan Loewenherz's
+[git-bigstore](https://github.com/lionheart/git-bigstore) (2013), which got
+one thing right that everything else got wrong: large file storage should use
+git's own clean/smudge filters and your own bucket, not a vendor-hosted server
+with its own protocol and billing.
+
+Dan's original insight was that git-media (and later Git LFS) broke
+idempotency — running the clean filter twice produced different output, which
+corrupted repos during collaboration. bigstore fixed that with a simple,
+idempotent pointer format and direct cloud storage. It was a Python script, a
+`.gitattributes` line, and your S3 credentials. Nothing else.
+
+This rewrite keeps that philosophy — one binary, no server, no lock-in — and
+adds what a decade of real use demanded: concurrent transfers, integrity
+verification, DVC migration, LFS interop, and a storage-layer bridge that lets
+Git LFS clients pull from the same bucket without knowing bigstore exists.
 
 ## Install
 
