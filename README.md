@@ -326,6 +326,51 @@ The default storage layout (`files/{hash_fn}/{prefix}/{rest}`) is
 DVC-compatible. Objects uploaded by bigstore can coexist with DVC objects in the
 same bucket.
 
+## Comparison: bigstore vs Git LFS vs DVC
+
+All three solve "large files in git." They differ in where control sits.
+
+|  | **bigstore** | **Git LFS** | **DVC** |
+|--|-------------|-------------|---------|
+| Mechanism | Git clean/smudge filter | Git clean/smudge filter | Separate CLI, `.dvc` metafiles |
+| Storage | Any S3-compatible bucket you own | Host's LFS server | Any remote (S3, GCS, SSH, etc.) |
+| Pointer format | 3-line (`bigstore\nsha256\n<hex>`) | `version`, `oid`, `size` | YAML `.dvc` files |
+| Server required | No (direct bucket access) | Yes (LFS HTTP API on host) | No |
+| Billing | Your bucket costs | Host LFS quotas + bandwidth | Your bucket costs |
+| DVC migration | Built-in (`ref`, `import-dvc-dir`) | None | N/A |
+| File locking | No | Yes | No |
+| Ecosystem support | Custom tooling | Broad (GitHub, GitLab, etc.) | ML/data pipelines |
+| Integrity verification | Hash-verified on every transfer | Hash-verified | Hash-verified |
+
+### When to use what
+
+**Git LFS** when you want standard tooling with broad hosting support and don't
+mind host-managed storage. Best for teams on GitHub/GitLab who want minimal
+operational burden.
+
+**DVC** when your large files are part of ML pipelines with versioned
+experiments, parameters, and metrics. DVC is a data pipeline tool that happens
+to store files, not a git extension.
+
+**bigstore** when you want the git-native clean/smudge workflow with full
+control over your object storage. No LFS server needed, no host quotas, works
+with any S3-compatible bucket. Best for teams that already manage their own
+infrastructure.
+
+### Interop
+
+**bigstore + DVC**: Content-level interop via `ref` and `import-dvc-dir`.
+DVC-compatible storage layout allows coexistence in the same bucket. DVC is a
+byte source for bigstore, not a shared pointer layer.
+
+**bigstore + Git LFS**: Can coexist in one repo on different path patterns.
+Migration from LFS: `git lfs pull`, change `.gitattributes` to
+`filter=bigstore`, `git add`, push. No protocol-level interop — different
+pointer formats, different transfer mechanisms.
+
+**Same file path cannot use both filters.** Both bigstore and LFS use git
+clean/smudge, so applying both to the same path will break.
+
 ## Legacy config
 
 If your repo has a `.bigstore` file (no `.toml` extension), bigstore will load
