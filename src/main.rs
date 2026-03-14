@@ -151,19 +151,22 @@ async fn cmd_init(url: &str, endpoint: Option<&str>) -> Result<()> {
     let config_path = repo_root.join(".bigstore.toml");
     cfg.save(&config_path)?;
 
-    // Only set filter config if not already configured (preserve custom paths)
-    let had_filter = git::config_get("filter.bigstore.clean").is_some();
-    if !had_filter {
-        git::config_set("filter.bigstore.clean", "git-bigstore filter-clean")?;
-        git::config_set("filter.bigstore.smudge", "git-bigstore filter-smudge")?;
+    // Read existing filter config as a unit — detects partial/broken state
+    let existing = git::FilterConfig::load()?;
+    match &existing {
+        Some(_) => {
+            // Already configured (both clean and smudge present) — preserve
+        }
+        None => {
+            git::FilterConfig::default_commands().save()?;
+        }
     }
-    git::config_set("filter.bigstore.required", "true")?;
 
     cache::ensure_cache_dir(&git_dir)?;
 
     eprintln!("Initialized bigstore with backend: {}", cfg.backend_type());
     eprintln!("Config written to .bigstore.toml");
-    if had_filter {
+    if existing.is_some() {
         eprintln!("Filter config preserved (already configured)");
     }
     eprintln!();
