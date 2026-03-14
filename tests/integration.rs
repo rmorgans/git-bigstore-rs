@@ -152,6 +152,110 @@ fn init_preserves_existing_filter_config() {
     assert_eq!(smudge_after, custom_smudge, "smudge filter should be preserved");
 }
 
+/// Helper: create a bare git repo + storage dir for filter config tests.
+fn bare_test_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let storage_dir = tmp.path().join("storage");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&storage_dir).unwrap();
+
+    git(&repo_dir, &["init"]);
+    git(&repo_dir, &["config", "user.email", "test@test.com"]);
+    git(&repo_dir, &["config", "user.name", "Test"]);
+
+    (tmp, repo_dir, storage_dir)
+}
+
+#[test]
+fn init_rejects_clean_without_smudge() {
+    let (_tmp, repo_dir, storage_dir) = bare_test_repo();
+
+    git(
+        &repo_dir,
+        &["config", "filter.bigstore.clean", "git-bigstore filter-clean"],
+    );
+
+    let storage_url = format!("local://{}", storage_dir.display());
+    let output = bigstore(&repo_dir, &["init", &storage_url]);
+    assert!(!output.status.success(), "should fail with partial config");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("smudge is missing"),
+        "should report missing smudge: {stderr}"
+    );
+}
+
+#[test]
+fn init_rejects_smudge_without_clean() {
+    let (_tmp, repo_dir, storage_dir) = bare_test_repo();
+
+    git(
+        &repo_dir,
+        &["config", "filter.bigstore.smudge", "git-bigstore filter-smudge"],
+    );
+
+    let storage_url = format!("local://{}", storage_dir.display());
+    let output = bigstore(&repo_dir, &["init", &storage_url]);
+    assert!(!output.status.success(), "should fail with partial config");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("clean is missing"),
+        "should report missing clean: {stderr}"
+    );
+}
+
+#[test]
+fn init_rejects_mismatched_filter_binaries() {
+    let (_tmp, repo_dir, storage_dir) = bare_test_repo();
+
+    git(
+        &repo_dir,
+        &["config", "filter.bigstore.clean", "/usr/bin/bigstore filter-clean"],
+    );
+    git(
+        &repo_dir,
+        &["config", "filter.bigstore.smudge", "/opt/bin/bigstore filter-smudge"],
+    );
+    git(
+        &repo_dir,
+        &["config", "filter.bigstore.required", "true"],
+    );
+
+    let storage_url = format!("local://{}", storage_dir.display());
+    let output = bigstore(&repo_dir, &["init", &storage_url]);
+    assert!(!output.status.success(), "should fail with mismatched binaries");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("different binaries"),
+        "should report binary mismatch: {stderr}"
+    );
+}
+
+#[test]
+fn init_rejects_missing_required() {
+    let (_tmp, repo_dir, storage_dir) = bare_test_repo();
+
+    git(
+        &repo_dir,
+        &["config", "filter.bigstore.clean", "git-bigstore filter-clean"],
+    );
+    git(
+        &repo_dir,
+        &["config", "filter.bigstore.smudge", "git-bigstore filter-smudge"],
+    );
+    // Deliberately not setting required
+
+    let storage_url = format!("local://{}", storage_dir.display());
+    let output = bigstore(&repo_dir, &["init", &storage_url]);
+    assert!(!output.status.success(), "should fail with missing required");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("required"),
+        "should report missing required: {stderr}"
+    );
+}
+
 #[test]
 fn clean_filter_produces_pointer_file() {
     let t = TestRepo::new();
