@@ -26,6 +26,19 @@
 - DVC pointers are parsed strictly as DVC 3. A pointer without `hash: md5`
   comes from DVC 2 (md5-dos2unix, a different cache layout) and is refused
   with a message saying so, instead of being reported as a missing object.
+- **git runs one bigstore filter process per command** instead of one
+  clean/smudge process per file. `init` and `pull` set
+  `filter.bigstore.process = "<bin> filter-process"` (git's long-running
+  filter protocol) beside the one-shot `clean`/`smudge`/`required` keys, which
+  stay as the fallback for git older than 2.11; clones configured by an older
+  version gain the key on their next `pull` or `init`. For 500 files of 1 KiB
+  (local backend, macOS arm64): `pull` 11 s → 0.4 s, `pull` with a warm cache
+  9.7 s → 0.3 s, `git add` 13.7 s → 0.4 s. A `process` key with another
+  binary or subcommand, or without the one-shot keys, is rejected with a fix.
+- **Downgrading** to a version without `filter-process` needs
+  `git config --unset filter.bigstore.process` in each clone first; otherwise
+  every checkout, `git add` and `git status` of a tracked file fails with
+  `smudge filter bigstore failed` (nothing is corrupted).
 
 ### Fixed
 

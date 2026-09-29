@@ -78,7 +78,11 @@ git bigstore init t3://my-bucket
 ### `git bigstore init <url>`
 
 Initialize bigstore in the current repository. Creates `.bigstore.toml` and
-configures git clean/smudge filters.
+configures the git filter: one long-running filter process per git command
+(`filter.bigstore.process`), with the one-shot clean/smudge filters kept as
+the fallback for git older than 2.11. Existing filter config with a custom
+binary path is preserved; config written by an older version gains the
+process key.
 
 ### `git bigstore push [patterns...]`
 
@@ -103,7 +107,8 @@ Pull then checks files out through git, so they get their committed file mode
 and `git status` stays clean. Only files that are still unsmudged pointers are
 replaced: local edits are never overwritten, and missing files (deleted, or
 outside a sparse checkout) stay missing. In a fresh clone, pull configures the
-bigstore git filters if they are not set yet. If pull is interrupted, the
+bigstore git filters if they are not set yet, and it adds the filter process
+to a clone configured by an older version. If pull is interrupted, the
 next pull repairs the files it had started checking out.
 
 ```bash
@@ -248,8 +253,9 @@ that happens to start with `bigstore` — is stored as a large file.
 New content always gets a sha256 pointer. A file whose committed pointer is
 md5 (committed DVC pointer text) keeps that md5 pointer as long as its content
 matches it, so re-running the clean filter — as git does after checkout —
-never shows it as modified. git passes the path to the clean filter (`%f`) so
-it can look the pointer up in the index.
+never shows it as modified. git passes the path to the filter (`pathname` in
+the filter process, `%f` for one-shot clean) so it can look the pointer up in
+the index.
 
 The object cache lives in the repository's common git directory
 (`.git/bigstore/objects`), shared by all linked worktrees.
@@ -352,6 +358,8 @@ Tested against a real monorepo with 34 .dvc files across nested DVC projects.
   ```bash
   git config filter.bigstore.clean "/path/to/git-bigstore filter-clean %f"
   git config filter.bigstore.smudge "/path/to/git-bigstore filter-smudge"
+  git config filter.bigstore.required true
+  git config filter.bigstore.process "/path/to/git-bigstore filter-process"
   ```
 
 ### Pull fallback
@@ -538,6 +546,20 @@ Repos with layout templates that omit `{hash_fn}` (e.g.,
 objects require the `{hash_fn}` placeholder — bigstore will error with a clear
 message if the layout doesn't support the hash function.
 
+## Downgrading
+
+`init` and `pull` set `filter.bigstore.process`, which versions before the
+filter process do not understand: with such a binary every checkout, `git add`
+and `git status` of a tracked file fails (`smudge filter bigstore failed`,
+`clean filter 'bigstore' failed`). Nothing is corrupted. Before running an
+older binary, remove the key in each clone:
+
+```bash
+git config --unset filter.bigstore.process
+```
+
+git then uses the one-shot clean/smudge filters again.
+
 ## Troubleshooting
 
 **"no bigstore config found"** — Run `git bigstore init <url>` first, or check
@@ -564,3 +586,7 @@ corrupted cache entry and re-pull.
 **"layout template does not contain {hash_fn}"** — Your `.bigstore.toml` uses a
 legacy layout that only supports SHA-256. Update the layout to
 `files/{hash_fn}/{prefix}/{rest}` to support MD5/DVC objects.
+
+**"smudge filter bigstore failed"** or **"clean filter 'bigstore' failed"** on
+every file — The configured binary has no `filter-process` command (an older
+version, see [Downgrading](#downgrading)), or is not on PATH.
