@@ -286,11 +286,7 @@ mod tests {
     fn parse_dir_manifest_rejects_empty_relpath() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let md5 = "aa".repeat(16);
-        std::fs::write(
-            tmp.path(),
-            format!(r#"[{{"md5":"{md5}","relpath":""}}]"#),
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), format!(r#"[{{"md5":"{md5}","relpath":""}}]"#)).unwrap();
         assert!(parse_dir_manifest(tmp.path()).is_err());
     }
 
@@ -298,11 +294,7 @@ mod tests {
     fn parse_dir_manifest_rejects_dot_relpath() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let md5 = "aa".repeat(16);
-        std::fs::write(
-            tmp.path(),
-            format!(r#"[{{"md5":"{md5}","relpath":"."}}]"#),
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), format!(r#"[{{"md5":"{md5}","relpath":"."}}]"#)).unwrap();
         let err = parse_dir_manifest(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("."), "{err}");
     }
@@ -310,11 +302,7 @@ mod tests {
     #[test]
     fn parse_dir_manifest_rejects_bad_md5() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            tmp.path(),
-            r#"[{"md5":"not-valid","relpath":"file.bin"}]"#,
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), r#"[{"md5":"not-valid","relpath":"file.bin"}]"#).unwrap();
         assert!(parse_dir_manifest(tmp.path()).is_err());
     }
 }

@@ -73,7 +73,6 @@ impl Hexdigest {
     pub fn rest(&self) -> &str {
         &self.0[2..]
     }
-
 }
 
 impl fmt::Display for Hexdigest {
@@ -164,12 +163,12 @@ impl Layout {
                  Update layout in .bigstore.toml to: files/{{hash_fn}}/{{prefix}}/{{rest}}"
             );
         }
-        Ok(self.0
+        Ok(self
+            .0
             .replace("{hash_fn}", hash_fn.as_str())
             .replace("{prefix}", hexdigest.prefix())
             .replace("{rest}", hexdigest.rest()))
     }
-
 }
 
 /// DVC-compatible default layout.
@@ -187,13 +186,18 @@ impl fmt::Display for Layout {
 }
 
 impl Serialize for Layout {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Layout {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Layout::new(&s).map_err(serde::de::Error::custom)
     }

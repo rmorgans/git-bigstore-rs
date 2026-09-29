@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use futures::stream::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use object_store::ObjectStoreExt;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
@@ -125,10 +126,15 @@ async fn download_one(
 
     // Step 4: Download to temp file, hashing as we stream
     pb.set_message(format!("{path} (downloading)"));
-    let verified_path =
-        download_and_verify(store, &remote_key, git_dir, pointer.hash_fn, &pointer.hexdigest)
-            .await
-            .with_context(|| format!("downloading {path}"))?;
+    let verified_path = download_and_verify(
+        store,
+        &remote_key,
+        git_dir,
+        pointer.hash_fn,
+        &pointer.hexdigest,
+    )
+    .await
+    .with_context(|| format!("downloading {path}"))?;
 
     // Step 6 happened inside download_and_verify (atomic persist)
     // Step 7: Copy to working tree
@@ -171,8 +177,7 @@ async fn download_and_verify(
         }
         Backend::Rclone(_) => {
             // For rclone, download to temp first, then hash
-            let tmp_dl =
-                tempfile::NamedTempFile::new_in(cache::cache_dir(git_dir))?;
+            let tmp_dl = tempfile::NamedTempFile::new_in(cache::cache_dir(git_dir))?;
             backend::download(store, remote_key, tmp_dl.path()).await?;
 
             let mut file = std::fs::File::open(tmp_dl.path())?;
@@ -363,9 +368,17 @@ pub async fn pull(tracked: &[(String, String)], concurrency: usize) -> Result<Tr
         let dvc_cache_root = &dvc_cache_root;
         let pb = &pb;
         async move {
-            let outcome =
-                download_one(store, cfg, git_dir, repo_root, dvc_cache_root, path, pointer, pb)
-                    .await;
+            let outcome = download_one(
+                store,
+                cfg,
+                git_dir,
+                repo_root,
+                dvc_cache_root,
+                path,
+                pointer,
+                pb,
+            )
+            .await;
             (path.clone(), outcome)
         }
     }))
@@ -398,7 +411,6 @@ pub async fn pull(tracked: &[(String, String)], concurrency: usize) -> Result<Tr
     pb.finish_and_clear();
     Ok(summary)
 }
-
 
 /// Create a hasher for the given hash function.
 enum Hasher {
@@ -442,8 +454,7 @@ pub fn hash_file(path: &Path, hash_fn: HashFunction) -> Result<Hexdigest> {
         hasher.update(&buf[..n]);
     }
     let hex_str = hasher.finalize_hex();
-    Hexdigest::new(&hex_str, hash_fn)
-        .context("internal error: hasher produced invalid hex")
+    Hexdigest::new(&hex_str, hash_fn).context("internal error: hasher produced invalid hex")
 }
 
 fn progress_bar(total: u64) -> ProgressBar {

@@ -8,16 +8,7 @@
 [advisories]
 version = 2
 yanked = "deny"
-# Transitive advisories with no available fix. Remove each once object_store
-# (the sole path to both) ships a release that drops the dependency.
-ignore = [
-    # rustls-pemfile is unmaintained; pulled in only by object_store. No safe
-    # upgrade exists yet. Not a vulnerability.
-    "RUSTSEC-2025-0134",
-    # rand unsoundness only triggers with a custom global logger that calls
-    # rand::rng() during logging — not a pattern this crate uses.
-    "RUSTSEC-2026-0097",
-]
+ignore = []
 
 [licenses]
 version = 2
@@ -31,6 +22,8 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # Mozilla CA bundle data (webpki-root-certs, via reqwest's platform verifier).
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

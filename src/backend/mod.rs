@@ -2,7 +2,7 @@ pub(crate) mod rclone;
 pub mod store;
 
 use anyhow::Result;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,9 +19,9 @@ pub fn from_config(cfg: &BigstoreConfig) -> Result<Backend> {
             let s = store::build_object_store(&cfg.backend)?;
             Ok(Backend::ObjectStore(Arc::from(s)))
         }
-        BackendConfig::Rclone { remote } => Ok(Backend::Rclone(rclone::RcloneBackend::new(
-            remote.clone(),
-        ))),
+        BackendConfig::Rclone { remote } => {
+            Ok(Backend::Rclone(rclone::RcloneBackend::new(remote.clone())))
+        }
         BackendConfig::Local { path } => {
             let s = store::build_local_store(path)?;
             Ok(Backend::ObjectStore(Arc::from(s)))

@@ -73,7 +73,7 @@ impl TestRepo {
         std::fs::create_dir_all(&storage_dir).unwrap();
 
         // Init git repo
-        git(&repo_dir, &["init"]);
+        git(&repo_dir, &["init", "-b", "main"]);
         git(&repo_dir, &["config", "user.email", "test@test.com"]);
         git(&repo_dir, &["config", "user.name", "Test"]);
 
@@ -139,9 +139,15 @@ fn init_creates_config_and_sets_git_filters() {
     // Git filters should be configured (we override to full path in TestRepo::new,
     // so just check they contain "filter-clean" / "filter-smudge")
     let clean = git(&t.repo_dir, &["config", "filter.bigstore.clean"]);
-    assert!(clean.contains("filter-clean"), "clean filter not set: {clean}");
+    assert!(
+        clean.contains("filter-clean"),
+        "clean filter not set: {clean}"
+    );
     let smudge = git(&t.repo_dir, &["config", "filter.bigstore.smudge"]);
-    assert!(smudge.contains("filter-smudge"), "smudge filter not set: {smudge}");
+    assert!(
+        smudge.contains("filter-smudge"),
+        "smudge filter not set: {smudge}"
+    );
 }
 
 #[test]
@@ -152,20 +158,32 @@ fn init_preserves_existing_filter_config() {
     // Capture the current custom filter paths.
     let custom_clean = git(&t.repo_dir, &["config", "filter.bigstore.clean"]);
     let custom_smudge = git(&t.repo_dir, &["config", "filter.bigstore.smudge"]);
-    assert!(custom_clean.contains('/'), "should be a full path: {custom_clean}");
+    assert!(
+        custom_clean.contains('/'),
+        "should be a full path: {custom_clean}"
+    );
 
     // Re-run init — should NOT clobber the custom filter paths
     let storage_url = format!("local://{}", t.storage_dir.display());
     let output = bigstore(&t.repo_dir, &["init", &storage_url]);
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("preserved"), "should mention filter was preserved: {stderr}");
+    assert!(
+        stderr.contains("preserved"),
+        "should mention filter was preserved: {stderr}"
+    );
 
     // Verify filters are still the custom paths
     let clean_after = git(&t.repo_dir, &["config", "filter.bigstore.clean"]);
     let smudge_after = git(&t.repo_dir, &["config", "filter.bigstore.smudge"]);
-    assert_eq!(clean_after, custom_clean, "clean filter should be preserved");
-    assert_eq!(smudge_after, custom_smudge, "smudge filter should be preserved");
+    assert_eq!(
+        clean_after, custom_clean,
+        "clean filter should be preserved"
+    );
+    assert_eq!(
+        smudge_after, custom_smudge,
+        "smudge filter should be preserved"
+    );
 }
 
 /// Helper: create a bare git repo + storage dir for filter config tests.
@@ -176,7 +194,7 @@ fn bare_test_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::create_dir_all(&storage_dir).unwrap();
 
-    git(&repo_dir, &["init"]);
+    git(&repo_dir, &["init", "-b", "main"]);
     git(&repo_dir, &["config", "user.email", "test@test.com"]);
     git(&repo_dir, &["config", "user.name", "Test"]);
 
@@ -189,7 +207,11 @@ fn init_rejects_clean_without_smudge() {
 
     git(
         &repo_dir,
-        &["config", "filter.bigstore.clean", "git-bigstore filter-clean"],
+        &[
+            "config",
+            "filter.bigstore.clean",
+            "git-bigstore filter-clean",
+        ],
     );
 
     let storage_url = format!("local://{}", storage_dir.display());
@@ -208,7 +230,11 @@ fn init_rejects_smudge_without_clean() {
 
     git(
         &repo_dir,
-        &["config", "filter.bigstore.smudge", "git-bigstore filter-smudge"],
+        &[
+            "config",
+            "filter.bigstore.smudge",
+            "git-bigstore filter-smudge",
+        ],
     );
 
     let storage_url = format!("local://{}", storage_dir.display());
@@ -227,20 +253,28 @@ fn init_rejects_mismatched_filter_binaries() {
 
     git(
         &repo_dir,
-        &["config", "filter.bigstore.clean", "/usr/bin/bigstore filter-clean"],
+        &[
+            "config",
+            "filter.bigstore.clean",
+            "/usr/bin/bigstore filter-clean",
+        ],
     );
     git(
         &repo_dir,
-        &["config", "filter.bigstore.smudge", "/opt/bin/bigstore filter-smudge"],
+        &[
+            "config",
+            "filter.bigstore.smudge",
+            "/opt/bin/bigstore filter-smudge",
+        ],
     );
-    git(
-        &repo_dir,
-        &["config", "filter.bigstore.required", "true"],
-    );
+    git(&repo_dir, &["config", "filter.bigstore.required", "true"]);
 
     let storage_url = format!("local://{}", storage_dir.display());
     let output = bigstore(&repo_dir, &["init", &storage_url]);
-    assert!(!output.status.success(), "should fail with mismatched binaries");
+    assert!(
+        !output.status.success(),
+        "should fail with mismatched binaries"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("different binaries"),
@@ -254,17 +288,28 @@ fn init_rejects_missing_required() {
 
     git(
         &repo_dir,
-        &["config", "filter.bigstore.clean", "git-bigstore filter-clean"],
+        &[
+            "config",
+            "filter.bigstore.clean",
+            "git-bigstore filter-clean",
+        ],
     );
     git(
         &repo_dir,
-        &["config", "filter.bigstore.smudge", "git-bigstore filter-smudge"],
+        &[
+            "config",
+            "filter.bigstore.smudge",
+            "git-bigstore filter-smudge",
+        ],
     );
     // Deliberately not setting required
 
     let storage_url = format!("local://{}", storage_dir.display());
     let output = bigstore(&repo_dir, &["init", &storage_url]);
-    assert!(!output.status.success(), "should fail with missing required");
+    assert!(
+        !output.status.success(),
+        "should fail with missing required"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("required"),
@@ -380,8 +425,15 @@ fn large_file_multipart_round_trip() {
     bigstore_ok(&t.repo_dir, &["pull"]);
 
     let restored = t.read_file("big.bin");
-    assert_eq!(restored.len(), content.len(), "size mismatch after multipart round-trip");
-    assert_eq!(restored, content, "content mismatch after multipart round-trip");
+    assert_eq!(
+        restored.len(),
+        content.len(),
+        "size mismatch after multipart round-trip"
+    );
+    assert_eq!(
+        restored, content,
+        "content mismatch after multipart round-trip"
+    );
 }
 
 #[test]
@@ -399,7 +451,7 @@ fn push_is_idempotent() {
     // First push
     bigstore_ok(&t.repo_dir, &["push"]);
     // Second push — should skip (already uploaded)
-    let output = bigstore(& t.repo_dir, &["push"]);
+    let output = bigstore(&t.repo_dir, &["push"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("already up to date") || stderr.contains("0 file(s) uploaded"),
@@ -548,10 +600,7 @@ fn multiple_files_tracked() {
     t.write_file("a.bin", b"file a\n");
     t.write_file("b.bin", b"file b\n");
     t.write_file("assets/model.dat", b"model data\n");
-    git(
-        &t.repo_dir,
-        &["add", "a.bin", "b.bin", "assets/model.dat"],
-    );
+    git(&t.repo_dir, &["add", "a.bin", "b.bin", "assets/model.dat"]);
     git(&t.repo_dir, &["commit", "-m", "add files"]);
 
     // Push all
@@ -593,8 +642,11 @@ fn ref_creates_md5_pointer_from_dvc_file() {
     // Create a .dvc file
     t.write_file(
         "model.bin.dvc",
-        format!("outs:\n- md5: {md5_hash}\n  size: {}\n  path: model.bin\n", content.len())
-            .as_bytes(),
+        format!(
+            "outs:\n- md5: {md5_hash}\n  size: {}\n  path: model.bin\n",
+            content.len()
+        )
+        .as_bytes(),
     );
 
     // Run ref command
@@ -602,10 +654,14 @@ fn ref_creates_md5_pointer_from_dvc_file() {
 
     // Content is restored from cache — working tree has real data, not pointer text
     let restored = t.read_file("model.bin");
-    assert_eq!(restored, content, "working tree should have real content after ref");
+    assert_eq!(
+        restored, content,
+        "working tree should have real content after ref"
+    );
 
     // Bigstore cache should have the object
-    let bs_cache = t.repo_dir
+    let bs_cache = t
+        .repo_dir
         .join(".git/bigstore/objects/md5")
         .join(&md5_hash[..2])
         .join(&md5_hash[2..]);
@@ -654,24 +710,25 @@ fn ref_imports_from_dvc_cache_with_verification() {
     // Create .dvc file
     t.write_file(
         "data.bin.dvc",
-        format!("outs:\n- md5: {md5_hash}\n  size: {}\n  path: data.bin\n", content.len())
-            .as_bytes(),
+        format!(
+            "outs:\n- md5: {md5_hash}\n  size: {}\n  path: data.bin\n",
+            content.len()
+        )
+        .as_bytes(),
     );
 
     // Run ref — should import from DVC cache
     let output = bigstore(&t.repo_dir, &["ref", "data.bin.dvc", "data.bin"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "ref should succeed: {stderr}"
-    );
+    assert!(output.status.success(), "ref should succeed: {stderr}");
     assert!(
         stderr.contains("Imported from DVC cache"),
         "should report DVC cache import: {stderr}"
     );
 
     // Verify bigstore cache now has the object
-    let bs_cache = t.repo_dir
+    let bs_cache = t
+        .repo_dir
         .join(".git/bigstore/objects/md5")
         .join(shard)
         .join(rest);
@@ -860,7 +917,10 @@ fn legacy_layout_sha256_works_md5_rejected() {
 
     bigstore_ok(&t.repo_dir, &["pull"]);
     let restored = t.read_file("data.bin");
-    assert_eq!(restored, original_content, "sha256 should work with legacy layout");
+    assert_eq!(
+        restored, original_content,
+        "sha256 should work with legacy layout"
+    );
 
     // MD5 pointer should fail with layout-migration error
     let content = b"md5 content\n";
@@ -912,15 +972,30 @@ fn log_shows_bigstore_file_history() {
     let output = bigstore_ok(&t.repo_dir, &["log"]);
 
     // Should show both commits
-    assert!(output.contains("update model v2"), "should show v2 commit: {output}");
-    assert!(output.contains("add model v1"), "should show v1 commit: {output}");
+    assert!(
+        output.contains("update model v2"),
+        "should show v2 commit: {output}"
+    );
+    assert!(
+        output.contains("add model v1"),
+        "should show v1 commit: {output}"
+    );
 
     // Should show the file path
-    assert!(output.contains("model.bin"), "should show file path: {output}");
+    assert!(
+        output.contains("model.bin"),
+        "should show file path: {output}"
+    );
 
     // Should show + for add and ~ for modify
-    assert!(output.contains("+ model.bin"), "should show + for add: {output}");
-    assert!(output.contains("~ model.bin"), "should show ~ for modify: {output}");
+    assert!(
+        output.contains("+ model.bin"),
+        "should show + for add: {output}"
+    );
+    assert!(
+        output.contains("~ model.bin"),
+        "should show ~ for modify: {output}"
+    );
 }
 
 #[test]
@@ -961,7 +1036,10 @@ fn log_detects_renames() {
     let output = bigstore_ok(&t.repo_dir, &["log"]);
 
     // Should show R symbol with both paths
-    assert!(output.contains("R old.bin -> new.bin"), "should show R with old -> new: {output}");
+    assert!(
+        output.contains("R old.bin -> new.bin"),
+        "should show R with old -> new: {output}"
+    );
 }
 
 #[test]
@@ -980,8 +1058,14 @@ fn log_shows_delete_as_minus() {
     git(&t.repo_dir, &["commit", "-m", "delete temp"]);
 
     let output = bigstore_ok(&t.repo_dir, &["log"]);
-    assert!(output.contains("- temp.bin"), "should show - for delete: {output}");
-    assert!(output.contains("+ temp.bin"), "should also show + for the add: {output}");
+    assert!(
+        output.contains("- temp.bin"),
+        "should show - for delete: {output}"
+    );
+    assert!(
+        output.contains("+ temp.bin"),
+        "should also show + for the add: {output}"
+    );
 }
 
 #[test]
@@ -1005,7 +1089,10 @@ fn log_shows_changes_from_merge_commits() {
 
     // Switch back to main, merge feature
     git(&t.repo_dir, &["checkout", "main"]);
-    git(&t.repo_dir, &["merge", "feature", "--no-ff", "-m", "merge feature"]);
+    git(
+        &t.repo_dir,
+        &["merge", "feature", "--no-ff", "-m", "merge feature"],
+    );
 
     let output = bigstore_ok(&t.repo_dir, &["log"]);
 
@@ -1041,8 +1128,14 @@ fn log_ignores_non_bigstore_files() {
     let output = bigstore_ok(&t.repo_dir, &["log"]);
 
     // Should show data.bin but not readme.txt
-    assert!(output.contains("data.bin"), "should show data.bin: {output}");
-    assert!(!output.contains("readme.txt"), "should NOT show readme.txt: {output}");
+    assert!(
+        output.contains("data.bin"),
+        "should show data.bin: {output}"
+    );
+    assert!(
+        !output.contains("readme.txt"),
+        "should NOT show readme.txt: {output}"
+    );
 }
 
 #[test]
@@ -1057,14 +1150,34 @@ fn log_nonpointer_to_pointer_shows_add() {
     // Now add .gitattributes to track *.bin, re-add the file so the
     // clean filter converts it to a pointer
     t.write_file(".gitattributes", b"*.bin filter=bigstore\n");
-    bigstore_ok(&t.repo_dir, &["init", &format!("local://{}", t.storage_dir.display())]);
+    bigstore_ok(
+        &t.repo_dir,
+        &["init", &format!("local://{}", t.storage_dir.display())],
+    );
     // Override filter paths for test binary
     let bin = env!("CARGO_BIN_EXE_git-bigstore");
-    git(&t.repo_dir, &["config", "filter.bigstore.clean", &format!("{bin} filter-clean")]);
-    git(&t.repo_dir, &["config", "filter.bigstore.smudge", &format!("{bin} filter-smudge")]);
+    git(
+        &t.repo_dir,
+        &[
+            "config",
+            "filter.bigstore.clean",
+            &format!("{bin} filter-clean"),
+        ],
+    );
+    git(
+        &t.repo_dir,
+        &[
+            "config",
+            "filter.bigstore.smudge",
+            &format!("{bin} filter-smudge"),
+        ],
+    );
 
     t.write_file("model.bin", b"plain content\n"); // same content, but now filtered
-    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml", "model.bin"]);
+    git(
+        &t.repo_dir,
+        &["add", ".gitattributes", ".bigstore.toml", "model.bin"],
+    );
     git(&t.repo_dir, &["commit", "-m", "convert to bigstore"]);
 
     let output = bigstore_ok(&t.repo_dir, &["log"]);
@@ -1112,7 +1225,7 @@ fn log_root_commit_with_bigstore_file() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::create_dir_all(&storage_dir).unwrap();
 
-    git(&repo_dir, &["init"]);
+    git(&repo_dir, &["init", "-b", "main"]);
     git(&repo_dir, &["config", "user.email", "test@test.com"]);
     git(&repo_dir, &["config", "user.name", "Test"]);
 
@@ -1120,13 +1233,30 @@ fn log_root_commit_with_bigstore_file() {
     bigstore_ok(&repo_dir, &["init", &storage_url]);
 
     let bin = env!("CARGO_BIN_EXE_git-bigstore");
-    git(&repo_dir, &["config", "filter.bigstore.clean", &format!("{bin} filter-clean")]);
-    git(&repo_dir, &["config", "filter.bigstore.smudge", &format!("{bin} filter-smudge")]);
+    git(
+        &repo_dir,
+        &[
+            "config",
+            "filter.bigstore.clean",
+            &format!("{bin} filter-clean"),
+        ],
+    );
+    git(
+        &repo_dir,
+        &[
+            "config",
+            "filter.bigstore.smudge",
+            &format!("{bin} filter-smudge"),
+        ],
+    );
 
     // First (root) commit includes a bigstore file
     std::fs::write(repo_dir.join(".gitattributes"), b"*.bin filter=bigstore\n").unwrap();
     std::fs::write(repo_dir.join("initial.bin"), b"root commit data\n").unwrap();
-    git(&repo_dir, &["add", ".gitattributes", ".bigstore.toml", "initial.bin"]);
+    git(
+        &repo_dir,
+        &["add", ".gitattributes", ".bigstore.toml", "initial.bin"],
+    );
     git(&repo_dir, &["commit", "-m", "root with bigstore file"]);
 
     let output = bigstore_ok(&repo_dir, &["log"]);
@@ -1158,11 +1288,7 @@ fn log_copy_shows_c_with_both_paths() {
     // To trigger copy detection with -C, the source must also be modified
     // in the same changeset. So: copy original.bin -> copy.bin AND modify
     // original.bin in the same commit.
-    std::fs::copy(
-        t.repo_dir.join("original.bin"),
-        t.repo_dir.join("copy.bin"),
-    )
-    .unwrap();
+    std::fs::copy(t.repo_dir.join("original.bin"), t.repo_dir.join("copy.bin")).unwrap();
     t.write_file("original.bin", b"modified original for copy test\n");
     git(&t.repo_dir, &["add", "copy.bin", "original.bin"]);
     git(&t.repo_dir, &["commit", "-m", "copy and modify"]);
@@ -1242,8 +1368,14 @@ fn dvc_ls_lists_dir_entries() {
     setup_dvc_dir(&t, "models.dvc", files);
 
     let output = bigstore_ok(&t.repo_dir, &["dvc-ls", "models.dvc"]);
-    assert!(output.contains("weights/model.pt"), "should list model.pt: {output}");
-    assert!(output.contains("exports/out.onnx"), "should list out.onnx: {output}");
+    assert!(
+        output.contains("weights/model.pt"),
+        "should list model.pt: {output}"
+    );
+    assert!(
+        output.contains("exports/out.onnx"),
+        "should list out.onnx: {output}"
+    );
 }
 
 #[test]
@@ -1253,8 +1385,11 @@ fn dvc_ls_rejects_single_file_dvc() {
     let md5_hash = format!("{:x}", md5::Md5::digest(content));
     t.write_file(
         "data.dvc",
-        format!("outs:\n- md5: {md5_hash}\n  size: {}\n  path: data.bin\n", content.len())
-            .as_bytes(),
+        format!(
+            "outs:\n- md5: {md5_hash}\n  size: {}\n  path: data.bin\n",
+            content.len()
+        )
+        .as_bytes(),
     );
 
     let output = bigstore(&t.repo_dir, &["dvc-ls", "data.dvc"]);
@@ -1276,12 +1411,12 @@ fn import_dvc_dir_imports_multiple_files() {
     ];
     let info = setup_dvc_dir(&t, "models.dvc", files);
 
-    let output = bigstore(&t.repo_dir, &["import-dvc-dir", "models.dvc", "imported-models"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "import should succeed: {stderr}"
+    let output = bigstore(
+        &t.repo_dir,
+        &["import-dvc-dir", "models.dvc", "imported-models"],
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "import should succeed: {stderr}");
 
     // Content is restored from cache — working tree has real data, not pointer text
     let expected_contents: std::collections::HashMap<&str, &[u8]> = files.iter().copied().collect();
@@ -1290,16 +1425,23 @@ fn import_dvc_dir_imports_multiple_files() {
         assert!(file_path.exists(), "file should exist at {relpath}");
         let actual = std::fs::read(&file_path).unwrap();
         let expected = expected_contents[relpath.as_str()];
-        assert_eq!(actual, expected, "working tree should have real content for {relpath}");
+        assert_eq!(
+            actual, expected,
+            "working tree should have real content for {relpath}"
+        );
     }
 
     // Verify bigstore cache has the objects
     for (md5, _relpath) in &info {
-        let bs_cache = t.repo_dir
+        let bs_cache = t
+            .repo_dir
             .join(".git/bigstore/objects/md5")
             .join(&md5[..2])
             .join(&md5[2..]);
-        assert!(bs_cache.exists(), "object {md5} should be in bigstore cache");
+        assert!(
+            bs_cache.exists(),
+            "object {md5} should be in bigstore cache"
+        );
     }
 
     // Verify suggested .gitattributes pattern
@@ -1379,9 +1521,7 @@ fn import_dvc_dir_fails_on_missing_cache_blob() {
 #[test]
 fn import_dvc_dir_fails_on_existing_destination() {
     let t = TestRepo::new();
-    let files: &[(&str, &[u8])] = &[
-        ("model.pt", b"model data"),
-    ];
+    let files: &[(&str, &[u8])] = &[("model.pt", b"model data")];
     setup_dvc_dir(&t, "models.dvc", files);
 
     // Create a conflicting file at the destination
@@ -1403,21 +1543,25 @@ fn import_dvc_dir_fails_on_existing_destination() {
 #[test]
 fn import_dvc_dir_force_overwrites() {
     let t = TestRepo::new();
-    let files: &[(&str, &[u8])] = &[
-        ("model.pt", b"model data"),
-    ];
+    let files: &[(&str, &[u8])] = &[("model.pt", b"model data")];
     setup_dvc_dir(&t, "models.dvc", files);
 
     // Create conflicting file
     t.write_file("dest/model.pt", b"old content");
 
-    let output = bigstore(&t.repo_dir, &["import-dvc-dir", "models.dvc", "dest", "--force"]);
+    let output = bigstore(
+        &t.repo_dir,
+        &["import-dvc-dir", "models.dvc", "dest", "--force"],
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "force should succeed: {stderr}");
 
     // Content is restored — working tree has real data, not old content
     let content = std::fs::read(t.repo_dir.join("dest/model.pt")).unwrap();
-    assert_eq!(content, b"model data", "should have restored content, not old data");
+    assert_eq!(
+        content, b"model data",
+        "should have restored content, not old data"
+    );
 }
 
 #[test]
@@ -1436,7 +1580,10 @@ fn import_dvc_dir_filters_by_pattern() {
         &["import-dvc-dir", "models.dvc", "dest", "exports/*.onnx"],
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "filtered import should succeed: {stderr}");
+    assert!(
+        output.status.success(),
+        "filtered import should succeed: {stderr}"
+    );
 
     // Only exports/*.onnx should be imported
     assert!(t.repo_dir.join("dest/exports/out.onnx").exists());
@@ -1451,7 +1598,10 @@ fn dvc_ls_rejects_path_traversal() {
     let output = bigstore(&t.repo_dir, &["dvc-ls", "../../../etc/passwd"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(".."), "should reject path traversal: {stderr}");
+    assert!(
+        stderr.contains(".."),
+        "should reject path traversal: {stderr}"
+    );
 
     let output = bigstore(&t.repo_dir, &["dvc-ls", "/etc/passwd"]);
     assert!(!output.status.success());
@@ -1471,7 +1621,10 @@ fn import_dvc_dir_rejects_source_path_traversal() {
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(".."), "should reject source traversal: {stderr}");
+    assert!(
+        stderr.contains(".."),
+        "should reject source traversal: {stderr}"
+    );
 }
 
 #[test]
@@ -1486,15 +1639,16 @@ fn import_dvc_dir_rejects_dest_path_traversal() {
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(".."), "should reject dest traversal: {stderr}");
+    assert!(
+        stderr.contains(".."),
+        "should reject dest traversal: {stderr}"
+    );
 }
 
 #[test]
 fn import_dvc_dir_suggests_directory_scoped_gitattributes() {
     let t = TestRepo::new();
-    let files: &[(&str, &[u8])] = &[
-        ("file.bin", b"data"),
-    ];
+    let files: &[(&str, &[u8])] = &[("file.bin", b"data")];
     setup_dvc_dir(&t, "models.dvc", files);
 
     let output = bigstore(&t.repo_dir, &["import-dvc-dir", "models.dvc", "my-models"]);
@@ -1571,7 +1725,10 @@ fn lfs_adapter_downloads_and_verifies() {
         .lines()
         .find(|l| l.contains("\"event\":\"complete\""))
         .unwrap_or_else(|| panic!("no complete event: {stdout}"));
-    assert!(!complete.contains("\"error\""), "good object should not error: {complete}");
+    assert!(
+        !complete.contains("\"error\""),
+        "good object should not error: {complete}"
+    );
 
     let v: serde_json::Value = serde_json::from_str(complete).unwrap();
     assert!(
@@ -1645,8 +1802,15 @@ fn lfs_adapter_uploads_verified() {
         .lines()
         .find(|l| l.contains("\"event\":\"complete\""))
         .unwrap_or_else(|| panic!("no complete event: {stdout}"));
-    assert!(!complete.contains("\"error\""), "valid upload should not error: {complete}");
-    assert_eq!(storage_object_count(&t), 1, "verified upload should write one object");
+    assert!(
+        !complete.contains("\"error\""),
+        "valid upload should not error: {complete}"
+    );
+    assert_eq!(
+        storage_object_count(&t),
+        1,
+        "verified upload should write one object"
+    );
 }
 
 #[test]

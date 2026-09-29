@@ -26,9 +26,13 @@
   library crate; the binary is now a thin CLI shell. Removes duplicated git
   helpers in the LFS adapter and makes the core unit-testable.
 - Replaced unmaintained `serde_yaml` (RUSTSEC-2024-0370) with `serde_yaml_ng`.
-- Bumped `object_store` to 0.12; updated `rustls-webpki` to clear four
-  advisories. Added `deny.toml` for `cargo deny` supply-chain gating.
+- Bumped `object_store` to 0.14 and refreshed the lockfile, clearing
+  advisories in `rustls-webpki`, `quick-xml` (RUSTSEC-2026-0194/0195), `h2`
+  (RUSTSEC-2026-0258) and `rustls` (RUSTSEC-2026-0285). TLS now uses
+  `aws-lc-rs` with the platform certificate verifier. Added `deny.toml` for
+  `cargo deny` supply-chain gating.
 - Removed the unimplemented `bigstore-compress` filter recognition.
+- `rust-version` raised to 1.89, the floor the dependency tree now requires.
 
 ## 0.1.0
 

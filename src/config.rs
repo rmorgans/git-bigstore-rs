@@ -41,14 +41,10 @@ pub enum BackendConfig {
     },
 
     #[serde(rename = "rclone")]
-    Rclone {
-        remote: String,
-    },
+    Rclone { remote: String },
 
     #[serde(rename = "local")]
-    Local {
-        path: String,
-    },
+    Local { path: String },
 }
 
 impl BigstoreConfig {
@@ -124,8 +120,7 @@ impl BigstoreConfig {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         // Layout is validated during deserialization — invalid templates fail here
-        toml::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
     }
 
     /// Find and load config from a repo root.
@@ -137,12 +132,12 @@ impl BigstoreConfig {
         }
         let legacy_path = repo_root.join(".bigstore");
         if legacy_path.exists() {
-            eprintln!("note: using legacy .bigstore config; run `git bigstore migrate-config` to upgrade");
+            eprintln!(
+                "note: using legacy .bigstore config; run `git bigstore migrate-config` to upgrade"
+            );
             return Self::load(&legacy_path);
         }
-        anyhow::bail!(
-            "no bigstore config found (looked for .bigstore.toml and .bigstore)"
-        )
+        anyhow::bail!("no bigstore config found (looked for .bigstore.toml and .bigstore)")
     }
 
     pub fn bucket_prefix(&self) -> &str {
@@ -167,7 +162,11 @@ impl BigstoreConfig {
     /// Build the remote object key using the configured layout.
     /// Safe: Layout is validated, Hexdigest is validated.
     /// Returns Err if the layout doesn't support the given hash function.
-    pub fn remote_object_key(&self, hexdigest: &Hexdigest, hash_fn: HashFunction) -> Result<String> {
+    pub fn remote_object_key(
+        &self,
+        hexdigest: &Hexdigest,
+        hash_fn: HashFunction,
+    ) -> Result<String> {
         let key = self.layout.object_key(hexdigest, hash_fn)?;
 
         let bucket_prefix = match &self.backend {
@@ -224,10 +223,7 @@ mod tests {
         let cfg = BigstoreConfig::from_url("t3://my-bucket", None).unwrap();
         match &cfg.backend {
             BackendConfig::S3 { endpoint, .. } => {
-                assert_eq!(
-                    endpoint.as_deref(),
-                    Some("https://fly.storage.tigris.dev")
-                );
+                assert_eq!(endpoint.as_deref(), Some("https://fly.storage.tigris.dev"));
             }
             _ => panic!("expected S3"),
         }
@@ -238,7 +234,10 @@ mod tests {
         let cfg = BigstoreConfig::from_url("s3://bucket/data", None).unwrap();
         let d = test_digest();
         let key = cfg.remote_object_key(&d, HashFunction::Sha256).unwrap();
-        assert_eq!(key, format!("data/files/sha256/{}/{}", d.prefix(), d.rest()));
+        assert_eq!(
+            key,
+            format!("data/files/sha256/{}/{}", d.prefix(), d.rest())
+        );
     }
 
     #[test]

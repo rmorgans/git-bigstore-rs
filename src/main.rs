@@ -288,9 +288,7 @@ fn cmd_migrate_config(force: bool) -> Result<()> {
     );
 
     if toml_path.exists() && !force {
-        anyhow::bail!(
-            ".bigstore.toml already exists. Use --force to overwrite."
-        );
+        anyhow::bail!(".bigstore.toml already exists. Use --force to overwrite.");
     }
 
     // Load from legacy, save as toml (validates + normalizes)
@@ -341,12 +339,28 @@ fn cmd_log(paths: &[String]) -> Result<()> {
         // For all others (including merges): diff against first parent explicitly
         let diff_output = if is_root {
             Command::new("git")
-                .args(["diff-tree", "--root", "-r", "-M", "-C", "--name-status", commit])
+                .args([
+                    "diff-tree",
+                    "--root",
+                    "-r",
+                    "-M",
+                    "-C",
+                    "--name-status",
+                    commit,
+                ])
                 .output()?
         } else {
             let parent = format!("{commit}~1");
             Command::new("git")
-                .args(["diff-tree", "-r", "-M", "-C", "--name-status", &parent, commit])
+                .args([
+                    "diff-tree",
+                    "-r",
+                    "-M",
+                    "-C",
+                    "--name-status",
+                    &parent,
+                    commit,
+                ])
                 .output()?
         };
         if !diff_output.status.success() {
@@ -419,8 +433,12 @@ fn cmd_log(paths: &[String]) -> Result<()> {
                 // Rename where bigstore tracking was removed
                 ('R', Some(_), None) => ChangeKind::RenamedDeleted,
                 // Pure rename (same content hash)
-                ('R', _, _) if old_pointer.as_ref().map(|p| &p.hexdigest)
-                    == new_pointer.as_ref().map(|p| &p.hexdigest) => ChangeKind::Renamed,
+                ('R', _, _)
+                    if old_pointer.as_ref().map(|p| &p.hexdigest)
+                        == new_pointer.as_ref().map(|p| &p.hexdigest) =>
+                {
+                    ChangeKind::Renamed
+                }
                 // Everything else: content change
                 _ => ChangeKind::Modified,
             };
@@ -442,7 +460,9 @@ fn cmd_log(paths: &[String]) -> Result<()> {
         let meta_output = Command::new("git")
             .args(["log", "-1", "--format=%h %ai %s", commit])
             .output()?;
-        let meta = String::from_utf8_lossy(&meta_output.stdout).trim().to_string();
+        let meta = String::from_utf8_lossy(&meta_output.stdout)
+            .trim()
+            .to_string();
 
         if found_any {
             println!();
@@ -461,31 +481,55 @@ fn cmd_log(paths: &[String]) -> Result<()> {
             match c.kind {
                 ChangeKind::Added => {
                     if let Some(p) = &c.new_pointer {
-                        println!("    {symbol} {}  {}:{}", c.path, p.hash_fn, short_hash(&p.hexdigest));
+                        println!(
+                            "    {symbol} {}  {}:{}",
+                            c.path,
+                            p.hash_fn,
+                            short_hash(&p.hexdigest)
+                        );
                     }
                 }
                 ChangeKind::Deleted => {
                     if let Some(p) = &c.old_pointer {
-                        println!("    {symbol} {}  {}:{}", c.path, p.hash_fn, short_hash(&p.hexdigest));
+                        println!(
+                            "    {symbol} {}  {}:{}",
+                            c.path,
+                            p.hash_fn,
+                            short_hash(&p.hexdigest)
+                        );
                     }
                 }
                 ChangeKind::RenamedAdded | ChangeKind::Copied => {
                     let old = c.old_path.as_deref().unwrap_or("?");
                     if let Some(p) = &c.new_pointer {
-                        println!("    {symbol} {old} -> {}  {}:{}", c.path, p.hash_fn, short_hash(&p.hexdigest));
+                        println!(
+                            "    {symbol} {old} -> {}  {}:{}",
+                            c.path,
+                            p.hash_fn,
+                            short_hash(&p.hexdigest)
+                        );
                     }
                 }
                 ChangeKind::RenamedDeleted => {
                     let old = c.old_path.as_deref().unwrap_or("?");
                     if let Some(p) = &c.old_pointer {
-                        println!("    {symbol} {old} -> {}  {}:{}", c.path, p.hash_fn, short_hash(&p.hexdigest));
+                        println!(
+                            "    {symbol} {old} -> {}  {}:{}",
+                            c.path,
+                            p.hash_fn,
+                            short_hash(&p.hexdigest)
+                        );
                     }
                 }
                 ChangeKind::Modified => {
-                    let old_desc = c.old_pointer.as_ref()
+                    let old_desc = c
+                        .old_pointer
+                        .as_ref()
                         .map(|p| format!("{}:{}", p.hash_fn, short_hash(&p.hexdigest)))
                         .unwrap_or_else(|| "(not a pointer)".to_string());
-                    let new_desc = c.new_pointer.as_ref()
+                    let new_desc = c
+                        .new_pointer
+                        .as_ref()
                         .map(|p| format!("{}:{}", p.hash_fn, short_hash(&p.hexdigest)))
                         .unwrap_or_else(|| "(not a pointer)".to_string());
                     let path_str = if let Some(op) = &c.old_path {
@@ -498,7 +542,12 @@ fn cmd_log(paths: &[String]) -> Result<()> {
                 ChangeKind::Renamed => {
                     let old = c.old_path.as_deref().unwrap_or("?");
                     if let Some(p) = &c.new_pointer {
-                        println!("    {symbol} {old} -> {}  {}:{}", c.path, p.hash_fn, short_hash(&p.hexdigest));
+                        println!(
+                            "    {symbol} {old} -> {}  {}:{}",
+                            c.path,
+                            p.hash_fn,
+                            short_hash(&p.hexdigest)
+                        );
                     }
                 }
             }
@@ -545,7 +594,11 @@ impl CatFileBatch {
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout was piped"));
 
-        Ok(Self { child, stdin: Some(stdin), stdout })
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout,
+        })
     }
 
     /// Read a blob and try to parse it as a bigstore pointer.
@@ -615,7 +668,7 @@ impl Drop for CatFileBatch {
 fn short_hash(hexdigest: &types::Hexdigest) -> String {
     let s = hexdigest.to_string();
     if s.len() > 12 {
-        format!("{}..{}", &s[..6], &s[s.len()-6..])
+        format!("{}..{}", &s[..6], &s[s.len() - 6..])
     } else {
         s
     }
@@ -769,10 +822,7 @@ fn cmd_import_dvc_dir(
             for c in &conflicts {
                 eprintln!("  {dest_root}/{c}");
             }
-            anyhow::bail!(
-                "{} destination file(s) already exist",
-                conflicts.len()
-            );
+            anyhow::bail!("{} destination file(s) already exist", conflicts.len());
         }
     }
 
@@ -815,8 +865,7 @@ fn cmd_import_dvc_dir(
 
         // Restore real content so working tree has data, not pointer text.
         // The clean filter will convert back to pointer on `git add`.
-        let cache_path =
-            cache::object_path(&git_dir, hexdigest, types::HashFunction::Md5);
+        let cache_path = cache::object_path(&git_dir, hexdigest, types::HashFunction::Md5);
         if cache_path.exists() {
             cache::copy_to_working_tree(&cache_path, &dest_path)?;
         }
@@ -838,7 +887,11 @@ fn cmd_import_dvc_dir(
         for (path, err) in &failed {
             eprintln!("FAILED: {path} — {err}");
         }
-        anyhow::bail!("{} of {} entries failed", failed.len(), failed.len() + total as usize);
+        anyhow::bail!(
+            "{} of {} entries failed",
+            failed.len(),
+            failed.len() + total as usize
+        );
     }
 
     eprintln!();
@@ -912,7 +965,10 @@ fn resolve_dvc_cache(source_path: &Path) -> Result<std::path::PathBuf> {
 /// Reject absolute paths and path traversal.
 fn validate_relative_path(label: &str, p: &str) -> Result<()> {
     let path = Path::new(p);
-    anyhow::ensure!(!path.is_absolute(), "{label} must be a relative path: {p:?}");
+    anyhow::ensure!(
+        !path.is_absolute(),
+        "{label} must be a relative path: {p:?}"
+    );
     anyhow::ensure!(
         !path
             .components()

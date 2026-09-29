@@ -49,8 +49,8 @@ pub fn clean() -> Result<()> {
     tmp.flush()?;
 
     let hex_str = hex::encode(hasher.finalize());
-    let hexdigest = Hexdigest::new(&hex_str, hash_fn)
-        .context("internal error: sha256 produced invalid hex")?;
+    let hexdigest =
+        Hexdigest::new(&hex_str, hash_fn).context("internal error: sha256 produced invalid hex")?;
 
     let dest = cache::object_path(&git_dir, &hexdigest, hash_fn);
     if let Some(parent) = dest.parent() {

@@ -15,8 +15,8 @@
 //!   1. .bigstore.toml (if present)
 //!   2. git config bigstore-lfs.url (fallback for LFS-only repos)
 
-use anyhow::{Context, Result};
 use crate::{backend, config, git, transfer, types};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -326,8 +326,8 @@ pub fn run() -> Result<()> {
             continue;
         }
 
-        let event: Event =
-            serde_json::from_str(&line).with_context(|| format!("invalid JSON from LFS: {line}"))?;
+        let event: Event = serde_json::from_str(&line)
+            .with_context(|| format!("invalid JSON from LFS: {line}"))?;
 
         match event.event.as_str() {
             "init" => match load_config() {

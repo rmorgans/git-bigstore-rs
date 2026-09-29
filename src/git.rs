@@ -88,14 +88,18 @@ impl FilterConfig {
         }
 
         // Partial presence
-        let clean = clean.ok_or_else(|| anyhow::anyhow!(
-            "filter.bigstore.smudge is set but filter.bigstore.clean is missing.\n\
+        let clean = clean.ok_or_else(|| {
+            anyhow::anyhow!(
+                "filter.bigstore.smudge is set but filter.bigstore.clean is missing.\n\
              Fix: git config filter.bigstore.clean \"git-bigstore filter-clean\""
-        ))?;
-        let smudge = smudge.ok_or_else(|| anyhow::anyhow!(
-            "filter.bigstore.clean is set but filter.bigstore.smudge is missing.\n\
+            )
+        })?;
+        let smudge = smudge.ok_or_else(|| {
+            anyhow::anyhow!(
+                "filter.bigstore.clean is set but filter.bigstore.smudge is missing.\n\
              Fix: git config filter.bigstore.smudge \"git-bigstore filter-smudge\""
-        ))?;
+            )
+        })?;
 
         // Required must be "true"
         match required.as_deref() {
@@ -111,16 +115,20 @@ impl FilterConfig {
         }
 
         // Command shape: must end with "filter-clean" / "filter-smudge"
-        let clean_bin = clean.strip_suffix(" filter-clean").ok_or_else(|| anyhow::anyhow!(
-            "filter.bigstore.clean has unexpected format: {clean:?}\n\
+        let clean_bin = clean.strip_suffix(" filter-clean").ok_or_else(|| {
+            anyhow::anyhow!(
+                "filter.bigstore.clean has unexpected format: {clean:?}\n\
              Expected: \"<binary> filter-clean\"\n\
              Fix: git config filter.bigstore.clean \"git-bigstore filter-clean\""
-        ))?;
-        let smudge_bin = smudge.strip_suffix(" filter-smudge").ok_or_else(|| anyhow::anyhow!(
-            "filter.bigstore.smudge has unexpected format: {smudge:?}\n\
+            )
+        })?;
+        let smudge_bin = smudge.strip_suffix(" filter-smudge").ok_or_else(|| {
+            anyhow::anyhow!(
+                "filter.bigstore.smudge has unexpected format: {smudge:?}\n\
              Expected: \"<binary> filter-smudge\"\n\
              Fix: git config filter.bigstore.smudge \"git-bigstore filter-smudge\""
-        ))?;
+            )
+        })?;
 
         // Same binary prefix
         anyhow::ensure!(
