@@ -1,11 +1,13 @@
 //! `bigstore::folder` as a library consumer uses it: plain folders, a
 //! `local://` remote, no git.
 
-use bigstore::dvc::{DvcOutput, DvcPointer};
+use bigstore::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use bigstore::folder::{
     self, Credentials, HistoryKey, Overwrite, PointerSource, PullConflict, PullOptions,
     PushOptions, Remote, RemoteConfig, Selector,
 };
+use bigstore::hash::{hash_file, hash_reader};
+use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
 use std::path::{Path, PathBuf};
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dvc-3.67.1");
@@ -406,8 +408,9 @@ fn calling_from_inside_a_tokio_runtime_is_an_error_not_a_panic() {
 
 #[test]
 fn pulls_what_dvc_pushed() {
-    // The golden remote DVC 3.67.1 wrote with `dvc push`: bigstore restores
-    // every file and each one hashes to the manifest's md5.
+    // The golden remote DVC 3.67.1 wrote with `dvc push`, including a
+    // non-ASCII name push would refuse: bigstore restores every file and
+    // each one hashes to the manifest's md5.
     let e = env();
     let golden = Path::new(GOLDEN).join("dataset");
     let remote = Remote::open(&RemoteConfig {
@@ -417,21 +420,92 @@ fn pulls_what_dvc_pushed() {
         credentials: Credentials::FromEnv,
     })
     .unwrap();
-    let pointer = DvcPointer::load(&golden.join("tt.dvc")).unwrap();
-    let DvcOutput::Dir { nfiles, .. } = pointer.output else {
-        panic!()
-    };
-    // Its manifest includes a non-ASCII name this mode refuses to create.
     let restore = e.data.join("tt");
-    let err = folder::pull(
+    let report = folder::pull(
         &remote,
         &PointerSource::File(golden.join("tt.dvc")),
         &pull_opts(Some(restore.clone())),
     )
-    .unwrap_err();
-    assert!(format!("{err:#}").contains("ASCII"), "{err:#}");
-    assert!(!restore.exists(), "nothing written before refusing");
-    assert_eq!(nfiles, 11);
+    .unwrap();
+    let entries = bigstore::dvc::parse_dir_manifest(&golden.join("manifest.dir")).unwrap();
+    assert_eq!(entries.len(), 11);
+    assert_eq!(report.written + report.unchanged, 11);
+    for entry in &entries {
+        let path = restore.join(entry.relpath.as_str());
+        assert_eq!(hash_file(&path, HashFunction::Md5).unwrap(), entry.md5);
+    }
+}
+
+/// Lay out `files` on `e`'s remote the way `dvc push` from Linux would
+/// (objects, then the `.dir` manifest), and write `out.dvc` for it in
+/// `e.data`. Returns the pointer path.
+fn dvc_pushed_dir(e: &Env, files: &[(&str, &[u8])]) -> PathBuf {
+    let object = |md5: &Hexdigest| {
+        let hex = md5.to_string();
+        e.store.join("files/md5").join(&hex[..2]).join(&hex[2..])
+    };
+    let mut entries = Vec::new();
+    let mut size = 0;
+    for (name, content) in files {
+        let md5 = hash_reader(&mut &content[..], HashFunction::Md5).unwrap();
+        write(&object(&md5), content);
+        size += content.len() as u64;
+        entries.push(ManifestEntry {
+            relpath: ManifestPath::new(name).unwrap(),
+            md5,
+        });
+    }
+    let manifest = Manifest::from_entries(entries).unwrap();
+    let id = manifest.id();
+    let dir = object(&id).with_extension("dir");
+    write(&dir, &manifest.to_bytes());
+    let pointer = DvcPointer {
+        output: DvcOutput::Dir {
+            manifest: id,
+            size,
+            nfiles: files.len() as u64,
+        },
+        path: "out".into(),
+    };
+    let path = e.data.join("out.dvc");
+    write(&path, pointer.to_yaml().as_bytes());
+    path
+}
+
+/// `back\slash.txt` is valid DVC data and an ordinary name on Unix: pull
+/// restores it, while push keeps refusing names Windows could not create.
+#[cfg(unix)]
+#[test]
+fn pulls_a_name_push_refuses_when_this_os_can_create_it() {
+    let e = env();
+    let pointer = dvc_pushed_dir(&e, &[("back\\slash.txt", b"b"), ("sub/ok.txt", b"o")]);
+    let report = folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap();
+    assert_eq!(report.written, 2);
+    let out = e.data.join("out");
+    assert_eq!(std::fs::read(out.join("back\\slash.txt")).unwrap(), b"b");
+    assert_eq!(std::fs::read(out.join("sub/ok.txt")).unwrap(), b"o");
+
+    let err = folder::push(&e.remote, &out, &opts("ds/out")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains(r#""back\\slash.txt""#),
+        "{err:#}"
+    );
+}
+
+/// On Windows `\` is a separator: a hostile manifest name must be refused,
+/// by name, before anything is written.
+#[cfg(windows)]
+#[test]
+fn windows_refuses_to_pull_a_name_it_would_misread() {
+    let e = env();
+    let pointer = dvc_pushed_dir(&e, &[("a\\..\\..\\escaped.txt", b"x"), ("ok.txt", b"o")]);
+    let err = folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains(r#""a\\..\\..\\escaped.txt""#),
+        "{err:#}"
+    );
+    assert!(!e.data.join("out").exists(), "nothing written");
+    assert!(!e.data.parent().unwrap().join("escaped.txt").exists());
 }
 
 #[cfg(unix)]

@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::hash::Hasher;
-use crate::types::{HashFunction, Hexdigest, RepoPath};
+use crate::types::{HashFunction, Hexdigest, ManifestPath};
 
 /// An md5 digest; DVC 3 addresses everything with plain md5.
 fn md5(hex: &str) -> Result<Hexdigest> {
@@ -20,7 +20,7 @@ fn md5(hex: &str) -> Result<Hexdigest> {
 /// One file in a `.dir` manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestEntry {
-    pub relpath: RepoPath,
+    pub relpath: ManifestPath,
     /// Always md5.
     pub md5: Hexdigest,
 }
@@ -117,12 +117,8 @@ impl Manifest {
         let entries = raw
             .into_iter()
             .map(|e| {
-                let relpath = RepoPath::new(&e.relpath).with_context(|| {
-                    format!(
-                        "manifest relpath must be a relative path inside the directory: {:?}",
-                        e.relpath
-                    )
-                })?;
+                let relpath = ManifestPath::new(&e.relpath)
+                    .context("manifest relpath must be a relative path inside the directory")?;
                 let md5 =
                     md5(&e.md5).with_context(|| format!("invalid md5 for {:?}", e.relpath))?;
                 Ok(ManifestEntry { relpath, md5 })
@@ -278,6 +274,7 @@ pub fn parse_dir_manifest(manifest_path: &Path) -> Result<Vec<ManifestEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PathSyntax;
 
     const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dvc-3.67.1");
 
@@ -288,8 +285,7 @@ mod tests {
     fn manifests_match_dvc_byte_for_byte() {
         for (case, out) in [
             ("dataset", "tt"),
-            // Names with `\` cannot exist on Windows; RepoPath refuses them there.
-            #[cfg(not(windows))]
+            // Names with `\`, a newline, non-ASCII: valid DVC data on every OS.
             ("names", "x"),
             ("empty", "e"),
             ("crlf", "c"),
@@ -350,7 +346,7 @@ mod tests {
 
     fn entry(relpath: &str) -> ManifestEntry {
         ManifestEntry {
-            relpath: RepoPath::new(relpath).unwrap(),
+            relpath: ManifestPath::new(relpath).unwrap(),
             md5: md5(&"aa".repeat(16)).unwrap(),
         }
     }
@@ -375,5 +371,31 @@ mod tests {
         }
         let raw = r#"[{"md5":"not-valid","relpath":"file.bin"}]"#;
         assert!(Manifest::parse_unverified(raw.as_bytes()).is_err());
+    }
+
+    /// A manifest made on Unix with `\` and `:` in names parses anywhere
+    /// (`dvc-ls` works on Windows), but Windows refuses to write those
+    /// names: `a\..\..\x` would land outside the target there.
+    #[test]
+    fn manifest_names_windows_misreads_parse_but_are_not_written_there() {
+        let md5 = "aa".repeat(16);
+        let raw = format!(
+            r#"[{{"md5":"{md5}","relpath":"a\\..\\..\\x"}},{{"md5":"{md5}","relpath":"C:/y"}}]"#
+        );
+        let manifest = Manifest::parse_unverified(raw.as_bytes()).unwrap();
+        let names: Vec<&str> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.relpath.as_str())
+            .collect();
+        assert_eq!(names, ["C:/y", "a\\..\\..\\x"]);
+        for e in manifest.entries() {
+            let err = e.relpath.to_repo_path_for(PathSyntax::Windows).unwrap_err();
+            let shown = format!("{err:#}");
+            assert!(
+                shown.contains(&format!("{:?}", e.relpath.as_str())),
+                "{shown}"
+            );
+        }
     }
 }

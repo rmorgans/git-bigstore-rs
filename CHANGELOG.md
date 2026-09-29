@@ -41,6 +41,16 @@
 - Which files bigstore handles is now decided by git (`git check-attr`), so
   files tracked through nested `.gitattributes` or `.git/info/attributes` are
   pushed and pulled instead of being silently skipped.
+- A DVC manifest with `\` or `:` in a file name (valid DVC data made on
+  Unix) failed to parse on Windows, so even read-only commands such as
+  `dvc-ls` refused it. Parsing now checks content only (relative,
+  `/`-separated, no empty, `.` or `..` components); `import-dvc-dir` and
+  `folder pull` refuse, naming the file, only the names this OS would misread
+  (`\` and `:` on Windows), before writing anything.
+- `folder pull` restores any name this OS can create, e.g. non-ASCII or `\`
+  names from a manifest `dvc push` wrote on Linux. `folder push` still
+  refuses names that are not portable, so what it writes can be pulled
+  everywhere.
 - One blob that is not a pointer (e.g. committed before its `filter=bigstore`
   rule) no longer aborts the whole push or pull; `status` reports it as
   `not a pointer in git (git add --renormalize)`.

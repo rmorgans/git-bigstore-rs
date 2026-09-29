@@ -375,7 +375,7 @@ fn snapshot_dir(dir: &Path, tmp: &Path) -> std::result::Result<Staged, Retry> {
         warn_unterminated(f.relpath.as_str(), &s, &mut warnings);
         size += s.size();
         entries.push(ManifestEntry {
-            relpath: f.relpath.as_repo_path().clone(),
+            relpath: f.relpath.to_manifest_path(),
             md5: s.md5().clone(),
         });
         snapshots.entry(s.md5().clone()).or_insert(s);
@@ -722,11 +722,11 @@ async fn pull_async(
                 .entries()
                 .iter()
                 .map(|e| {
-                    for c in e.relpath.as_str().split('/') {
-                        check_portable_component(c)
-                            .with_context(|| format!("cannot restore {}", e.relpath))?;
-                    }
-                    Ok((e.relpath.to_fs_path(&into), e.md5.clone()))
+                    let path = e
+                        .relpath
+                        .to_repo_path()
+                        .with_context(|| format!("cannot restore {:?}", e.relpath.as_str()))?;
+                    Ok((path.to_fs_path(&into), e.md5.clone()))
                 })
                 .collect::<Result<_>>()?
         }
