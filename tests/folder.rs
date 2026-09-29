@@ -482,3 +482,18 @@ fn cli_works_without_git_on_path() {
     let log = run(&["folder", "log", KEY, "--remote", &remote]);
     assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1);
 }
+
+#[test]
+fn an_equivalent_crlf_pointer_is_left_untouched() {
+    // DVC on Windows writes `.dvc` files with CRLF; re-pushing the same
+    // content must not rewrite (churn) them.
+    let e = env();
+    let w = writer_dir(&e);
+    let first = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let crlf = std::fs::read_to_string(&first.pointer_path)
+        .unwrap()
+        .replace('\n', "\r\n");
+    std::fs::write(&first.pointer_path, &crlf).unwrap();
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    assert_eq!(std::fs::read_to_string(&first.pointer_path).unwrap(), crlf);
+}

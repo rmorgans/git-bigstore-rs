@@ -288,6 +288,8 @@ mod tests {
     fn manifests_match_dvc_byte_for_byte() {
         for (case, out) in [
             ("dataset", "tt"),
+            // Names with `\` cannot exist on Windows; RepoPath refuses them there.
+            #[cfg(not(windows))]
             ("names", "x"),
             ("empty", "e"),
             ("crlf", "c"),

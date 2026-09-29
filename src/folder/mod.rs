@@ -565,10 +565,12 @@ fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write the pointer atomically; leave an identical file untouched.
+/// Write the pointer atomically. A file that already says the same thing is
+/// left untouched, whatever its formatting (DVC on Windows writes CRLF), so a
+/// no-op push never churns a committed `.dvc`.
 fn write_pointer_file(path: &Path, pointer: &DvcPointer) -> Result<()> {
     let yaml = pointer.to_yaml();
-    if std::fs::read_to_string(path).is_ok_and(|t| t == yaml) {
+    if DvcPointer::load(path).is_ok_and(|existing| existing == *pointer) {
         return Ok(());
     }
     let dir = path.parent().context("pointer path has no parent")?;
