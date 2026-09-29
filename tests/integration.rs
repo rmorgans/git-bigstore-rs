@@ -1042,6 +1042,36 @@ fn failed_checkout_keeps_the_index_and_retry_converges() {
     assert_eq!(git(&clone, &["status", "--porcelain"]), "");
 }
 
+/// Run `cmd` in its own process group and collect its output once every
+/// process holding its stdout/stderr (git, filters) has exited. If that
+/// takes longer than `limit`, kill the whole group and fail, so a filter
+/// protocol stall fails the test instead of hanging CI.
+#[cfg(unix)]
+fn output_within(cmd: &mut Command, limit: std::time::Duration) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(child.wait_with_output()));
+    match rx.recv_timeout(limit) {
+        Ok(output) => output.unwrap(),
+        Err(_) => {
+            // Unreaped until its pipes close, so the group id stays valid.
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{group}")])
+                .status();
+            panic!("{cmd:?} did not finish within {limit:?}; killed its process group");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn killed_pull_is_recovered_by_the_next_pull() {
@@ -1086,13 +1116,14 @@ exit 1
     let first_reply = 19 + 4 + (4 + b"md5-addressed content\n".len()) + 4 + 4;
 
     let bin = env!("CARGO_BIN_EXE_git-bigstore");
-    let killed = Command::new(bin)
-        .arg("pull")
-        .current_dir(&clone)
-        .env("FORWARD_BYTES", (handshake + first_reply).to_string())
-        .env("BIGSTORE_BIN", bin)
-        .output()
-        .unwrap();
+    let killed = output_within(
+        Command::new(bin)
+            .arg("pull")
+            .current_dir(&clone)
+            .env("FORWARD_BYTES", (handshake + first_reply).to_string())
+            .env("BIGSTORE_BIN", bin),
+        std::time::Duration::from_secs(60),
+    );
     assert!(!killed.status.success(), "pull should have been killed");
     assert_eq!(
         std::fs::read(clone.join("a_md5.bin")).unwrap(),
