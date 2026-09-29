@@ -1,42 +1,55 @@
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::cache;
 use crate::git;
-use crate::types::{HashFunction, Hexdigest, Pointer};
+use crate::hash::Hasher;
+use crate::types::{HashFunction, Pointer, MAX_POINTER_BYTES};
 
-const POINTER_HEADER: &[u8] = b"bigstore\n";
+/// The first bytes of a stream, classified by [`Pointer::parse`] — the one
+/// rule shared by both filters and the working-tree check.
+enum Head {
+    /// The whole stream is a pointer; `raw` is every byte of it.
+    Pointer { pointer: Pointer, raw: Vec<u8> },
+    /// Content; `head` is its first bytes, the rest is still in the reader.
+    Content { head: Vec<u8> },
+}
+
+fn read_head(reader: &mut impl Read) -> io::Result<Head> {
+    let mut head = Vec::with_capacity(MAX_POINTER_BYTES + 1);
+    // One byte past the limit: a pointer is always shorter, so anything that
+    // fills the buffer is content.
+    reader
+        .take(MAX_POINTER_BYTES as u64 + 1)
+        .read_to_end(&mut head)?;
+    Ok(match Pointer::parse(&head) {
+        Some(pointer) => Head::Pointer { pointer, raw: head },
+        None => Head::Content { head },
+    })
+}
 
 /// Clean filter: file content -> pointer (stdin -> stdout).
 ///
-/// If the input is already a pointer, pass through unchanged (idempotent).
+/// Input that is already a pointer passes through unchanged (idempotent).
+/// Everything else — including text that merely starts like a pointer — is
+/// hashed into the cache and replaced by its pointer.
 pub fn clean() -> Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = stdin.lock();
-    let mut writer = stdout.lock();
+    let mut reader = io::stdin().lock();
+    let mut writer = io::stdout().lock();
 
-    let mut first_line = Vec::new();
-    reader.read_until(b'\n', &mut first_line)?;
+    let head = match read_head(&mut reader)? {
+        Head::Pointer { raw, .. } => return Ok(writer.write_all(&raw)?),
+        Head::Content { head } => head,
+    };
 
-    if first_line == POINTER_HEADER {
-        writer.write_all(&first_line)?;
-        io::copy(&mut reader, &mut writer)?;
-        return Ok(());
-    }
-
-    let git_dir = git::git_dir()?;
-    let hash_fn = HashFunction::Sha256;
-    let mut hasher = Sha256::new();
-
+    let git_dir = git::common_dir()?;
     cache::ensure_cache_dir(&git_dir)?;
     let mut tmp = tempfile::NamedTempFile::new_in(cache::cache_dir(&git_dir))?;
+    let mut hasher = Hasher::new(HashFunction::Sha256);
 
-    hasher.update(&first_line);
-    tmp.write_all(&first_line)?;
-
+    hasher.update(&head);
+    tmp.write_all(&head)?;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
@@ -46,138 +59,79 @@ pub fn clean() -> Result<()> {
         hasher.update(&buf[..n]);
         tmp.write_all(&buf[..n])?;
     }
-    tmp.flush()?;
+    let hexdigest = hasher.finalize();
 
-    let hex_str = hex::encode(hasher.finalize());
-    let hexdigest =
-        Hexdigest::new(&hex_str, hash_fn).context("internal error: sha256 produced invalid hex")?;
-
-    let dest = cache::object_path(&git_dir, &hexdigest, hash_fn);
+    let dest = cache::object_path(&git_dir, &hexdigest);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    // Atomic persist, ignore AlreadyExists (concurrent clean of same content)
+    // Atomic persist; AlreadyExists means a concurrent clean of the same content.
     match tmp.persist_noclobber(&dest) {
         Ok(_) => {}
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.error.into()),
     }
 
-    let pointer = Pointer::new(hash_fn, hexdigest);
-    writer.write_all(&pointer.encode())?;
-
+    writer.write_all(&Pointer::new(hexdigest).encode())?;
     Ok(())
 }
 
 /// Smudge filter: pointer -> file content (stdin -> stdout).
 ///
-/// If the object is in the local cache, output its content.
-/// If not, pass through the pointer (user needs to `git bigstore pull`).
+/// A pointer whose object is cached becomes that object's content; one that
+/// is not cached passes through (`git bigstore pull` fetches it later).
+/// Anything that is not a pointer passes through byte for byte.
 pub fn smudge() -> Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = stdin.lock();
-    let mut writer = stdout.lock();
+    let mut reader = io::stdin().lock();
+    let mut writer = io::stdout().lock();
 
-    let mut first_line = Vec::new();
-    reader.read_until(b'\n', &mut first_line)?;
-
-    if first_line != POINTER_HEADER {
-        writer.write_all(&first_line)?;
-        io::copy(&mut reader, &mut writer)?;
-        return Ok(());
-    }
-
-    let mut hash_fn_line = String::new();
-    reader.read_line(&mut hash_fn_line)?;
-    let mut hexdigest_line = String::new();
-    reader.read_line(&mut hexdigest_line)?;
-
-    // Reconstruct the raw pointer bytes for pass-through on failure
-    let raw_pointer = [
-        &first_line[..],
-        hash_fn_line.as_bytes(),
-        hexdigest_line.as_bytes(),
-    ]
-    .concat();
-
-    // Validate the pointer — if invalid, pass through as-is
-    let pointer = match Pointer::parse(&raw_pointer)? {
-        Some(p) => p,
-        None => {
-            writer.write_all(&raw_pointer)?;
-            return Ok(());
+    match read_head(&mut reader)? {
+        Head::Content { head } => {
+            writer.write_all(&head)?;
+            io::copy(&mut reader, &mut writer)?;
         }
-    };
-
-    let git_dir = git::git_dir()?;
-    let cache_path = cache::object_path(&git_dir, &pointer.hexdigest, pointer.hash_fn);
-
-    if cache_path.exists() {
-        let mut file = std::fs::File::open(&cache_path)?;
-        io::copy(&mut file, &mut writer)?;
-    } else {
-        writer.write_all(&raw_pointer)?;
-    }
-
-    Ok(())
-}
-
-/// Read a pointer from git's index (staging area) for a tracked file.
-/// Uses `:path` which reads the staged version, not HEAD.
-pub fn read_pointer_from_git(path: &str) -> Result<Option<Pointer>> {
-    let output = std::process::Command::new("git")
-        .args(["cat-file", "blob", &format!(":{path}")])
-        .output()?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    Pointer::parse(&output.stdout)
-}
-
-/// Check if a working-tree file is a pointer (not yet smudged).
-pub fn is_pointer_file(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut reader = io::BufReader::new(file);
-    let mut first_line = Vec::new();
-    if reader.read_until(b'\n', &mut first_line).is_err() {
-        return false;
-    }
-    first_line == POINTER_HEADER
-}
-
-/// Parse .gitattributes for bigstore filter patterns.
-/// Returns Vec<(glob_pattern, filter_name)>.
-pub fn parse_gitattributes(path: &Path) -> Result<Vec<(String, String)>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-
-    let mut filters = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            for attr in &parts[1..] {
-                if let Some(filter_name) = attr.strip_prefix("filter=") {
-                    if filter_name == "bigstore" {
-                        filters.push((parts[0].to_string(), filter_name.to_string()));
-                    }
+        Head::Pointer { pointer, raw } => {
+            let cache_path = cache::object_path(&git::common_dir()?, pointer.hexdigest());
+            match std::fs::File::open(&cache_path) {
+                Ok(mut object) => {
+                    io::copy(&mut object, &mut writer)?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => writer.write_all(&raw)?,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("failed to open {}", cache_path.display()))
                 }
             }
         }
     }
+    Ok(())
+}
 
-    Ok(filters)
+/// What the working tree holds at a tracked path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeFile {
+    /// Nothing there: deleted, or outside a sparse checkout.
+    Missing,
+    /// A pointer that has not been smudged into content.
+    Pointer(Pointer),
+    /// Anything else: checked-out content, a local edit, a directory or a
+    /// symlink. Never overwritten by `pull`.
+    Content,
+}
+
+pub fn worktree_file(path: &Path) -> Result<WorktreeFile> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(WorktreeFile::Missing),
+        Err(e) => return Err(e).with_context(|| format!("failed to stat {}", path.display())),
+    };
+    if !meta.is_file() {
+        return Ok(WorktreeFile::Content);
+    }
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    Ok(match read_head(&mut file)? {
+        Head::Pointer { pointer, .. } => WorktreeFile::Pointer(pointer),
+        Head::Content { .. } => WorktreeFile::Content,
+    })
 }

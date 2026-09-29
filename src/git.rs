@@ -1,22 +1,204 @@
-use anyhow::Result;
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use globset::{Glob, GlobMatcher};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-pub fn git_dir() -> Result<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .output()?;
+use crate::catfile::CatFileBatch;
+use crate::types::{Pointer, RepoPath};
+
+/// The git directory shared by all linked worktrees, as an absolute path.
+/// The object cache lives here, so every worktree of a clone shares it and a
+/// commit made in one worktree can be checked out in another.
+pub fn common_dir() -> Result<PathBuf> {
+    rev_parse(&["--path-format=absolute", "--git-common-dir"])
+}
+
+pub fn repo_root() -> Result<PathBuf> {
+    rev_parse(&["--show-toplevel"])
+}
+
+fn rev_parse(args: &[&str]) -> Result<PathBuf> {
+    let output = Command::new("git").arg("rev-parse").args(args).output()?;
     anyhow::ensure!(output.status.success(), "not a git repository");
     let path = String::from_utf8(output.stdout)?.trim().to_string();
     Ok(PathBuf::from(path))
 }
 
-pub fn repo_root() -> Result<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()?;
-    anyhow::ensure!(output.status.success(), "not a git repository");
-    let path = String::from_utf8(output.stdout)?.trim().to_string();
-    Ok(PathBuf::from(path))
+/// Run git in `repo_root`, feeding `input` on stdin, and return stdout.
+/// stdin is written from a separate thread so large inputs cannot deadlock
+/// against a full stdout pipe.
+fn git_with_input(repo_root: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    let mut stdin = child.stdin.take().context("git stdin not piped")?;
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output()?;
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stdin writer panicked"))??;
+    anyhow::ensure!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+fn nul_joined<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in paths {
+        out.extend_from_slice(p);
+        out.push(0);
+    }
+    out
+}
+
+/// What git's index holds for a file the bigstore filter applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexBlob {
+    /// A bigstore pointer: the file's content lives in the cache/remote.
+    Pointer(Pointer),
+    /// Raw content, e.g. committed before the filter was configured and not
+    /// yet renormalised. Nothing to transfer.
+    Content,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    pub path: RepoPath,
+    pub blob: IndexBlob,
+    /// Excluded from the working tree (sparse checkout or
+    /// `update-index --skip-worktree`): never fetched or checked out.
+    pub skip_worktree: bool,
+}
+
+/// Every regular file in the index whose `filter` attribute is `bigstore`,
+/// narrowed to those matching any of `patterns` (root-relative globs) when
+/// patterns are given.
+///
+/// Git decides the attribute (`git check-attr`), so nested `.gitattributes`,
+/// `.git/info/attributes` and macros count exactly as they do for the clean
+/// filter itself. Paths are read NUL-separated and root-relative, so
+/// non-ASCII names and the caller's cwd cannot change the result.
+/// Unmerged (conflicted) entries are skipped.
+pub fn bigstore_entries(repo_root: &Path, patterns: &[String]) -> Result<Vec<IndexEntry>> {
+    let matchers: Vec<GlobMatcher> = patterns
+        .iter()
+        .map(|p| {
+            Glob::new(p)
+                .with_context(|| format!("invalid pattern: {p:?}"))
+                .map(|g| g.compile_matcher())
+        })
+        .collect::<Result<_>>()?;
+
+    // "<tag> <mode> <oid> <stage>\t<path>\0". Paths stay raw bytes until git
+    // says the file is ours: an unrelated file with an odd name must not matter.
+    let listing = git_with_input(repo_root, &["ls-files", "-s", "-t", "-z"], Vec::new())?;
+    let mut files: Vec<(&[u8], &str, bool)> = Vec::new();
+    for record in listing.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        let tab = record
+            .iter()
+            .position(|&b| b == b'\t')
+            .context("malformed git ls-files record")?;
+        let meta = std::str::from_utf8(&record[..tab])?;
+        let [tag, mode, oid, stage] = meta.split(' ').collect::<Vec<_>>()[..] else {
+            anyhow::bail!("malformed git ls-files record: {meta:?}");
+        };
+        // Filters only ever apply to regular files at stage 0.
+        if stage != "0" || !matches!(mode, "100644" | "100755") {
+            continue;
+        }
+        files.push((&record[tab + 1..], oid, tag == "S"));
+    }
+
+    // "<path>\0filter\0<value>\0", in input order.
+    let attrs = git_with_input(
+        repo_root,
+        &["check-attr", "-z", "--stdin", "filter"],
+        nul_joined(files.iter().map(|(p, ..)| *p)),
+    )?;
+    let values: Vec<&[u8]> = attrs.split(|&b| b == 0).collect();
+    let (records, _trailing) = values.as_chunks::<3>();
+    anyhow::ensure!(
+        records.len() == files.len(),
+        "git check-attr returned {} records for {} paths",
+        records.len(),
+        files.len()
+    );
+
+    let mut cat_file = CatFileBatch::start(repo_root)?;
+    let mut entries = Vec::new();
+    for ((raw_path, oid, skip_worktree), [attr_path, _name, value]) in
+        files.into_iter().zip(records)
+    {
+        anyhow::ensure!(
+            *attr_path == raw_path,
+            "git check-attr output out of order at {}",
+            String::from_utf8_lossy(raw_path)
+        );
+        if *value != b"bigstore" {
+            continue;
+        }
+        let path = RepoPath::from_git_bytes(raw_path)?;
+        if !(matchers.is_empty() || matchers.iter().any(|m| m.is_match(path.as_str()))) {
+            continue;
+        }
+        let blob = match cat_file.read_pointer(oid)? {
+            Some(p) => IndexBlob::Pointer(p),
+            None => IndexBlob::Content,
+        };
+        entries.push(IndexEntry {
+            path,
+            blob,
+            skip_worktree,
+        });
+    }
+    Ok(entries)
+}
+
+/// Write `paths` from the index into the working tree — through the smudge
+/// filter, with the index's file mode — and refresh their index stat data so
+/// git does not report them as modified (`git checkout-index -u`).
+///
+/// Without `-f`: git refuses to replace a file that exists, so this never
+/// overwrites something written at a path after the caller checked it.
+/// If any path fails, git writes no index at all: paths it did write are
+/// left with stale stat data (see [`refresh_entries`]).
+pub fn checkout_index(repo_root: &Path, paths: &[&RepoPath]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    git_with_input(
+        repo_root,
+        &["checkout-index", "-u", "-z", "--stdin"],
+        nul_joined(paths.iter().map(|p| p.as_str().as_bytes())),
+    )?;
+    Ok(())
+}
+
+/// Re-record index stat data for `paths` by passing their working-tree
+/// content through the clean filter (`git update-index`). For files whose
+/// content hashes to the index's blob this changes nothing but the stat data;
+/// `update-index --refresh` cannot do it because git treats a size change as
+/// a content change without re-reading the file.
+pub fn refresh_entries(repo_root: &Path, paths: &[&RepoPath]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    git_with_input(
+        repo_root,
+        &["update-index", "-z", "--stdin"],
+        nul_joined(paths.iter().map(|p| p.as_str().as_bytes())),
+    )?;
+    Ok(())
 }
 
 pub fn config_get(key: &str) -> Option<String> {

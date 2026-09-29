@@ -1,467 +1,421 @@
 use anyhow::{Context, Result};
-use futures::stream::StreamExt;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use object_store::ObjectStoreExt;
-use sha2::{Digest, Sha256};
-use std::io::Write;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 
 use crate::backend::{self, Backend};
 use crate::cache;
 use crate::config::BigstoreConfig;
-use crate::filter;
-use crate::git;
-use crate::types::{HashFunction, Hexdigest, Pointer};
+use crate::filter::{self, WorktreeFile};
+use crate::git::{self, IndexBlob, IndexEntry};
+use crate::hash::{self, Hasher};
+use crate::types::{HashFunction, Hexdigest, Pointer, RepoPath};
 
 pub const DEFAULT_CONCURRENCY: usize = 8;
 
-/// The result of a push/pull operation.
-pub struct TransferSummary {
-    pub uploaded: u64,
-    pub downloaded: u64,
-    pub skipped: u64,
-    pub verified: u64,
-    pub failed: Vec<TransferError>,
+/// One content object and every tracked path that references it. Transfers
+/// run per object, so identical files move once. Only built by [`objects`],
+/// which guarantees at least one path.
+pub struct Object {
+    hexdigest: Hexdigest,
+    paths: Vec<RepoPath>,
 }
 
-pub struct TransferError {
-    pub path: String,
+/// The objects referenced by pointer entries. Entries whose index blob is raw
+/// content have nothing to transfer and are skipped.
+pub fn objects<'a>(entries: impl IntoIterator<Item = &'a IndexEntry>) -> Vec<Object> {
+    let mut by_digest: BTreeMap<&Hexdigest, Vec<RepoPath>> = BTreeMap::new();
+    for entry in entries {
+        if let IndexBlob::Pointer(p) = &entry.blob {
+            by_digest
+                .entry(p.hexdigest())
+                .or_default()
+                .push(entry.path.clone());
+        }
+    }
+    by_digest
+        .into_iter()
+        .map(|(hexdigest, paths)| Object {
+            hexdigest: hexdigest.clone(),
+            paths,
+        })
+        .collect()
+}
+
+/// The remote store and the local cache a transfer moves objects between.
+pub struct Remote<'a> {
+    pub store: &'a Backend,
+    pub cfg: &'a BigstoreConfig,
+    /// Common git dir holding the object cache.
+    pub git_dir: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Push,
+    Pull,
+}
+
+/// Outcome of a push or pull, counted in files (paths), not objects.
+pub struct Report {
+    pub direction: Direction,
+    pub transferred: usize,
+    pub up_to_date: usize,
+    pub failed: Vec<Failure>,
+}
+
+pub struct Failure {
+    pub paths: Vec<RepoPath>,
     pub error: String,
 }
 
-impl TransferSummary {
-    fn new() -> Self {
-        Self {
-            uploaded: 0,
-            downloaded: 0,
-            skipped: 0,
-            verified: 0,
-            failed: Vec::new(),
-        }
-    }
-
+impl Report {
     pub fn print(&self) {
-        if self.uploaded > 0 {
-            eprintln!("{} file(s) uploaded", self.uploaded);
+        if self.transferred > 0 {
+            match self.direction {
+                Direction::Push => eprintln!("{} file(s) uploaded", self.transferred),
+                Direction::Pull => {
+                    eprintln!("{} file(s) downloaded and verified", self.transferred)
+                }
+            }
         }
-        if self.downloaded > 0 {
-            eprintln!(
-                "{} file(s) downloaded ({} verified)",
-                self.downloaded, self.verified
-            );
+        if self.up_to_date > 0 {
+            eprintln!("{} file(s) already up to date", self.up_to_date);
         }
-        if self.skipped > 0 {
-            eprintln!("{} file(s) already up to date", self.skipped);
-        }
-        for err in &self.failed {
-            eprintln!("FAILED: {} — {}", err.path, err.error);
+        for f in &self.failed {
+            let paths: Vec<&str> = f.paths.iter().map(RepoPath::as_str).collect();
+            eprintln!("FAILED: {} — {}", paths.join(", "), f.error);
         }
     }
 }
 
-// ──────────────────────────────────────────────────
-// Download lifecycle
-// ──────────────────────────────────────────────────
-//
-// 1. Parse pointer from git (validates hash_fn + hexdigest)
-// 2. Check local cache — skip if present
-// 3. Check remote — warn if missing
-// 4. Download to temp file, hashing content as it streams
-// 5. Verify hash matches pointer's hexdigest
-// 6. Persist verified temp file to cache (atomic)
-// 7. Copy from cache to working tree
-//
-// If verification fails, the temp file is discarded.
-// The cache never contains unverified content.
+enum Outcome {
+    Transferred,
+    UpToDate,
+}
 
-/// Download a single object: remote → verified cache → working tree.
-#[allow(clippy::too_many_arguments)]
-async fn download_one(
-    store: &Backend,
-    cfg: &BigstoreConfig,
-    git_dir: &Path,
-    repo_root: &Path,
+/// Run `op` over every object with at most `jobs` in flight.
+async fn run<'a, F, Fut>(objects: &'a [Object], jobs: usize, direction: Direction, op: F) -> Report
+where
+    F: Fn(&'a Object) -> Fut,
+    Fut: Future<Output = Result<Outcome>> + 'a,
+{
+    let pb = progress_bar(objects.len() as u64);
+    let results: Vec<(&Object, Result<Outcome>)> = stream::iter(objects)
+        .map(|obj| {
+            let fut = op(obj);
+            async move { (obj, fut.await) }
+        })
+        .buffer_unordered(jobs)
+        .inspect(|(obj, _)| {
+            pb.set_message(obj.paths[0].to_string());
+            pb.inc(1);
+        })
+        .collect()
+        .await;
+    pb.finish_and_clear();
+
+    let mut report = Report {
+        direction,
+        transferred: 0,
+        up_to_date: 0,
+        failed: Vec::new(),
+    };
+    for (obj, result) in results {
+        match result {
+            Ok(Outcome::Transferred) => report.transferred += obj.paths.len(),
+            Ok(Outcome::UpToDate) => report.up_to_date += obj.paths.len(),
+            Err(e) => report.failed.push(Failure {
+                paths: obj.paths.clone(),
+                error: format!("{e:#}"),
+            }),
+        }
+    }
+    report
+}
+
+// ──────────────────────────────────────────────────
+// Push
+// ──────────────────────────────────────────────────
+//
+// 1. Already on the remote → up to date (dedup).
+// 2. Otherwise it must be in the local cache → upload it.
+// 3. Neither → failure. The pointer is committed but its content exists
+//    nowhere this clone can reach; exiting 0 here would hide data loss.
+
+pub async fn push(remote: &Remote<'_>, objects: &[Object], jobs: usize) -> Report {
+    run(objects, jobs, Direction::Push, |obj| {
+        upload_one(remote, &obj.hexdigest)
+    })
+    .await
+}
+
+async fn upload_one(remote: &Remote<'_>, hexdigest: &Hexdigest) -> Result<Outcome> {
+    let key = remote.cfg.remote_object_key(hexdigest)?;
+    if backend::exists(remote.store, &key).await? {
+        return Ok(Outcome::UpToDate);
+    }
+    let cache_path = cache::object_path(remote.git_dir, hexdigest);
+    anyhow::ensure!(
+        cache_path.is_file(),
+        "not in the local cache and not on the remote \
+         (push from the clone that committed it)"
+    );
+    backend::upload(remote.store, &cache_path, &key).await?;
+    Ok(Outcome::Transferred)
+}
+
+// ──────────────────────────────────────────────────
+// Pull
+// ──────────────────────────────────────────────────
+//
+// Fetch fills the cache; `checkout` then updates the working tree.
+// 1. Already cached → up to date.
+// 2. md5 objects: import from the local DVC cache if present (verified).
+// 3. Download to a temp file, hashing as it streams; verify; persist
+//    atomically. The cache never holds unverified content.
+
+pub async fn pull(
+    remote: &Remote<'_>,
     dvc_cache_root: &Path,
-    path: &str,
-    pointer: &Pointer,
-    pb: &ProgressBar,
-) -> Result<DownloadOutcome> {
-    // Step 1: Verify the layout supports this hash function before doing any work.
-    // Fail early rather than pulling into cache and then failing on push.
-    cfg.remote_object_key(&pointer.hexdigest, pointer.hash_fn)?;
+    objects: &[Object],
+    jobs: usize,
+) -> Report {
+    run(objects, jobs, Direction::Pull, |obj| {
+        fetch_one(remote, dvc_cache_root, &obj.hexdigest)
+    })
+    .await
+}
 
-    let cache_path = cache::object_path(git_dir, &pointer.hexdigest, pointer.hash_fn);
-
-    // Step 2: Already in cache?
-    if cache_path.exists() {
-        pb.set_message(format!("{path} (cached)"));
-        pb.inc(1);
-        let full_path = repo_root.join(path);
-        cache::copy_to_working_tree(&cache_path, &full_path)?;
-        return Ok(DownloadOutcome::Skipped);
+async fn fetch_one(
+    remote: &Remote<'_>,
+    dvc_cache_root: &Path,
+    hexdigest: &Hexdigest,
+) -> Result<Outcome> {
+    // Resolving the key first rejects layouts that cannot address this hash
+    // function before anything is written to the cache.
+    let key = remote.cfg.remote_object_key(hexdigest)?;
+    if cache::object_path(remote.git_dir, hexdigest).is_file() {
+        return Ok(Outcome::UpToDate);
     }
 
-    // Step 2b: DVC cache fallback (md5 only)
-    if pointer.hash_fn == HashFunction::Md5 {
-        match cache::import_md5_from_dvc_cache(dvc_cache_root, git_dir, &pointer.hexdigest)
-            .with_context(|| format!("DVC cache import failed for {path}"))?
-        {
-            cache::DvcImportResult::Imported | cache::DvcImportResult::AlreadyCached => {
-                let full_path = repo_root.join(path);
-                cache::copy_to_working_tree(&cache_path, &full_path)?;
-                pb.set_message(format!("{path} (from dvc cache, verified)"));
-                pb.inc(1);
-                return Ok(DownloadOutcome::Downloaded);
-            }
+    if hexdigest.hash_fn() == HashFunction::Md5 {
+        let (root, git_dir, digest) = (
+            dvc_cache_root.to_path_buf(),
+            remote.git_dir.to_path_buf(),
+            hexdigest.clone(),
+        );
+        let imported = tokio::task::spawn_blocking(move || {
+            cache::import_from_dvc_cache(&root, &git_dir, &digest)
+        })
+        .await?
+        .context("DVC cache import failed")?;
+        match imported {
+            cache::DvcImportResult::Imported => return Ok(Outcome::Transferred),
+            cache::DvcImportResult::AlreadyCached => return Ok(Outcome::UpToDate),
             cache::DvcImportResult::NotInDvcCache => {}
         }
     }
 
-    // Step 3: Exists on remote?
-    let remote_key = cfg.remote_object_key(&pointer.hexdigest, pointer.hash_fn)?;
-    if !backend::exists(store, &remote_key).await? {
-        pb.inc(1);
-        return Ok(DownloadOutcome::NotFound);
-    }
-
-    // Step 4: Download to temp file, hashing as we stream
-    pb.set_message(format!("{path} (downloading)"));
-    let verified_path = download_and_verify(
-        store,
-        &remote_key,
-        git_dir,
-        pointer.hash_fn,
-        &pointer.hexdigest,
-    )
-    .await
-    .with_context(|| format!("downloading {path}"))?;
-
-    // Step 6 happened inside download_and_verify (atomic persist)
-    // Step 7: Copy to working tree
-    let full_path = repo_root.join(path);
-    cache::copy_to_working_tree(&verified_path, &full_path)?;
-
-    pb.set_message(format!("{path} (verified)"));
-    pb.inc(1);
-
-    Ok(DownloadOutcome::Downloaded)
+    anyhow::ensure!(
+        backend::exists(remote.store, &key).await?,
+        "not found on remote"
+    );
+    download_to_cache(remote, &key, hexdigest)
+        .await
+        .context("download failed")?;
+    Ok(Outcome::Transferred)
 }
 
-/// Download from remote, hash while streaming, verify, persist to cache.
-/// Returns the final cache path on success.
-async fn download_and_verify(
-    store: &Backend,
-    remote_key: &str,
-    git_dir: &Path,
-    hash_fn: HashFunction,
-    expected: &Hexdigest,
-) -> Result<std::path::PathBuf> {
-    cache::ensure_cache_dir(git_dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(cache::cache_dir(git_dir))?;
-    let mut hasher = Hasher::new(hash_fn);
+async fn download_to_cache(remote: &Remote<'_>, key: &str, expected: &Hexdigest) -> Result<()> {
+    cache::ensure_cache_dir(remote.git_dir)?;
+    let tmp = tempfile::NamedTempFile::new_in(cache::cache_dir(remote.git_dir))?;
 
-    // Stream download → hash + write to temp
-    match store {
-        Backend::ObjectStore(obj_store) => {
-            use futures::StreamExt;
-
-            let obj_path = object_store::path::Path::from(remote_key);
-            let result = obj_store.get(&obj_path).await?;
-            let mut stream = result.into_stream();
-
+    let actual = match remote.store {
+        Backend::ObjectStore(store) => {
+            let mut file = tokio::fs::File::from_std(tmp.reopen()?);
+            let mut stream = store
+                .get(&object_store::path::Path::from(key))
+                .await?
+                .into_stream();
+            let mut hasher = Hasher::new(expected.hash_fn());
             while let Some(chunk) = stream.next().await {
-                let bytes = chunk?;
-                hasher.update(&bytes);
-                tmp.write_all(&bytes)?;
+                let chunk = chunk?;
+                hasher.update(&chunk);
+                file.write_all(&chunk).await?;
             }
+            file.flush().await?;
+            hasher.finalize()
         }
         Backend::Rclone(_) => {
-            // For rclone, download to temp first, then hash
-            let tmp_dl = tempfile::NamedTempFile::new_in(cache::cache_dir(git_dir))?;
-            backend::download(store, remote_key, tmp_dl.path()).await?;
-
-            let mut file = std::fs::File::open(tmp_dl.path())?;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = std::io::Read::read(&mut file, &mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                tmp.write_all(&buf[..n])?;
-            }
+            backend::download(remote.store, key, tmp.path()).await?;
+            let (path, hash_fn) = (tmp.path().to_path_buf(), expected.hash_fn());
+            tokio::task::spawn_blocking(move || hash::hash_file(&path, hash_fn)).await??
         }
-    }
-
-    tmp.flush()?;
-
-    // Step 5: Verify
-    let actual_hex = hasher.finalize_hex();
-    let actual = Hexdigest::new(&actual_hex, hash_fn)
-        .context("internal error: sha256 produced invalid hex")?;
+    };
 
     anyhow::ensure!(
-        &actual == expected,
+        actual == *expected,
         "integrity check failed: expected {expected}, got {actual}"
     );
 
-    // Step 6: Atomic persist to cache
-    let dest = cache::object_path(git_dir, expected, hash_fn);
+    let dest = cache::object_path(remote.git_dir, expected);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     match tmp.persist_noclobber(&dest) {
-        Ok(_) => {}
-        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.error.into()),
+        Ok(_) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.error.into()),
     }
-
-    Ok(dest)
 }
 
-enum DownloadOutcome {
-    Downloaded,
-    Skipped,
-    NotFound,
+/// Result of [`checkout`].
+pub struct Checkout {
+    pub checked_out: usize,
+    /// Paths left as pointers because git could not check them out.
+    pub failed: Vec<Failure>,
 }
 
-// ──────────────────────────────────────────────────
-// Upload lifecycle
-// ──────────────────────────────────────────────────
-//
-// 1. Parse pointer from git
-// 2. Check local cache — skip if not cached (nothing to upload)
-// 3. Check remote — skip if already present (dedup)
-// 4. Upload from cache to remote
-//
-// No verification needed: the cache was verified on write (clean filter)
-// or on download (download_and_verify).
-
-async fn upload_one(
-    store: &Backend,
-    cfg: &BigstoreConfig,
-    git_dir: &Path,
-    path: &str,
-    pointer: &Pointer,
-    pb: &ProgressBar,
-) -> Result<UploadOutcome> {
-    let cache_path = cache::object_path(git_dir, &pointer.hexdigest, pointer.hash_fn);
-
-    // Step 2: In local cache?
-    if !cache_path.exists() {
-        pb.inc(1);
-        return Ok(UploadOutcome::NotCached);
-    }
-
-    // Step 3: Already on remote?
-    let remote_key = cfg.remote_object_key(&pointer.hexdigest, pointer.hash_fn)?;
-    if backend::exists(store, &remote_key).await? {
-        pb.set_message(format!("{path} (exists)"));
-        pb.inc(1);
-        return Ok(UploadOutcome::Skipped);
-    }
-
-    // Step 4: Upload
-    pb.set_message(format!("{path} (uploading)"));
-    backend::upload(store, &cache_path, &remote_key).await?;
-    pb.set_message(format!("{path} (done)"));
-    pb.inc(1);
-
-    Ok(UploadOutcome::Uploaded)
-}
-
-enum UploadOutcome {
-    Uploaded,
-    Skipped,
-    NotCached,
-}
-
-// ──────────────────────────────────────────────────
-// Public API
-// ──────────────────────────────────────────────────
-
-pub async fn push(tracked: &[(String, String)], concurrency: usize) -> Result<TransferSummary> {
-    let repo_root = git::repo_root()?;
-    let git_dir = git::git_dir()?;
-    let cfg = BigstoreConfig::find_and_load(&repo_root)?;
-    let store = backend::from_config(&cfg)?;
-
-    // Resolve pointers sequentially (fast local git calls)
-    let mut work: Vec<(String, Pointer)> = Vec::new();
-    for (path, _filter) in tracked {
-        if let Some(p) = filter::read_pointer_from_git(path)? {
-            work.push((path.clone(), p));
-        }
-    }
-
-    let mp = MultiProgress::new();
-    let pb = mp.add(progress_bar(work.len() as u64));
-    let mut summary = TransferSummary::new();
-
-    let results: Vec<_> = futures::stream::iter(work.iter().map(|(path, pointer)| {
-        let store = &store;
-        let cfg = &cfg;
-        let git_dir = &git_dir;
-        let pb = &pb;
-        async move {
-            let outcome = upload_one(store, cfg, git_dir, path, pointer, pb).await;
-            (path.clone(), outcome)
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect()
-    .await;
-
-    for (path, result) in results {
-        match result {
-            Ok(UploadOutcome::Uploaded) => summary.uploaded += 1,
-            Ok(UploadOutcome::Skipped) => summary.skipped += 1,
-            Ok(UploadOutcome::NotCached) => {
-                tracing::debug!(%path, "not in local cache, skipping");
-                summary.skipped += 1;
-            }
-            Err(e) => {
-                summary.failed.push(TransferError {
-                    path,
-                    error: format!("{e:#}"),
-                });
-            }
-        }
-    }
-
-    pb.finish_and_clear();
-    Ok(summary)
-}
-
-pub async fn pull(tracked: &[(String, String)], concurrency: usize) -> Result<TransferSummary> {
-    let repo_root = git::repo_root()?;
-    let git_dir = git::git_dir()?;
-    let cfg = BigstoreConfig::find_and_load(&repo_root)?;
-    let store = backend::from_config(&cfg)?;
-
-    // Resolve pointers sequentially (fast local git calls)
-    let mut work: Vec<(String, Pointer)> = Vec::new();
-    for (path, _filter) in tracked {
-        if let Some(p) = filter::read_pointer_from_git(path)? {
-            work.push((path.clone(), p));
-        }
-    }
-
-    // Resolve DVC cache for md5 fallback. Pull operates repo-wide,
-    // so find the DVC project from the repo root. If no DVC project
-    // exists, use default path (import_md5_from_dvc_cache will just
-    // return NotInDvcCache for all lookups).
-    let dvc_cache_root = match cache::find_dvc_project_root(&repo_root) {
-        Some(dvc_root) => cache::resolve_dvc_cache_root(&dvc_root)?,
-        None => repo_root.join(".dvc/cache"),
+/// Replace every unsmudged pointer file whose object is cached with its
+/// content.
+///
+/// Git writes the files (`checkout-index -u` through the smudge filter), so
+/// they get the index's file mode and the index's stat data is refreshed —
+/// the tree is clean afterwards. Only a working-tree file that is exactly the
+/// index's pointer is touched: local edits, other content, missing files and
+/// skip-worktree (sparse) entries are left alone.
+///
+/// Paths are classified before anything changes. Their pointer files are
+/// then removed (git skips entries whose stat data still matches the index,
+/// which a freshly checked-out pointer does) and git checks them all out in
+/// one batch. If the batch fails, git has written no index, so every path is
+/// reconciled on its own: content git did write is kept (after checking it is
+/// the object) and its index entry refreshed; paths git never reached are
+/// retried alone, and on failure get their pointer back. Nothing that
+/// appears at a path meanwhile is ever overwritten, a failed pull leaves the
+/// tree clean, and re-running pull converges.
+pub fn checkout(repo_root: &Path, git_dir: &Path, entries: &[IndexEntry]) -> Result<Checkout> {
+    let mut result = Checkout {
+        checked_out: 0,
+        failed: Vec::new(),
     };
-
-    let mp = MultiProgress::new();
-    let pb = mp.add(progress_bar(work.len() as u64));
-    let mut summary = TransferSummary::new();
-
-    let results: Vec<_> = futures::stream::iter(work.iter().map(|(path, pointer)| {
-        let store = &store;
-        let cfg = &cfg;
-        let git_dir = &git_dir;
-        let repo_root = &repo_root;
-        let dvc_cache_root = &dvc_cache_root;
-        let pb = &pb;
-        async move {
-            let outcome = download_one(
-                store,
-                cfg,
-                git_dir,
-                repo_root,
-                dvc_cache_root,
-                path,
+    let mut candidates = Vec::new();
+    for entry in entries.iter().filter(|e| !e.skip_worktree) {
+        let IndexBlob::Pointer(pointer) = &entry.blob else {
+            continue;
+        };
+        if !cache::object_path(git_dir, pointer.hexdigest()).is_file() {
+            continue;
+        }
+        let fs_path = entry.path.to_fs_path(repo_root);
+        if matches!(filter::worktree_file(&fs_path)?, WorktreeFile::Pointer(p) if p == *pointer) {
+            candidates.push(Candidate {
+                path: &entry.path,
                 pointer,
-                pb,
-            )
-            .await;
-            (path.clone(), outcome)
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect()
-    .await;
-
-    for (path, result) in results {
-        match result {
-            Ok(DownloadOutcome::Downloaded) => {
-                summary.downloaded += 1;
-                summary.verified += 1;
-            }
-            Ok(DownloadOutcome::Skipped) => summary.skipped += 1,
-            Ok(DownloadOutcome::NotFound) => {
-                summary.failed.push(TransferError {
-                    path,
-                    error: "not found on remote".to_string(),
-                });
-            }
-            Err(e) => {
-                summary.failed.push(TransferError {
-                    path,
-                    error: format!("{e:#}"),
-                });
-            }
+                permissions: std::fs::metadata(&fs_path)?.permissions(),
+                fs_path,
+            });
         }
     }
 
-    pb.finish_and_clear();
-    Ok(summary)
+    let mut removed = Vec::new();
+    for c in candidates {
+        match std::fs::remove_file(&c.fs_path) {
+            Ok(()) => removed.push(c),
+            Err(e) => result
+                .failed
+                .push(c.failure(format!("failed to replace: {e}"))),
+        }
+    }
+    let paths: Vec<&RepoPath> = removed.iter().map(|c| c.path).collect();
+    if git::checkout_index(repo_root, &paths).is_ok() {
+        result.checked_out += removed.len();
+        return Ok(result);
+    }
+
+    let mut written = Vec::new();
+    for c in removed {
+        match filter::worktree_file(&c.fs_path)? {
+            WorktreeFile::Missing => match git::checkout_index(repo_root, &[c.path]) {
+                Ok(()) => result.checked_out += 1,
+                Err(e) => {
+                    let error =
+                        match restore_pointer(&c.fs_path, &c.pointer.encode(), &c.permissions) {
+                            Ok(()) => format!("{e:#}"),
+                            Err(restore) => format!(
+                                "{e:#}; could not restore the pointer file ({restore:#}), \
+                             run `git checkout -- {}`",
+                                c.path
+                            ),
+                        };
+                    result.failed.push(c.failure(error));
+                }
+            },
+            WorktreeFile::Content
+                if hash::hash_file(&c.fs_path, c.pointer.hash_fn())
+                    .ok()
+                    .as_ref()
+                    == Some(c.pointer.hexdigest()) =>
+            {
+                written.push(c);
+            }
+            _ => result.failed.push(
+                c.failure("the file changed while pull was running; left untouched".to_string()),
+            ),
+        }
+    }
+    let paths: Vec<&RepoPath> = written.iter().map(|c| c.path).collect();
+    match git::refresh_entries(repo_root, &paths) {
+        Ok(()) => result.checked_out += written.len(),
+        Err(e) => result
+            .failed
+            .extend(written.iter().map(|c| c.failure(format!("{e:#}")))),
+    }
+    Ok(result)
 }
 
-/// Create a hasher for the given hash function.
-enum Hasher {
-    Sha256(Sha256),
-    Md5(md5::Md5),
+struct Candidate<'a> {
+    path: &'a RepoPath,
+    pointer: &'a Pointer,
+    fs_path: PathBuf,
+    permissions: std::fs::Permissions,
 }
 
-impl Hasher {
-    fn new(hash_fn: HashFunction) -> Self {
-        match hash_fn {
-            HashFunction::Sha256 => Self::Sha256(Sha256::new()),
-            HashFunction::Md5 => Self::Md5(<md5::Md5 as Digest>::new()),
-        }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        match self {
-            Self::Sha256(h) => h.update(data),
-            Self::Md5(h) => Digest::update(h, data),
-        }
-    }
-
-    fn finalize_hex(self) -> String {
-        match self {
-            Self::Sha256(h) => hex::encode(h.finalize()),
-            Self::Md5(h) => hex::encode(Digest::finalize(h)),
+impl Candidate<'_> {
+    fn failure(&self, error: String) -> Failure {
+        Failure {
+            paths: vec![self.path.clone()],
+            error,
         }
     }
 }
 
-/// Hash a file on disk, returning a validated hexdigest.
-pub fn hash_file(path: &Path, hash_fn: HashFunction) -> Result<Hexdigest> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Hasher::new(hash_fn);
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = std::io::Read::read(&mut file, &mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let hex_str = hasher.finalize_hex();
-    Hexdigest::new(&hex_str, hash_fn).context("internal error: hasher produced invalid hex")
+/// Put a pointer file back after a failed checkout. Git runs the smudge
+/// filter before creating the file, so after a failure the path is normally
+/// empty; `create_new` guarantees that anything that did appear there in the
+/// meantime is reported, never replaced.
+fn restore_pointer(path: &Path, pointer: &[u8], permissions: &std::fs::Permissions) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("{} exists", path.display()))?;
+    file.write_all(pointer)?;
+    file.set_permissions(permissions.clone())?;
+    Ok(())
 }
 
 fn progress_bar(total: u64) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::with_template("{spinner:.green} [{bar:30.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
+            .expect("progress template is valid")
             .progress_chars("#>-"),
     );
     pb

@@ -15,7 +15,7 @@
 //!   1. .bigstore.toml (if present)
 //!   2. git config bigstore-lfs.url (fallback for LFS-only repos)
 
-use crate::{backend, config, git, transfer, types};
+use crate::{backend, config, git, hash, types};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -88,7 +88,7 @@ fn load_config() -> Result<AdapterConfig> {
     let test_hex = "ab".repeat(32);
     let test_digest = types::Hexdigest::new(&test_hex, types::HashFunction::Sha256)?;
     cfg.layout
-        .object_key(&test_digest, types::HashFunction::Sha256)
+        .object_key(&test_digest)
         .context("bigstore layout does not support SHA-256 — incompatible with LFS")?;
 
     let b = backend::from_config(&cfg)?;
@@ -126,9 +126,7 @@ fn oid_to_remote_key(cfg: &AdapterConfig, oid: &str) -> Result<String> {
     let hexdigest = types::Hexdigest::new(oid, types::HashFunction::Sha256)
         .context("LFS OID is not a valid SHA-256 hex digest")?;
 
-    let key = cfg
-        .layout
-        .object_key(&hexdigest, types::HashFunction::Sha256)?;
+    let key = cfg.layout.object_key(&hexdigest)?;
 
     if cfg.prefix.is_empty() {
         Ok(key)
@@ -154,7 +152,7 @@ fn send(w: &mut impl Write, value: &impl Serialize) -> Result<()> {
 /// Git LFS also verifies, but bigstore checks every transfer itself.
 fn verify_oid(path: &Path, oid: &str) -> Result<()> {
     let expected = types::Hexdigest::new(oid, types::HashFunction::Sha256)?;
-    let actual = transfer::hash_file(path, types::HashFunction::Sha256)
+    let actual = hash::hash_file(path, types::HashFunction::Sha256)
         .with_context(|| format!("failed to hash oid {oid}"))?;
     anyhow::ensure!(
         actual == expected,

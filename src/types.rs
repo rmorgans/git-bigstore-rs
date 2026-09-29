@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// Supported hash functions. Exhaustive enum — invalid states unrepresentable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HashFunction {
     Sha256,
     Md5,
@@ -39,13 +40,17 @@ impl fmt::Display for HashFunction {
     }
 }
 
-/// A validated hex digest. Guarantees:
-/// - Only lowercase hex characters [0-9a-f]
-/// - Length matches the hash function (64 for sha256)
+/// A validated content digest: the hash function and its lowercase hex output.
 ///
-/// Slicing into prefix/rest is always safe.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Hexdigest(String);
+/// The algorithm travels with the hex, so a digest can never be paired with
+/// the wrong hash function (wrong cache path, wrong remote key, wrong verifier).
+/// Guarantees: hex is `[0-9a-f]` only and its length matches `hash_fn`, so
+/// slicing into prefix/rest is always safe and path-traversal-free.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Hexdigest {
+    hash_fn: HashFunction,
+    hex: String,
+}
 
 impl Hexdigest {
     pub fn new(s: &str, hash_fn: HashFunction) -> Result<Self> {
@@ -61,76 +66,142 @@ impl Hexdigest {
             s.chars().all(|c| c.is_ascii_hexdigit()),
             "hexdigest contains non-hex characters: {s:?}"
         );
-        Ok(Self(s.to_ascii_lowercase()))
+        Ok(Self {
+            hash_fn,
+            hex: s.to_ascii_lowercase(),
+        })
+    }
+
+    pub fn hash_fn(&self) -> HashFunction {
+        self.hash_fn
     }
 
     /// First 2 hex characters (directory shard).
     pub fn prefix(&self) -> &str {
-        &self.0[..2]
+        &self.hex[..2]
     }
 
     /// Remaining hex characters after the shard prefix.
     pub fn rest(&self) -> &str {
-        &self.0[2..]
+        &self.hex[2..]
     }
 }
 
+/// Displays the hex only; the hash function is shown separately where needed.
 impl fmt::Display for Hexdigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.hex)
     }
 }
 
-/// A validated bigstore pointer. Cannot be constructed with invalid data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pointer {
-    pub hash_fn: HashFunction,
-    pub hexdigest: Hexdigest,
-}
+/// Upper bound on the size of anything recognised as a pointer. Real pointers
+/// are ~81 bytes; the headroom tolerates CRLF and trailing blank lines.
+pub const MAX_POINTER_BYTES: usize = 512;
+
+/// A bigstore pointer: the three-line text git stores in place of a large file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Pointer(Hexdigest);
 
 impl Pointer {
-    /// Create a pointer. Panics if the hexdigest length doesn't match the hash function.
-    /// Safe: Both HashFunction and Hexdigest are validated, so a mismatch is a programmer error.
-    pub fn new(hash_fn: HashFunction, hexdigest: Hexdigest) -> Self {
-        assert_eq!(
-            hexdigest.0.len(),
-            hash_fn.digest_len(),
-            "hexdigest length {} does not match {} (expected {})",
-            hexdigest.0.len(),
-            hash_fn,
-            hash_fn.digest_len()
-        );
-        Self { hash_fn, hexdigest }
+    pub fn new(hexdigest: Hexdigest) -> Self {
+        Self(hexdigest)
+    }
+
+    pub fn hexdigest(&self) -> &Hexdigest {
+        &self.0
+    }
+
+    pub fn hash_fn(&self) -> HashFunction {
+        self.0.hash_fn
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        format!("bigstore\n{}\n{}\n", self.hash_fn, self.hexdigest).into_bytes()
+        format!("bigstore\n{}\n{}\n", self.0.hash_fn, self.0.hex).into_bytes()
     }
 
-    pub fn parse(data: &[u8]) -> Result<Option<Self>> {
-        let text = std::str::from_utf8(data).context("pointer is not valid UTF-8")?;
+    /// Classify `data` as a pointer. Total: anything that is not exactly a
+    /// well-formed pointer — binary data, text that merely starts with
+    /// `bigstore`, a pointer followed by other content — is `None`, i.e. file
+    /// content. This is the single definition of "is a pointer" used by the
+    /// clean and smudge filters, the working-tree check and index reads, so
+    /// they can never disagree.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() > MAX_POINTER_BYTES {
+            return None;
+        }
+        let text = std::str::from_utf8(data).ok()?;
         let mut lines = text.lines();
-
-        match lines.next() {
-            Some("bigstore") => {}
-            _ => return Ok(None),
+        if lines.next()? != "bigstore" {
+            return None;
         }
-
-        let hash_fn_str = lines.next().context("pointer missing hash function")?;
-        let hash_fn = HashFunction::parse(hash_fn_str)?;
-
-        let hexdigest_str = lines.next().context("pointer missing hexdigest")?;
-        let hexdigest = Hexdigest::new(hexdigest_str, hash_fn)?;
-
-        // A valid pointer is exactly three lines. Reject any trailing
-        // non-whitespace line so a blob that merely starts like a pointer isn't
-        // accepted (and then round-tripped unchanged by the idempotent clean
-        // filter). Blank trailing lines are tolerated; content after one is not.
-        if let Some(extra) = lines.find(|l| !l.trim().is_empty()) {
-            anyhow::bail!("pointer has unexpected trailing content: {extra:?}");
+        let hash_fn = HashFunction::parse(lines.next()?).ok()?;
+        let hexdigest = Hexdigest::new(lines.next()?, hash_fn).ok()?;
+        // Exactly three lines; trailing blank lines are tolerated, anything
+        // else means this is content that happens to start like a pointer.
+        if lines.any(|l| !l.trim().is_empty()) {
+            return None;
         }
+        Some(Self(hexdigest))
+    }
+}
 
-        Ok(Some(Self::new(hash_fn, hexdigest)))
+/// A path relative to the repository root: `/`-separated, non-empty, with no
+/// `..` components and no leading `/`. Every path bigstore reads from git or
+/// the user, and every path it writes to, goes through this type, so paths
+/// can neither escape the repository nor be misread relative to the cwd.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RepoPath(String);
+
+impl RepoPath {
+    /// Validate and normalise. Empty and `.` components are dropped, so
+    /// `./a//b/` becomes `a/b`.
+    pub fn new(s: &str) -> Result<Self> {
+        anyhow::ensure!(
+            !s.starts_with('/') && !Path::new(s).is_absolute(),
+            "path must be relative to the repository root: {s:?}"
+        );
+        anyhow::ensure!(!s.contains('\0'), "path contains a NUL byte: {s:?}");
+        let mut parts = Vec::new();
+        for part in s.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => anyhow::bail!("path must not contain '..': {s:?}"),
+                p => parts.push(p),
+            }
+        }
+        anyhow::ensure!(!parts.is_empty(), "path is empty: {s:?}");
+        Ok(Self(parts.join("/")))
+    }
+
+    /// Parse a path as git prints it with `-z` (raw bytes, root-relative).
+    pub fn from_git_bytes(bytes: &[u8]) -> Result<Self> {
+        let s = std::str::from_utf8(bytes).with_context(|| {
+            format!(
+                "path is not valid UTF-8: {:?}",
+                String::from_utf8_lossy(bytes)
+            )
+        })?;
+        Self::new(s)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// `self/child`, e.g. an import destination root joined with a manifest path.
+    pub fn join(&self, child: &RepoPath) -> RepoPath {
+        RepoPath(format!("{}/{}", self.0, child.0))
+    }
+
+    /// The on-disk location under `repo_root`.
+    pub fn to_fs_path(&self, repo_root: &Path) -> PathBuf {
+        repo_root.join(&self.0)
+    }
+}
+
+impl fmt::Display for RepoPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -156,7 +227,8 @@ impl Layout {
     /// For layouts without `{hash_fn}`, only sha256 is supported — the
     /// template is used as-is (backward compatible with older configs).
     /// For layouts with `{hash_fn}`, the placeholder is replaced dynamically.
-    pub fn object_key(&self, hexdigest: &Hexdigest, hash_fn: HashFunction) -> Result<String> {
+    pub fn object_key(&self, hexdigest: &Hexdigest) -> Result<String> {
+        let hash_fn = hexdigest.hash_fn();
         if !self.0.contains("{hash_fn}") && hash_fn != HashFunction::Sha256 {
             anyhow::bail!(
                 "layout template does not contain {{hash_fn}} — only sha256 is supported.\n\
@@ -272,74 +344,87 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "does not match")]
-    fn pointer_rejects_mismatched_hash_fn_and_digest() {
-        let hex = "a".repeat(32);
-        let digest = Hexdigest::new(&hex, HashFunction::Md5).unwrap();
-        // This should panic: sha256 hash_fn with a 32-char md5 digest
-        Pointer::new(HashFunction::Sha256, digest);
-    }
-
-    #[test]
     fn pointer_parse_valid() {
         let hex = "ab".repeat(32);
         let data = format!("bigstore\nsha256\n{hex}\n");
-        let p = Pointer::parse(data.as_bytes()).unwrap().unwrap();
-        assert_eq!(p.hash_fn, HashFunction::Sha256);
-        assert_eq!(p.hexdigest.to_string(), hex);
+        let p = Pointer::parse(data.as_bytes()).unwrap();
+        assert_eq!(p.hash_fn(), HashFunction::Sha256);
+        assert_eq!(p.hexdigest().to_string(), hex);
     }
 
     #[test]
-    fn pointer_parse_not_a_pointer() {
-        let data = b"just some regular file content\n";
-        assert!(Pointer::parse(data).unwrap().is_none());
+    fn pointer_parse_accepts_crlf() {
+        let hex = "ab".repeat(32);
+        let data = format!("bigstore\r\nmd5\r\n{}\r\n", &hex[..32]);
+        assert_eq!(
+            Pointer::parse(data.as_bytes()).unwrap().hash_fn(),
+            HashFunction::Md5
+        );
     }
 
     #[test]
     fn pointer_roundtrip() {
         let hex = "ab".repeat(32);
-        let p = Pointer::new(
-            HashFunction::Sha256,
-            Hexdigest::new(&hex, HashFunction::Sha256).unwrap(),
-        );
-        let encoded = p.encode();
-        let parsed = Pointer::parse(&encoded).unwrap().unwrap();
-        assert_eq!(p, parsed);
+        let p = Pointer::new(Hexdigest::new(&hex, HashFunction::Sha256).unwrap());
+        assert_eq!(Pointer::parse(&p.encode()), Some(p));
     }
 
+    /// Everything that is not exactly a pointer is content — including text
+    /// that starts with the pointer header. None of these may be an error:
+    /// callers treat the blob as ordinary file content.
     #[test]
-    fn pointer_rejects_malicious_hash_fn() {
-        let data = b"bigstore\n../../etc\naaaa\n";
-        assert!(Pointer::parse(data).is_err());
-    }
-
-    #[test]
-    fn pointer_rejects_short_digest() {
-        let data = b"bigstore\nsha256\ndeadbeef\n";
-        assert!(Pointer::parse(data).is_err());
-    }
-
-    #[test]
-    fn pointer_rejects_trailing_content() {
+    fn pointer_parse_classifies_non_pointers_as_content() {
         let hex = "ab".repeat(32);
-        let data = format!("bigstore\nsha256\n{hex}\nextra junk\n");
-        assert!(Pointer::parse(data.as_bytes()).is_err());
+        let cases: Vec<Vec<u8>> = vec![
+            b"just some regular file content\n".to_vec(),
+            b"".to_vec(),
+            vec![0xff, 0xfe, 0x00, b'\n'],
+            b"bigstore\n".to_vec(),
+            b"bigstore\nis a great tool\n".to_vec(),
+            b"bigstore\n../../etc\naaaa\n".to_vec(),
+            b"bigstore\nsha256\ndeadbeef\n".to_vec(),
+            format!("bigstore\nsha256\n{hex}\nextra junk\n").into_bytes(),
+            format!("bigstore\nsha256\n{hex}\n\npayload\n").into_bytes(),
+            format!(
+                "bigstore\nsha256\n{hex}\n{}",
+                "\n".repeat(MAX_POINTER_BYTES)
+            )
+            .into_bytes(),
+        ];
+        for data in cases {
+            assert_eq!(
+                Pointer::parse(&data),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(&data)
+            );
+        }
     }
 
     #[test]
     fn pointer_allows_trailing_blank_line() {
         let hex = "ab".repeat(32);
         let data = format!("bigstore\nsha256\n{hex}\n\n");
-        assert!(Pointer::parse(data.as_bytes()).unwrap().is_some());
+        assert!(Pointer::parse(data.as_bytes()).is_some());
     }
 
     #[test]
-    fn pointer_rejects_content_after_blank_line() {
-        // A blank line must not let later content slip past the trailing-content
-        // guard.
-        let hex = "ab".repeat(32);
-        let data = format!("bigstore\nsha256\n{hex}\n\npayload\n");
-        assert!(Pointer::parse(data.as_bytes()).is_err());
+    fn repo_path_normalises() {
+        assert_eq!(RepoPath::new("./a//b/").unwrap().as_str(), "a/b");
+        assert_eq!(RepoPath::new("café.bin").unwrap().as_str(), "café.bin");
+    }
+
+    #[test]
+    fn repo_path_rejects_escapes_and_empty() {
+        for bad in ["", ".", "/etc/passwd", "../x", "a/../../x", "a/..", "a\0b"] {
+            assert!(RepoPath::new(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn repo_path_rejects_non_utf8_git_bytes() {
+        let err = RepoPath::from_git_bytes(b"caf\xe9.bin").unwrap_err();
+        assert!(format!("{err:#}").contains("caf"), "{err:#}");
     }
 
     // Layout tests
@@ -349,7 +434,7 @@ mod tests {
         let l = Layout::new("files/{hash_fn}/{prefix}/{rest}").unwrap();
         let hex = "ab".repeat(32);
         let d = Hexdigest::new(&hex, HashFunction::Sha256).unwrap();
-        let key = l.object_key(&d, HashFunction::Sha256).unwrap();
+        let key = l.object_key(&d).unwrap();
         assert_eq!(key, format!("files/sha256/{}/{}", d.prefix(), d.rest()));
     }
 
@@ -359,11 +444,11 @@ mod tests {
         let sha_hex = "ab".repeat(32);
         let sha_d = Hexdigest::new(&sha_hex, HashFunction::Sha256).unwrap();
         // sha256 works
-        assert!(l.object_key(&sha_d, HashFunction::Sha256).is_ok());
+        assert!(l.object_key(&sha_d).is_ok());
         // md5 is rejected
         let md5_hex = "ab".repeat(16);
         let md5_d = Hexdigest::new(&md5_hex, HashFunction::Md5).unwrap();
-        assert!(l.object_key(&md5_d, HashFunction::Md5).is_err());
+        assert!(l.object_key(&md5_d).is_err());
     }
 
     #[test]
@@ -371,10 +456,10 @@ mod tests {
         let l = Layout::new("files/{hash_fn}/{prefix}/{rest}").unwrap();
         let sha_hex = "ab".repeat(32);
         let sha_d = Hexdigest::new(&sha_hex, HashFunction::Sha256).unwrap();
-        assert!(l.object_key(&sha_d, HashFunction::Sha256).is_ok());
+        assert!(l.object_key(&sha_d).is_ok());
         let md5_hex = "ab".repeat(16);
         let md5_d = Hexdigest::new(&md5_hex, HashFunction::Md5).unwrap();
-        let key = l.object_key(&md5_d, HashFunction::Md5).unwrap();
+        let key = l.object_key(&md5_d).unwrap();
         assert!(key.contains("md5/"));
     }
 

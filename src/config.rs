@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::types::{HashFunction, Hexdigest, Layout};
+use crate::types::{Hexdigest, Layout};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BigstoreConfig {
@@ -160,26 +160,12 @@ impl BigstoreConfig {
     }
 
     /// Build the remote object key using the configured layout.
-    /// Safe: Layout is validated, Hexdigest is validated.
-    /// Returns Err if the layout doesn't support the given hash function.
-    pub fn remote_object_key(
-        &self,
-        hexdigest: &Hexdigest,
-        hash_fn: HashFunction,
-    ) -> Result<String> {
-        let key = self.layout.object_key(hexdigest, hash_fn)?;
-
-        let bucket_prefix = match &self.backend {
-            BackendConfig::S3 { prefix, .. }
-            | BackendConfig::Gcs { prefix, .. }
-            | BackendConfig::Azure { prefix, .. } => prefix.as_str(),
-            _ => "",
-        };
-
-        if bucket_prefix.is_empty() {
-            Ok(key)
-        } else {
-            Ok(format!("{bucket_prefix}/{key}"))
+    /// Returns Err if the layout doesn't support the digest's hash function.
+    pub fn remote_object_key(&self, hexdigest: &Hexdigest) -> Result<String> {
+        let key = self.layout.object_key(hexdigest)?;
+        match self.bucket_prefix() {
+            "" => Ok(key),
+            prefix => Ok(format!("{prefix}/{key}")),
         }
     }
 }
@@ -233,7 +219,7 @@ mod tests {
     fn remote_object_key_dvc_layout() {
         let cfg = BigstoreConfig::from_url("s3://bucket/data", None).unwrap();
         let d = test_digest();
-        let key = cfg.remote_object_key(&d, HashFunction::Sha256).unwrap();
+        let key = cfg.remote_object_key(&d).unwrap();
         assert_eq!(
             key,
             format!("data/files/sha256/{}/{}", d.prefix(), d.rest())
@@ -244,7 +230,7 @@ mod tests {
     fn remote_object_key_no_prefix() {
         let cfg = BigstoreConfig::from_url("s3://bucket", None).unwrap();
         let d = test_digest();
-        let key = cfg.remote_object_key(&d, HashFunction::Sha256).unwrap();
+        let key = cfg.remote_object_key(&d).unwrap();
         assert_eq!(key, format!("files/sha256/{}/{}", d.prefix(), d.rest()));
     }
 
