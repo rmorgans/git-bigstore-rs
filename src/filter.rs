@@ -11,14 +11,14 @@ use crate::types::{HashFunction, Pointer, MAX_POINTER_BYTES};
 
 /// The first bytes of a stream, classified by [`Pointer::parse`] — the one
 /// rule shared by both filters and the working-tree check.
-enum Head {
+pub(crate) enum Head {
     /// The whole stream is a pointer; `raw` is every byte of it.
     Pointer { pointer: Pointer, raw: Vec<u8> },
     /// Content; `head` is its first bytes, the rest is still in the reader.
     Content { head: Vec<u8> },
 }
 
-fn read_head(reader: &mut impl Read) -> io::Result<Head> {
+pub(crate) fn read_head(reader: &mut impl Read) -> io::Result<Head> {
     let mut head = Vec::with_capacity(MAX_POINTER_BYTES + 1);
     // One byte past the limit: a pointer is always shorter, so anything that
     // fills the buffer is content.
@@ -46,21 +46,42 @@ pub fn clean(path: Option<&OsStr>) -> Result<()> {
         Head::Pointer { raw, .. } => return Ok(writer.write_all(&raw)?),
         Head::Content { head } => head,
     };
-
     let indexed = match path.and_then(OsStr::to_str) {
         Some(path) => index_pointer(&mut CatFileBatch::start(Path::new("."))?, path)?,
         None => None,
     };
-    // Content matching an md5 pointer keeps it: git re-cleans checked-out
-    // files (racy timestamps, touched files) and a sha256 pointer would show
-    // them as modified and re-stage them.
+    let pointer = store_content(&git::common_dir()?, &head, &mut reader, indexed)?;
+    writer.write_all(&pointer.encode())?;
+    Ok(())
+}
+
+/// The pointer git's index holds at root-relative `path` (stage 0), if any.
+pub(crate) fn index_pointer(index: &mut CatFileBatch, path: &str) -> Result<Option<Pointer>> {
+    // cat-file --batch reads one name per line.
+    if path.contains('\n') {
+        return Ok(None);
+    }
+    index.read_pointer(&format!(":0:{path}"))
+}
+
+/// Hash `head` followed by the rest of `rest` into the cache and return its
+/// pointer: sha256, or `indexed` if that is md5 and the content matches it.
+///
+/// Content matching an md5 pointer keeps it: git re-cleans checked-out files
+/// (racy timestamps, touched files) and a sha256 pointer would show them as
+/// modified and re-stage them.
+pub(crate) fn store_content(
+    git_dir: &Path,
+    head: &[u8],
+    rest: &mut impl Read,
+    indexed: Option<Pointer>,
+) -> Result<Pointer> {
     let mut kept = indexed
         .filter(|p| p.hash_fn() != HashFunction::Sha256)
         .map(|p| (Hasher::new(p.hash_fn()), p));
 
-    let git_dir = git::common_dir()?;
-    cache::ensure_cache_dir(&git_dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(cache::cache_dir(&git_dir))?;
+    cache::ensure_cache_dir(git_dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(cache::cache_dir(git_dir))?;
     let mut hasher = Hasher::new(HashFunction::Sha256);
 
     let mut update = |data: &[u8]| -> io::Result<()> {
@@ -70,10 +91,10 @@ pub fn clean(path: Option<&OsStr>) -> Result<()> {
         }
         tmp.write_all(data)
     };
-    update(&head)?;
+    update(head)?;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = rest.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -84,7 +105,7 @@ pub fn clean(path: Option<&OsStr>) -> Result<()> {
         _ => Pointer::new(hasher.finalize()),
     };
 
-    let dest = cache::object_path(&git_dir, pointer.hexdigest());
+    let dest = cache::object_path(git_dir, pointer.hexdigest());
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -94,18 +115,7 @@ pub fn clean(path: Option<&OsStr>) -> Result<()> {
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.error.into()),
     }
-
-    writer.write_all(&pointer.encode())?;
-    Ok(())
-}
-
-/// The pointer git's index holds at root-relative `path` (stage 0), if any.
-fn index_pointer(index: &mut CatFileBatch, path: &str) -> Result<Option<Pointer>> {
-    // cat-file --batch reads one name per line.
-    if path.contains('\n') {
-        return Ok(None);
-    }
-    index.read_pointer(&format!(":0:{path}"))
+    Ok(pointer)
 }
 
 /// Smudge filter: pointer -> file content (stdin -> stdout).
@@ -122,21 +132,24 @@ pub fn smudge() -> Result<()> {
             writer.write_all(&head)?;
             io::copy(&mut reader, &mut writer)?;
         }
-        Head::Pointer { pointer, raw } => {
-            let cache_path = cache::object_path(&git::common_dir()?, pointer.hexdigest());
-            match std::fs::File::open(&cache_path) {
-                Ok(mut object) => {
-                    io::copy(&mut object, &mut writer)?;
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => writer.write_all(&raw)?,
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("failed to open {}", cache_path.display()))
-                }
+        Head::Pointer { pointer, raw } => match open_object(&git::common_dir()?, &pointer)? {
+            Some(mut object) => {
+                io::copy(&mut object, &mut writer)?;
             }
-        }
+            None => writer.write_all(&raw)?,
+        },
     }
     Ok(())
+}
+
+/// The cached object for `pointer`, or `None` if it is not cached.
+pub(crate) fn open_object(git_dir: &Path, pointer: &Pointer) -> Result<Option<std::fs::File>> {
+    let cache_path = cache::object_path(git_dir, pointer.hexdigest());
+    match std::fs::File::open(&cache_path) {
+        Ok(object) => Ok(Some(object)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("failed to open {}", cache_path.display())),
+    }
 }
 
 /// What the working tree holds at a tracked path.
