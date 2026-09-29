@@ -57,6 +57,29 @@ fn bigstore_stdin(dir: &Path, args: &[&str], input: &[u8]) -> std::process::Outp
     child.wait_with_output().unwrap()
 }
 
+/// Point the bigstore filter at the test binary, which is not on PATH (as
+/// `init` writes it). Sets every key, so it also configures a fresh clone.
+fn use_test_filters(dir: &Path) {
+    let bin = env!("CARGO_BIN_EXE_git-bigstore");
+    git(
+        dir,
+        &[
+            "config",
+            "filter.bigstore.clean",
+            &format!("{bin} filter-clean %f"),
+        ],
+    );
+    git(
+        dir,
+        &[
+            "config",
+            "filter.bigstore.smudge",
+            &format!("{bin} filter-smudge"),
+        ],
+    );
+    git(dir, &["config", "filter.bigstore.required", "true"]);
+}
+
 struct TestRepo {
     repo_dir: PathBuf,
     storage_dir: PathBuf,
@@ -83,23 +106,7 @@ impl TestRepo {
 
         // Override the git filter config to use the full path to the test binary
         // (git can't find "git-bigstore" in PATH during tests)
-        let bin = env!("CARGO_BIN_EXE_git-bigstore");
-        git(
-            &repo_dir,
-            &[
-                "config",
-                "filter.bigstore.clean",
-                &format!("{bin} filter-clean"),
-            ],
-        );
-        git(
-            &repo_dir,
-            &[
-                "config",
-                "filter.bigstore.smudge",
-                &format!("{bin} filter-smudge"),
-            ],
-        );
+        use_test_filters(&repo_dir);
 
         Self {
             repo_dir,
@@ -135,24 +142,7 @@ impl TestRepo {
         );
         git(&dest, &["config", "user.email", "test@test.com"]);
         git(&dest, &["config", "user.name", "Test"]);
-        let bin = env!("CARGO_BIN_EXE_git-bigstore");
-        git(
-            &dest,
-            &[
-                "config",
-                "filter.bigstore.clean",
-                &format!("{bin} filter-clean"),
-            ],
-        );
-        git(
-            &dest,
-            &[
-                "config",
-                "filter.bigstore.smudge",
-                &format!("{bin} filter-smudge"),
-            ],
-        );
-        git(&dest, &["config", "filter.bigstore.required", "true"]);
+        use_test_filters(&dest);
         dest
     }
 
@@ -967,21 +957,14 @@ fn failed_checkout_keeps_the_index_and_retry_converges() {
     assert!(std::fs::read(clone.join("z.bin"))
         .unwrap()
         .starts_with(b"bigstore\n"));
-    // Nothing staged: the md5 pointer must not be re-cleaned into a sha256
-    // one. (md5 files are left out of `status`: git's racy-timestamp
-    // re-check runs the clean filter, which always yields sha256.)
+    // Nothing staged or modified: git re-cleans the files it wrote without
+    // an index update, and the md5 pointer must clean back to itself.
     assert_eq!(git(&clone, &["diff", "--cached", "--name-only"]), "");
-    assert_eq!(
-        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
-        ""
-    );
+    assert_eq!(git(&clone, &["status", "--porcelain"]), "");
 
     bigstore_ok(&clone, &["pull"]);
     assert_eq!(std::fs::read(clone.join("z.bin")).unwrap(), b"object z\n");
-    assert_eq!(
-        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
-        ""
-    );
+    assert_eq!(git(&clone, &["status", "--porcelain"]), "");
 }
 
 #[cfg(unix)]
@@ -1016,7 +999,7 @@ exit 1
     .unwrap();
     std::fs::set_permissions(&killer, std::fs::Permissions::from_mode(0o755)).unwrap();
     let killer = killer.to_str().unwrap();
-    for (key, cmd) in [("clean", "filter-clean"), ("smudge", "filter-smudge")] {
+    for (key, cmd) in [("clean", "filter-clean %f"), ("smudge", "filter-smudge")] {
         let value = format!("{killer} {cmd}");
         git(
             &clone,
@@ -1039,7 +1022,7 @@ exit 1
         "sanity: the kill left the tree damaged"
     );
 
-    for (key, cmd) in [("clean", "filter-clean"), ("smudge", "filter-smudge")] {
+    for (key, cmd) in [("clean", "filter-clean %f"), ("smudge", "filter-smudge")] {
         let value = format!("{bin} {cmd}");
         git(
             &clone,
@@ -1060,12 +1043,34 @@ exit 1
     assert_eq!(std::fs::read(clone.join("b.bin")).unwrap(), b"object b\n");
     assert_eq!(std::fs::read(clone.join("z.bin")).unwrap(), b"object z\n");
     assert_eq!(git(&clone, &["diff", "--cached", "--name-only"]), "");
-    // md5 pointers are excluded: git's racy-timestamp re-check runs the clean
-    // filter, which always yields a sha256 pointer.
-    assert_eq!(
-        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
-        ""
-    );
+    assert_eq!(git(&clone, &["status", "--porcelain"]), "");
+}
+
+/// After checkout, git re-runs the clean filter on any file whose stat data
+/// no longer vouches for it (racy timestamps, `touch`, a copied tree). An md5
+/// pointer's content must clean back to that same md5 pointer; a sha256
+/// pointer would show the file as modified and re-stage it.
+#[test]
+fn md5_pointer_content_cleans_back_to_the_same_pointer() {
+    let t = TestRepo::new();
+    commit_mixed_pointers(&t);
+    let clone = t.clone_repo("clone");
+    bigstore_ok(&clone, &["pull"]);
+    let content = std::fs::read(clone.join("a_md5.bin")).unwrap();
+    assert_eq!(content, b"md5-addressed content\n");
+
+    // New stat data forces git to run clean instead of trusting the index.
+    let file = std::fs::File::options()
+        .write(true)
+        .open(clone.join("a_md5.bin"))
+        .unwrap();
+    file.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+    drop(file);
+
+    assert_eq!(git(&clone, &["status", "--porcelain"]), "");
+    git(&clone, &["add", "a_md5.bin"]);
+    assert_eq!(git(&clone, &["diff", "--cached", "--name-only"]), "");
 }
 
 #[test]
@@ -1690,24 +1695,7 @@ fn log_nonpointer_to_pointer_shows_add() {
         &t.repo_dir,
         &["init", &format!("local://{}", t.storage_dir.display())],
     );
-    // Override filter paths for test binary
-    let bin = env!("CARGO_BIN_EXE_git-bigstore");
-    git(
-        &t.repo_dir,
-        &[
-            "config",
-            "filter.bigstore.clean",
-            &format!("{bin} filter-clean"),
-        ],
-    );
-    git(
-        &t.repo_dir,
-        &[
-            "config",
-            "filter.bigstore.smudge",
-            &format!("{bin} filter-smudge"),
-        ],
-    );
+    use_test_filters(&t.repo_dir);
 
     t.write_file("model.bin", b"plain content\n"); // same content, but now filtered
     git(
@@ -1768,23 +1756,7 @@ fn log_root_commit_with_bigstore_file() {
     let storage_url = format!("local://{}", storage_dir.display());
     bigstore_ok(&repo_dir, &["init", &storage_url]);
 
-    let bin = env!("CARGO_BIN_EXE_git-bigstore");
-    git(
-        &repo_dir,
-        &[
-            "config",
-            "filter.bigstore.clean",
-            &format!("{bin} filter-clean"),
-        ],
-    );
-    git(
-        &repo_dir,
-        &[
-            "config",
-            "filter.bigstore.smudge",
-            &format!("{bin} filter-smudge"),
-        ],
-    );
+    use_test_filters(&repo_dir);
 
     // First (root) commit includes a bigstore file
     std::fs::write(repo_dir.join(".gitattributes"), b"*.bin filter=bigstore\n").unwrap();

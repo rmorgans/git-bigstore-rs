@@ -218,7 +218,8 @@ fn config_set(key: &str, value: &str) -> Result<()> {
 // required. This type models them as a unit and enforces:
 //
 //   1. Presence-consistency: all three must be set, or none.
-//   2. Command-shape: clean must end with "filter-clean", smudge with
+//   2. Command-shape: clean must end with "filter-clean %f" (or plain
+//      "filter-clean", written by older versions), smudge with
 //      "filter-smudge", and both must share the same binary prefix.
 //   3. Required must be "true".
 //
@@ -228,7 +229,7 @@ fn config_set(key: &str, value: &str) -> Result<()> {
 ///
 /// Invariants (enforced by load/new):
 /// - `binary` is the shared command prefix (e.g. "git-bigstore" or "/full/path/to/git-bigstore")
-/// - clean = "{binary} filter-clean", smudge = "{binary} filter-smudge"
+/// - clean = "{binary} filter-clean %f", smudge = "{binary} filter-smudge"
 /// - required is always true (set on save, checked on load)
 pub struct FilterConfig {
     binary: String,
@@ -262,7 +263,7 @@ impl FilterConfig {
         let clean = clean.ok_or_else(|| {
             anyhow::anyhow!(
                 "filter.bigstore.smudge is set but filter.bigstore.clean is missing.\n\
-             Fix: git config filter.bigstore.clean \"git-bigstore filter-clean\""
+             Fix: git config filter.bigstore.clean \"git-bigstore filter-clean %f\""
             )
         })?;
         let smudge = smudge.ok_or_else(|| {
@@ -285,14 +286,18 @@ impl FilterConfig {
             ),
         }
 
-        // Command shape: must end with "filter-clean" / "filter-smudge"
-        let clean_bin = clean.strip_suffix(" filter-clean").ok_or_else(|| {
-            anyhow::anyhow!(
-                "filter.bigstore.clean has unexpected format: {clean:?}\n\
-             Expected: \"<binary> filter-clean\"\n\
-             Fix: git config filter.bigstore.clean \"git-bigstore filter-clean\""
-            )
-        })?;
+        // Command shape: must end with "filter-clean [%f]" / "filter-smudge".
+        // `%f` hands clean the path, so it can keep an md5 pointer.
+        let clean_bin = clean
+            .strip_suffix(" filter-clean %f")
+            .or_else(|| clean.strip_suffix(" filter-clean"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "filter.bigstore.clean has unexpected format: {clean:?}\n\
+             Expected: \"<binary> filter-clean %f\"\n\
+             Fix: git config filter.bigstore.clean \"git-bigstore filter-clean %f\""
+                )
+            })?;
         let smudge_bin = smudge.strip_suffix(" filter-smudge").ok_or_else(|| {
             anyhow::anyhow!(
                 "filter.bigstore.smudge has unexpected format: {smudge:?}\n\
@@ -319,7 +324,7 @@ impl FilterConfig {
     pub fn save(&self) -> Result<()> {
         config_set(
             "filter.bigstore.clean",
-            &format!("{} filter-clean", self.binary),
+            &format!("{} filter-clean %f", self.binary),
         )?;
         config_set(
             "filter.bigstore.smudge",

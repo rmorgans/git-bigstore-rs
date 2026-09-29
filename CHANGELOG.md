@@ -66,10 +66,12 @@
   next pull repairs exactly the files it had touched — files the user deleted
   stay deleted. Pull never replaces a file that appears at a path while it
   runs.
-- Known limitation, unchanged: files whose committed pointer is md5 (DVC
-  imports) can show as modified after git re-checks their timestamps, because
-  the clean filter always produces sha256. `git add --renormalize <path>`
-  converts them.
+- Files whose committed pointer is md5 (DVC pointer text) no longer show as
+  modified, or get re-staged as sha256, after git re-checks their timestamps.
+  The clean filter now gets the path (`filter-clean %f`) and keeps the index's
+  md5 pointer when the content still matches it. `init` and `pull` write the
+  new command; an existing `filter-clean` without `%f` keeps working as
+  before.
 - Files outside a sparse checkout (skip-worktree) are no longer downloaded;
   `status` shows them as `outside sparse checkout`.
 - `status --verify` repair advice names the corrupted object files instead of

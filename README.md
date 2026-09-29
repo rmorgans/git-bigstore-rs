@@ -245,6 +245,12 @@ the smudge filter restores the real content on checkout (if cached locally).
 Only an exact pointer is treated as one: any other content — including text
 that happens to start with `bigstore` — is stored as a large file.
 
+New content always gets a sha256 pointer. A file whose committed pointer is
+md5 (committed DVC pointer text) keeps that md5 pointer as long as its content
+matches it, so re-running the clean filter — as git does after checkout —
+never shows it as modified. git passes the path to the clean filter (`%f`) so
+it can look the pointer up in the index.
+
 The object cache lives in the repository's common git directory
 (`.git/bigstore/objects`), shared by all linked worktrees.
 
@@ -344,7 +350,7 @@ Tested against a real monorepo with 34 .dvc files across nested DVC projects.
   pointer text). The clean filter converts back to pointers on `git add`.
 - If `git-bigstore` is not in PATH, set full filter paths before `git add`:
   ```bash
-  git config filter.bigstore.clean "/path/to/git-bigstore filter-clean"
+  git config filter.bigstore.clean "/path/to/git-bigstore filter-clean %f"
   git config filter.bigstore.smudge "/path/to/git-bigstore filter-smudge"
   ```
 

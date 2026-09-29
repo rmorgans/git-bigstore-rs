@@ -114,9 +114,13 @@ enum Commands {
     #[command(subcommand)]
     Folder(FolderCommand),
 
-    /// Internal: clean filter (stdin -> stdout)
-    #[command(name = "filter-clean", hide = true)]
-    FilterClean,
+    /// Internal: clean filter (stdin -> stdout); git passes the path as `%f`
+    #[command(name = "filter-clean", hide = true, disable_help_flag = true)]
+    FilterClean {
+        /// The file's path relative to the repository root
+        #[arg(allow_hyphen_values = true)]
+        path: Option<std::ffi::OsString>,
+    },
 
     /// Internal: smudge filter (stdin -> stdout)
     #[command(name = "filter-smudge", hide = true)]
@@ -208,7 +212,7 @@ fn main() -> Result<()> {
             force,
         } => cmd_import_dvc_dir(&source, &dest_root, &patterns, force),
         Commands::Folder(cmd) => cmd_folder(cmd),
-        Commands::FilterClean => filter::clean(),
+        Commands::FilterClean { path } => filter::clean(path.as_deref()),
         Commands::FilterSmudge => filter::smudge(),
         Commands::LfsAdapter => bigstore::lfs_adapter::run(),
     }

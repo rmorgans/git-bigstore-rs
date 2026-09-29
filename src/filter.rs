@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::cache;
+use crate::catfile::CatFileBatch;
 use crate::git;
 use crate::hash::Hasher;
 use crate::types::{HashFunction, Pointer, MAX_POINTER_BYTES};
@@ -33,8 +35,10 @@ fn read_head(reader: &mut impl Read) -> io::Result<Head> {
 ///
 /// Input that is already a pointer passes through unchanged (idempotent).
 /// Everything else — including text that merely starts like a pointer — is
-/// hashed into the cache and replaced by its pointer.
-pub fn clean() -> Result<()> {
+/// hashed into the cache and replaced by its pointer: sha256, unless the
+/// index holds an md5 pointer for `path` that this content still matches.
+/// Git passes `path` through `%f`; without it the pointer is always sha256.
+pub fn clean(path: Option<&OsStr>) -> Result<()> {
     let mut reader = io::stdin().lock();
     let mut writer = io::stdout().lock();
 
@@ -43,25 +47,44 @@ pub fn clean() -> Result<()> {
         Head::Content { head } => head,
     };
 
+    let indexed = match path.and_then(OsStr::to_str) {
+        Some(path) => index_pointer(&mut CatFileBatch::start(Path::new("."))?, path)?,
+        None => None,
+    };
+    // Content matching an md5 pointer keeps it: git re-cleans checked-out
+    // files (racy timestamps, touched files) and a sha256 pointer would show
+    // them as modified and re-stage them.
+    let mut kept = indexed
+        .filter(|p| p.hash_fn() != HashFunction::Sha256)
+        .map(|p| (Hasher::new(p.hash_fn()), p));
+
     let git_dir = git::common_dir()?;
     cache::ensure_cache_dir(&git_dir)?;
     let mut tmp = tempfile::NamedTempFile::new_in(cache::cache_dir(&git_dir))?;
     let mut hasher = Hasher::new(HashFunction::Sha256);
 
-    hasher.update(&head);
-    tmp.write_all(&head)?;
+    let mut update = |data: &[u8]| -> io::Result<()> {
+        hasher.update(data);
+        if let Some((h, _)) = kept.as_mut() {
+            h.update(data);
+        }
+        tmp.write_all(data)
+    };
+    update(&head)?;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
-        tmp.write_all(&buf[..n])?;
+        update(&buf[..n])?;
     }
-    let hexdigest = hasher.finalize();
+    let pointer = match kept.map(|(h, p)| (h.finalize(), p)) {
+        Some((digest, p)) if digest == *p.hexdigest() => p,
+        _ => Pointer::new(hasher.finalize()),
+    };
 
-    let dest = cache::object_path(&git_dir, &hexdigest);
+    let dest = cache::object_path(&git_dir, pointer.hexdigest());
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -72,8 +95,17 @@ pub fn clean() -> Result<()> {
         Err(e) => return Err(e.error.into()),
     }
 
-    writer.write_all(&Pointer::new(hexdigest).encode())?;
+    writer.write_all(&pointer.encode())?;
     Ok(())
+}
+
+/// The pointer git's index holds at root-relative `path` (stage 0), if any.
+fn index_pointer(index: &mut CatFileBatch, path: &str) -> Result<Option<Pointer>> {
+    // cat-file --batch reads one name per line.
+    if path.contains('\n') {
+        return Ok(None);
+    }
+    index.read_pointer(&format!(":0:{path}"))
 }
 
 /// Smudge filter: pointer -> file content (stdin -> stdout).
