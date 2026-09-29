@@ -51,6 +51,8 @@
   names from a manifest `dvc push` wrote on Linux. `folder push` still
   refuses names that are not portable, so what it writes can be pulled
   everywhere.
+- `folder pull --at <id>` with a prefix that matches several versions lists
+  each candidate's id and push time instead of only saying it is ambiguous.
 - One blob that is not a pointer (e.g. committed before its `filter=bigstore`
   rule) no longer aborts the whole push or pull; `status` reports it as
   `not a pointer in git (git add --renormalize)`.

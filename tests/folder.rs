@@ -571,3 +571,50 @@ fn an_equivalent_crlf_pointer_is_left_untouched() {
     folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     assert_eq!(std::fs::read_to_string(&first.pointer_path).unwrap(), crlf);
 }
+
+/// Put a history record on `e`'s remote directly, as another host's push
+/// would have: a single-file pointer to `md5` at `time` (record format).
+fn write_record(e: &Env, key: &str, time: &str, md5: &str) {
+    let pointer = DvcPointer {
+        output: DvcOutput::File {
+            md5: Hexdigest::new(md5, HashFunction::Md5).unwrap(),
+            size: 1,
+        },
+        path: "f".into(),
+    };
+    write(
+        &e.store
+            .join(format!("bigstore-history/{key}/{time}-{md5}.dvc")),
+        pointer.to_yaml().as_bytes(),
+    );
+}
+
+#[test]
+fn an_ambiguous_version_id_is_refused_and_lists_the_candidates() {
+    let e = env();
+    let a = format!("deadbeef{}", "0".repeat(24));
+    let b = format!("deadbeef{}", "1".repeat(24));
+    write_record(&e, "k", "20260901T000000.000000000Z", &a);
+    write_record(&e, "k", "20260902T000000.000000000Z", &b);
+    let pull = |id: &str| {
+        folder::pull(
+            &e.remote,
+            &PointerSource::History {
+                key: HistoryKey::new("k").unwrap(),
+                at: Selector::Id(id.into()),
+            },
+            &pull_opts(Some(e.data.join("f"))),
+        )
+    };
+    let msg = format!("{:#}", pull("DEADBEEF").unwrap_err());
+    assert!(msg.contains("ambiguous"), "{msg}");
+    assert!(msg.contains(&a) && msg.contains(&b), "{msg}");
+    assert!(
+        msg.contains("2026-09-01") && msg.contains("2026-09-02"),
+        "{msg}"
+    );
+    // A longer prefix picks one; the object is absent, so the fetch fails.
+    let msg = format!("{:#}", pull(&b[..9]).unwrap_err());
+    assert!(!msg.contains("ambiguous"), "{msg}");
+    assert!(!e.data.join("f").exists());
+}

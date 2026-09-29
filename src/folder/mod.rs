@@ -229,15 +229,23 @@ fn select<'a>(records: &'a [HistoryRecord], at: &Selector) -> Result<&'a History
                 "version id prefix must be at least 8 hex characters"
             );
             let prefix = prefix.to_ascii_lowercase();
-            let mut matches = records
+            let matches: Vec<&HistoryRecord> = records
                 .iter()
-                .filter(|r| r.id().to_string().starts_with(&prefix));
-            let first = matches.next();
-            anyhow::ensure!(
-                matches.next().is_none(),
-                "version id prefix {prefix} is ambiguous"
-            );
-            first
+                .filter(|r| r.id().to_string().starts_with(&prefix))
+                .collect();
+            match matches.as_slice() {
+                [] => None,
+                [one] => Some(*one),
+                many => {
+                    let candidates: String = many
+                        .iter()
+                        .map(|r| format!("\n  {}  pushed {}", r.id(), r.time.to_rfc3339()))
+                        .collect();
+                    anyhow::bail!(
+                        "version id prefix {prefix} is ambiguous; it matches:{candidates}"
+                    )
+                }
+            }
         }
         Selector::AtOrBefore(when) => {
             let when = chrono::DateTime::parse_from_rfc3339(when)
