@@ -23,7 +23,7 @@ pub use crate::backend::store::Credentials;
 use crate::backend::{self, Backend};
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
-use crate::types::{check_portable_component, Hexdigest, Layout, PortableRelPath};
+use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath, PortableRelPath};
 
 use snapshot::{Snapshot, SnapshotError};
 use walk::WalkError;
@@ -698,10 +698,7 @@ async fn pull_async(
     let (pointer, default_into) = match source {
         PointerSource::File(path) => {
             let pointer = DvcPointer::load(path)?;
-            let into = path
-                .parent()
-                .context("pointer has no parent directory")?
-                .join(&pointer.path);
+            let into = pointer_output(path, &pointer)?;
             (pointer, Some(into))
         }
         PointerSource::History { key, at } => {
@@ -776,6 +773,24 @@ async fn pull_async(
         unchanged,
         extra_local,
     })
+}
+
+/// Where a `.dvc` file's output lives: `pointer.path` beside it. That must
+/// be one name this OS can write, as push writes, so a pointer cannot
+/// restore outside its own directory (`..`, an absolute path, `a/b`).
+fn pointer_output(dvc: &Path, pointer: &DvcPointer) -> Result<PathBuf> {
+    let name = pointer.path.as_str();
+    let single = ManifestPath::new(name)
+        .and_then(|p| p.to_repo_path())
+        .is_ok_and(|p| !p.as_str().contains('/'));
+    anyhow::ensure!(
+        single,
+        "{} names its output {name:?}, which is not a single file or directory \
+         name on this OS; refusing to restore it",
+        dvc.display()
+    );
+    let dir = dvc.parent().context("pointer has no parent directory")?;
+    Ok(dir.join(name))
 }
 
 enum Target {

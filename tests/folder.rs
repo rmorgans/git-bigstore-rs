@@ -999,3 +999,35 @@ fn pull_of_a_version_whose_manifest_is_missing_names_it() {
     );
     assert!(!e.data.join("out").exists());
 }
+
+/// A `.dvc` names its output relative to its own directory, and push only
+/// ever writes one component. A pointer naming anything else is refused
+/// before a byte is written, wherever it points.
+#[test]
+fn pull_refuses_a_pointer_whose_path_leaves_its_directory() {
+    let e = env();
+    let file = e.data.join("store.toml");
+    write(&file, b"x = 1\n");
+    let report = folder::push(&e.remote, &file, &opts("ds/store.toml")).unwrap();
+    let DvcOutput::File { md5, .. } = &report.pointer.output else {
+        panic!("expected a file pointer")
+    };
+    let outside = e.data.parent().unwrap().join("escaped");
+    let absolute = outside.to_str().unwrap().to_string();
+    for bad in ["../escaped", absolute.as_str(), "sub/escaped", "", "."] {
+        let dvc = e.data.join("evil.dvc");
+        let yaml = format!("outs:\n- md5: {md5}\n  size: 6\n  hash: md5\n  path: '{bad}'\n");
+        write(&dvc, yaml.as_bytes());
+        let err = folder::pull(
+            &e.remote,
+            &PointerSource::File(dvc.clone()),
+            &pull_opts(None),
+        )
+        .expect_err(bad);
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
+        assert!(msg.contains("evil.dvc"), "{bad:?}: {msg}");
+        assert!(!outside.exists(), "{bad:?}: wrote outside");
+        assert!(!e.data.join("sub").exists(), "{bad:?}: wrote below");
+    }
+}

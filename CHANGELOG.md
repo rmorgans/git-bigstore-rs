@@ -53,6 +53,11 @@
   everywhere.
 - `folder pull --at <id>` with a prefix that matches several versions lists
   each candidate's id and push time instead of only saying it is ambiguous.
+- `folder pull <x.dvc>` restored to `<dir>/<path>` with `path` taken as
+  written, so a hostile `.dvc` with `path: ../x` or an absolute path wrote
+  outside the pointer's directory. `path` must now be one name this OS can
+  write (as push writes); anything else is refused, naming the value and the
+  `.dvc` file, before anything is written.
 - One blob that is not a pointer (e.g. committed before its `filter=bigstore`
   rule) no longer aborts the whole push or pull; `status` reports it as
   `not a pointer in git (git add --renormalize)`.
