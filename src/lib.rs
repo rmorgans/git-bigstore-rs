@@ -9,5 +9,6 @@ pub mod git;
 pub mod hash;
 pub mod lfs_adapter;
 pub mod log;
+pub mod pktline;
 pub mod transfer;
 pub mod types;
