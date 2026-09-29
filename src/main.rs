@@ -247,7 +247,14 @@ fn cmd_pull(patterns: &[String], jobs: Option<NonZeroUsize>) -> Result<()> {
     ))?;
     report.print();
     // Check out whatever did arrive, even if some objects failed.
-    let checkout = transfer::checkout(&repo_root, &git_dir, &entries)?;
+    let journal = git::worktree_git_dir()?.join("bigstore-pull-journal");
+    let checkout = transfer::checkout(&repo_root, &git_dir, &journal, &entries)?;
+    if checkout.recovered > 0 {
+        eprintln!(
+            "{} file(s) left by an interrupted pull recovered",
+            checkout.recovered
+        );
+    }
     if checkout.checked_out > 0 {
         eprintln!("{} file(s) checked out", checkout.checked_out);
     }

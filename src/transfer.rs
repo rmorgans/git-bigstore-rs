@@ -277,7 +277,9 @@ async fn download_to_cache(remote: &Remote<'_>, key: &str, expected: &Hexdigest)
 /// Result of [`checkout`].
 pub struct Checkout {
     pub checked_out: usize,
-    /// Paths left as pointers because git could not check them out.
+    /// Files an interrupted earlier pull left behind, now repaired.
+    pub recovered: usize,
+    /// Paths left as they were because git could not check them out.
     pub failed: Vec<Failure>,
 }
 
@@ -290,103 +292,195 @@ pub struct Checkout {
 /// index's pointer is touched: local edits, other content, missing files and
 /// skip-worktree (sparse) entries are left alone.
 ///
-/// Paths are classified before anything changes. Their pointer files are
-/// then removed (git skips entries whose stat data still matches the index,
-/// which a freshly checked-out pointer does) and git checks them all out in
-/// one batch. If the batch fails, git has written no index, so every path is
-/// reconciled on its own: content git did write is kept (after checking it is
-/// the object) and its index entry refreshed; paths git never reached are
-/// retried alone, and on failure get their pointer back. Nothing that
-/// appears at a path meanwhile is ever overwritten, a failed pull leaves the
-/// tree clean, and re-running pull converges.
-pub fn checkout(repo_root: &Path, git_dir: &Path, entries: &[IndexEntry]) -> Result<Checkout> {
+/// Git skips entries whose stat data still matches the index, which a
+/// freshly checked-out pointer does, so each pointer file is removed first.
+/// Before removing anything the paths are written to a journal in this
+/// worktree's git directory:
+///
+/// - If git fails part-way (it then writes no index at all), each path is
+///   reconciled on its own: a file git did write is verified against its
+///   object and checked out again so the index is refreshed; a path git never
+///   reached is retried alone and, if that fails, gets its original pointer
+///   bytes back. The index blob is never changed.
+/// - If pull is killed, the journal survives and the next pull repairs the
+///   paths it names — missing files and files with stale index data — while
+///   files deleted by the user (not in the journal) stay deleted.
+///
+/// Nothing that appears at a path while pull runs is ever overwritten.
+pub fn checkout(
+    repo_root: &Path,
+    git_dir: &Path,
+    journal: &Path,
+    entries: &[IndexEntry],
+) -> Result<Checkout> {
+    // Journaled paths this run does not handle (outside the pull patterns,
+    // unreadable) stay in the journal for a later pull.
+    let mut carried = read_journal(journal)?;
     let mut result = Checkout {
         checked_out: 0,
+        recovered: 0,
         failed: Vec::new(),
     };
+
     let mut candidates = Vec::new();
     for entry in entries.iter().filter(|e| !e.skip_worktree) {
         let IndexBlob::Pointer(pointer) = &entry.blob else {
             continue;
         };
-        if !cache::object_path(git_dir, pointer.hexdigest()).is_file() {
-            continue;
-        }
         let fs_path = entry.path.to_fs_path(repo_root);
-        if matches!(filter::worktree_file(&fs_path)?, WorktreeFile::Pointer(p) if p == *pointer) {
-            candidates.push(Candidate {
-                path: &entry.path,
-                pointer,
-                permissions: std::fs::metadata(&fs_path)?.permissions(),
-                fs_path,
-            });
-        }
+        let cached = cache::object_path(git_dir, pointer.hexdigest()).is_file();
+        let interrupted = carried.remove(&entry.path);
+        // Hashing content is only needed to recognise a file an interrupted
+        // pull wrote; every other checked-out file is left alone unread.
+        let state = match classify(&fs_path, pointer, interrupted) {
+            Ok(state) => state,
+            Err(e) => {
+                if interrupted {
+                    carried.insert(entry.path.clone());
+                }
+                result.failed.push(Failure {
+                    paths: vec![entry.path.clone()],
+                    error: format!("{e:#}"),
+                });
+                continue;
+            }
+        };
+        let found = match state {
+            Found::Pointer { raw, permissions } if cached => Found::Pointer { raw, permissions },
+            Found::Missing | Found::Object if interrupted => {
+                result.recovered += 1;
+                state
+            }
+            _ => continue,
+        };
+        candidates.push(Candidate {
+            path: &entry.path,
+            pointer,
+            fs_path,
+            found,
+        });
     }
 
-    let mut removed = Vec::new();
+    write_journal(
+        journal,
+        carried.iter().chain(candidates.iter().map(|c| c.path)),
+    )?;
+
+    let mut in_flight = Vec::new();
     for c in candidates {
-        match std::fs::remove_file(&c.fs_path) {
-            Ok(()) => removed.push(c),
-            Err(e) => result
-                .failed
-                .push(c.failure(format!("failed to replace: {e}"))),
+        match c.clear() {
+            Ok(()) => in_flight.push(c),
+            Err(e) => result.failed.push(c.failure(format!("{e:#}"))),
         }
     }
-    let paths: Vec<&RepoPath> = removed.iter().map(|c| c.path).collect();
+    let paths: Vec<&RepoPath> = in_flight.iter().map(|c| c.path).collect();
+    let mut unresolved = Vec::new();
     if git::checkout_index(repo_root, &paths).is_ok() {
-        result.checked_out += removed.len();
-        return Ok(result);
-    }
-
-    let mut written = Vec::new();
-    for c in removed {
-        match filter::worktree_file(&c.fs_path)? {
-            WorktreeFile::Missing => match git::checkout_index(repo_root, &[c.path]) {
+        result.checked_out += in_flight.len();
+    } else {
+        for c in &in_flight {
+            match c.checkout_alone(repo_root) {
                 Ok(()) => result.checked_out += 1,
                 Err(e) => {
-                    let error =
-                        match restore_pointer(&c.fs_path, &c.pointer.encode(), &c.permissions) {
-                            Ok(()) => format!("{e:#}"),
-                            Err(restore) => format!(
-                                "{e:#}; could not restore the pointer file ({restore:#}), \
-                             run `git checkout -- {}`",
-                                c.path
-                            ),
-                        };
-                    result.failed.push(c.failure(error));
+                    // Still missing: a later pull must know this pull removed it.
+                    if std::fs::symlink_metadata(&c.fs_path).is_err() {
+                        unresolved.push(c.path);
+                    }
+                    result.failed.push(c.failure(format!("{e:#}")));
                 }
-            },
-            WorktreeFile::Content
-                if hash::hash_file(&c.fs_path, c.pointer.hash_fn())
-                    .ok()
-                    .as_ref()
-                    == Some(c.pointer.hexdigest()) =>
-            {
-                written.push(c);
             }
-            _ => result.failed.push(
-                c.failure("the file changed while pull was running; left untouched".to_string()),
-            ),
         }
     }
-    let paths: Vec<&RepoPath> = written.iter().map(|c| c.path).collect();
-    match git::refresh_entries(repo_root, &paths) {
-        Ok(()) => result.checked_out += written.len(),
-        Err(e) => result
-            .failed
-            .extend(written.iter().map(|c| c.failure(format!("{e:#}")))),
-    }
+
+    write_journal(journal, carried.iter().chain(unresolved))?;
     Ok(result)
+}
+
+/// What a pointer entry's working-tree path holds, as far as checkout cares.
+enum Found {
+    /// Exactly the index's pointer, with its bytes and permissions (so a
+    /// failed checkout can put it back unchanged).
+    Pointer {
+        raw: Vec<u8>,
+        permissions: std::fs::Permissions,
+    },
+    /// Nothing.
+    Missing,
+    /// The object's exact content.
+    Object,
+    /// Anything else: never touched.
+    Other,
+}
+
+/// `hash_content`: whether to check if other content is the object itself
+/// (reads the whole file).
+fn classify(fs_path: &Path, pointer: &Pointer, hash_content: bool) -> Result<Found> {
+    Ok(match filter::worktree_file(fs_path)? {
+        WorktreeFile::Missing => Found::Missing,
+        WorktreeFile::Pointer(p) if p == *pointer => Found::Pointer {
+            raw: std::fs::read(fs_path)?,
+            permissions: std::fs::metadata(fs_path)?.permissions(),
+        },
+        WorktreeFile::Content
+            if hash_content
+                && hash::hash_file(fs_path, pointer.hash_fn())? == *pointer.hexdigest() =>
+        {
+            Found::Object
+        }
+        WorktreeFile::Pointer(_) | WorktreeFile::Content => Found::Other,
+    })
 }
 
 struct Candidate<'a> {
     path: &'a RepoPath,
     pointer: &'a Pointer,
     fs_path: PathBuf,
-    permissions: std::fs::Permissions,
+    found: Found,
 }
 
 impl Candidate<'_> {
+    /// Remove whatever git would otherwise consider up to date.
+    fn clear(&self) -> Result<()> {
+        match self.found {
+            Found::Missing => Ok(()),
+            _ => std::fs::remove_file(&self.fs_path)
+                .with_context(|| format!("failed to replace {}", self.path)),
+        }
+    }
+
+    /// Reconcile one path after a failed batch checkout.
+    fn checkout_alone(&self, repo_root: &Path) -> Result<()> {
+        match classify(&self.fs_path, self.pointer, true)? {
+            // Git wrote it but recorded no stat data: write it again.
+            Found::Object => {
+                std::fs::remove_file(&self.fs_path)?;
+                self.retry(repo_root)
+            }
+            Found::Missing => self.retry(repo_root),
+            Found::Pointer { .. } | Found::Other => {
+                anyhow::bail!("the file changed while pull was running; left untouched")
+            }
+        }
+    }
+
+    fn retry(&self, repo_root: &Path) -> Result<()> {
+        let Err(e) = git::checkout_index(repo_root, &[self.path]) else {
+            return Ok(());
+        };
+        let restored = match &self.found {
+            Found::Pointer { raw, permissions } => restore(&self.fs_path, raw, permissions),
+            // Nothing was there before this pull: leave it missing.
+            _ => Ok(()),
+        };
+        match restored {
+            Ok(()) => Err(e),
+            Err(restore) => Err(e.context(format!(
+                "could not restore the pointer file ({restore:#}); run `git checkout -- {}`",
+                self.path
+            ))),
+        }
+    }
+
     fn failure(&self, error: String) -> Failure {
         Failure {
             paths: vec![self.path.clone()],
@@ -395,19 +489,54 @@ impl Candidate<'_> {
     }
 }
 
-/// Put a pointer file back after a failed checkout. Git runs the smudge
-/// filter before creating the file, so after a failure the path is normally
-/// empty; `create_new` guarantees that anything that did appear there in the
-/// meantime is reported, never replaced.
-fn restore_pointer(path: &Path, pointer: &[u8], permissions: &std::fs::Permissions) -> Result<()> {
+/// Put a pointer file back after a failed checkout. `create_new` guarantees
+/// that anything that appeared at the path meanwhile is reported, never
+/// replaced.
+fn restore(path: &Path, raw: &[u8], permissions: &std::fs::Permissions) -> Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .with_context(|| format!("{} exists", path.display()))?;
-    file.write_all(pointer)?;
+    file.write_all(raw)?;
     file.set_permissions(permissions.clone())?;
+    Ok(())
+}
+
+/// Paths a previous pull removed and may not have finished checking out.
+fn read_journal(journal: &Path) -> Result<std::collections::BTreeSet<RepoPath>> {
+    let bytes = match std::fs::read(journal) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", journal.display())),
+    };
+    bytes
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(RepoPath::from_git_bytes)
+        .collect()
+}
+
+/// Durably replace the journal; an empty set removes it.
+fn write_journal<'a>(journal: &Path, paths: impl Iterator<Item = &'a RepoPath>) -> Result<()> {
+    use std::io::Write;
+    let mut bytes = Vec::new();
+    for p in paths {
+        bytes.extend_from_slice(p.as_str().as_bytes());
+        bytes.push(0);
+    }
+    if bytes.is_empty() {
+        return match std::fs::remove_file(journal) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let dir = journal.parent().context("journal path has no parent")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(&bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(journal)?;
     Ok(())
 }
 

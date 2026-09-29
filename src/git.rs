@@ -14,6 +14,12 @@ pub fn common_dir() -> Result<PathBuf> {
     rev_parse(&["--path-format=absolute", "--git-common-dir"])
 }
 
+/// This worktree's own git directory, as an absolute path (differs from
+/// [`common_dir`] in a linked worktree). Per-worktree state lives here.
+pub fn worktree_git_dir() -> Result<PathBuf> {
+    rev_parse(&["--path-format=absolute", "--git-dir"])
+}
+
 pub fn repo_root() -> Result<PathBuf> {
     rev_parse(&["--show-toplevel"])
 }
@@ -171,7 +177,7 @@ pub fn bigstore_entries(repo_root: &Path, patterns: &[String]) -> Result<Vec<Ind
 /// Without `-f`: git refuses to replace a file that exists, so this never
 /// overwrites something written at a path after the caller checked it.
 /// If any path fails, git writes no index at all: paths it did write are
-/// left with stale stat data (see [`refresh_entries`]).
+/// left with stale stat data.
 pub fn checkout_index(repo_root: &Path, paths: &[&RepoPath]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -179,23 +185,6 @@ pub fn checkout_index(repo_root: &Path, paths: &[&RepoPath]) -> Result<()> {
     git_with_input(
         repo_root,
         &["checkout-index", "-u", "-z", "--stdin"],
-        nul_joined(paths.iter().map(|p| p.as_str().as_bytes())),
-    )?;
-    Ok(())
-}
-
-/// Re-record index stat data for `paths` by passing their working-tree
-/// content through the clean filter (`git update-index`). For files whose
-/// content hashes to the index's blob this changes nothing but the stat data;
-/// `update-index --refresh` cannot do it because git treats a size change as
-/// a content change without re-reading the file.
-pub fn refresh_entries(repo_root: &Path, paths: &[&RepoPath]) -> Result<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    git_with_input(
-        repo_root,
-        &["update-index", "-z", "--stdin"],
         nul_joined(paths.iter().map(|p| p.as_str().as_bytes())),
     )?;
     Ok(())

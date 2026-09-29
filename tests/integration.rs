@@ -907,51 +907,179 @@ fn unrelated_non_utf8_path_does_not_block_push() {
 /// Cache object path for a committed pointer in `repo`.
 fn cached_object(repo: &Path, path: &str) -> PathBuf {
     let pointer = git(repo, &["cat-file", "blob", &format!(":{path}")]);
-    let hex = pointer.lines().nth(2).unwrap();
+    let mut lines = pointer.lines().skip(1);
+    let (hash_fn, hex) = (lines.next().unwrap(), lines.next().unwrap());
     let common = git(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     );
     PathBuf::from(common).join(format!(
-        "bigstore/objects/sha256/{}/{}",
+        "bigstore/objects/{hash_fn}/{}/{}",
         &hex[..2],
         &hex[2..]
     ))
 }
 
-#[cfg(unix)]
-#[test]
-fn failed_checkout_restores_the_pointer_and_retry_converges() {
-    use std::os::unix::fs::PermissionsExt;
-    let t = TestRepo::new();
+/// Commit `a_md5.bin` as an md5 pointer (as `ref` produces) whose object is
+/// in the cache, plus sha256 files `b.bin` and `z.bin`, and push them.
+fn commit_mixed_pointers(t: &TestRepo) {
     t.track("*.bin filter=bigstore\n");
-    t.write_file("a.bin", b"object a\n");
+    let content = b"md5-addressed content\n";
+    let hex = format!("{:x}", md5::Md5::digest(content));
+    let object = t.repo_dir.join(format!(
+        ".git/bigstore/objects/md5/{}/{}",
+        &hex[..2],
+        &hex[2..]
+    ));
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, content).unwrap();
+    t.write_file("a_md5.bin", format!("bigstore\nmd5\n{hex}\n").as_bytes());
     t.write_file("b.bin", b"object b\n");
-    git(&t.repo_dir, &["add", "a.bin", "b.bin"]);
+    t.write_file("z.bin", b"object z\n");
+    git(&t.repo_dir, &["add", "a_md5.bin", "b.bin", "z.bin"]);
     git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
     bigstore_ok(&t.repo_dir, &["push"]);
+}
 
-    // Fresh clone: both files are pointers. a.bin's object is already in the
-    // clone's cache but unreadable, so its smudge fails during checkout;
-    // b.bin's object is downloaded normally.
+#[cfg(unix)]
+#[test]
+fn failed_checkout_keeps_the_index_and_retry_converges() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = TestRepo::new();
+    commit_mixed_pointers(&t);
+
+    // z.bin sorts last: git writes a_md5.bin and b.bin, then dies on z.bin,
+    // whose cached object is unreadable, without writing any index.
     let clone = t.clone_repo("clone");
-    let object = cached_object(&clone, "a.bin");
+    let object = cached_object(&clone, "z.bin");
     std::fs::create_dir_all(object.parent().unwrap()).unwrap();
-    std::fs::copy(cached_object(&t.repo_dir, "a.bin"), &object).unwrap();
+    std::fs::copy(cached_object(&t.repo_dir, "z.bin"), &object).unwrap();
     std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
     let output = bigstore(&clone, &["pull"]);
     std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o444)).unwrap();
 
     assert!(!output.status.success(), "a failed checkout must fail pull");
-    assert!(std::fs::read(clone.join("a.bin"))
+    assert_eq!(
+        std::fs::read(clone.join("a_md5.bin")).unwrap(),
+        b"md5-addressed content\n"
+    );
+    assert_eq!(std::fs::read(clone.join("b.bin")).unwrap(), b"object b\n");
+    assert!(std::fs::read(clone.join("z.bin"))
         .unwrap()
         .starts_with(b"bigstore\n"));
-    assert_eq!(std::fs::read(clone.join("b.bin")).unwrap(), b"object b\n");
-    assert_eq!(git(&clone, &["status", "--porcelain"]), "");
+    // Nothing staged: the md5 pointer must not be re-cleaned into a sha256
+    // one. (md5 files are left out of `status`: git's racy-timestamp
+    // re-check runs the clean filter, which always yields sha256.)
+    assert_eq!(git(&clone, &["diff", "--cached", "--name-only"]), "");
+    assert_eq!(
+        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
+        ""
+    );
 
     bigstore_ok(&clone, &["pull"]);
-    assert_eq!(std::fs::read(clone.join("a.bin")).unwrap(), b"object a\n");
-    assert_eq!(git(&clone, &["status", "--porcelain"]), "");
+    assert_eq!(std::fs::read(clone.join("z.bin")).unwrap(), b"object z\n");
+    assert_eq!(
+        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
+        ""
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_pull_is_recovered_by_the_next_pull() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = TestRepo::new();
+    commit_mixed_pointers(&t);
+    let clone = t.clone_repo("clone");
+
+    // A filter binary that lets the first smudge through, then SIGKILLs pull
+    // and git in the middle of checkout.
+    let dir = clone.parent().unwrap();
+    let killer = dir.join("killer.sh");
+    std::fs::write(
+        &killer,
+        r#"#!/bin/sh
+[ "$1" = filter-smudge ] || exec "$BIGSTORE_BIN" "$@"
+n=$(cat "$KILL_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$KILL_COUNT"
+[ "$n" -lt 2 ] && exec "$BIGSTORE_BIN" filter-smudge
+p=$PPID
+while [ "${p:-1}" -gt 1 ]; do
+  case "$(ps -o command= -p "$p")" in
+    *"git-bigstore pull"*) kill -KILL "$p";;
+    *checkout-index*) kill -TERM "$p";;
+  esac
+  p=$(ps -o ppid= -p "$p" | tr -d ' ')
+done
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&killer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let killer = killer.to_str().unwrap();
+    for (key, cmd) in [("clean", "filter-clean"), ("smudge", "filter-smudge")] {
+        let value = format!("{killer} {cmd}");
+        git(
+            &clone,
+            &["config", &format!("filter.bigstore.{key}"), &value],
+        );
+    }
+
+    let bin = env!("CARGO_BIN_EXE_git-bigstore");
+    let killed = Command::new(bin)
+        .arg("pull")
+        .current_dir(&clone)
+        .env("KILL_COUNT", dir.join("count"))
+        .env("BIGSTORE_BIN", bin)
+        .output()
+        .unwrap();
+    assert!(!killed.status.success(), "pull should have been killed");
+    assert_ne!(
+        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
+        "",
+        "sanity: the kill left the tree damaged"
+    );
+
+    for (key, cmd) in [("clean", "filter-clean"), ("smudge", "filter-smudge")] {
+        let value = format!("{bin} {cmd}");
+        git(
+            &clone,
+            &["config", &format!("filter.bigstore.{key}"), &value],
+        );
+    }
+    let out = bigstore(&clone, &["pull"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("interrupted pull recovered"));
+    assert_eq!(
+        std::fs::read(clone.join("a_md5.bin")).unwrap(),
+        b"md5-addressed content\n"
+    );
+    assert_eq!(std::fs::read(clone.join("b.bin")).unwrap(), b"object b\n");
+    assert_eq!(std::fs::read(clone.join("z.bin")).unwrap(), b"object z\n");
+    assert_eq!(git(&clone, &["diff", "--cached", "--name-only"]), "");
+    // md5 pointers are excluded: git's racy-timestamp re-check runs the clean
+    // filter, which always yields a sha256 pointer.
+    assert_eq!(
+        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
+        ""
+    );
+}
+
+#[test]
+fn pull_never_restores_a_file_the_user_deleted() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("a.bin", b"content\n");
+    git(&t.repo_dir, &["add", "a.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+    bigstore_ok(&t.repo_dir, &["push"]);
+
+    std::fs::remove_file(t.repo_dir.join("a.bin")).unwrap();
+    bigstore_ok(&t.repo_dir, &["pull"]);
+    assert!(!t.file_exists("a.bin"));
 }
 
 #[test]
