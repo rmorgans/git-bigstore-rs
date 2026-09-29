@@ -83,7 +83,10 @@ configures git clean/smudge filters.
 ### `git bigstore push [patterns...]`
 
 Upload cached objects to remote storage. Skips objects already present on the
-remote. Optional glob patterns filter which files to push.
+remote. Optional glob patterns (relative to the repository root, whatever
+directory you run from) filter which files to push. An object that is
+neither on the remote nor in the local cache is reported as a failure — its
+content exists nowhere this clone can reach.
 
 ```bash
 git bigstore push              # push all tracked files
@@ -95,6 +98,13 @@ git bigstore push --jobs 16    # use 16 concurrent uploads
 
 Download objects from remote storage with integrity verification. Every
 downloaded object is hash-verified before entering the local cache.
+
+Pull then checks files out through git, so they get their committed file mode
+and `git status` stays clean. Only files that are still unsmudged pointers are
+replaced: local edits are never overwritten, and missing files (deleted, or
+outside a sparse checkout) stay missing. In a fresh clone, pull configures the
+bigstore git filters if they are not set yet. If pull is interrupted, the
+next pull repairs the files it had started checking out.
 
 ```bash
 git bigstore pull              # pull all tracked files
@@ -109,7 +119,9 @@ Show the state of each tracked large file:
 ```
                             ok  models/bert.bin
         cached (not checked out)  models/gpt2.bin
-              pointer only (needs pull)  data/train.bin
+       pointer only (needs pull)  data/train.bin
+       missing from working tree  data/old.bin
+not a pointer in git (git add --renormalize)  legacy/raw.bin
 ```
 
 Use `--verify` to re-hash cached objects and detect corruption:
@@ -207,7 +219,10 @@ is DVC-compatible (`files/{hash_fn}/{prefix}/{rest}`).
 
 ### `.gitattributes`
 
-Standard git mechanism for declaring which files use the bigstore filter:
+Standard git mechanism for declaring which files use the bigstore filter.
+bigstore asks git which files have `filter=bigstore` (`git check-attr`), so
+nested `.gitattributes` files, `.git/info/attributes` and macros apply exactly
+as they do for the filter itself:
 
 ```gitattributes
 *.bin filter=bigstore
@@ -227,6 +242,11 @@ a1b2c3d4e5f6...  (64-character hex digest)
 
 Pointers are 3 lines, ~81 bytes. The clean filter creates them on `git add`;
 the smudge filter restores the real content on checkout (if cached locally).
+Only an exact pointer is treated as one: any other content — including text
+that happens to start with `bigstore` — is stored as a large file.
+
+The object cache lives in the repository's common git directory
+(`.git/bigstore/objects`), shared by all linked worktrees.
 
 ## Concurrency
 
@@ -444,6 +464,14 @@ that `.bigstore.toml` is committed.
 
 **"not found on remote"** — The object hasn't been pushed yet. Run
 `git bigstore push` from a machine that has the file cached.
+
+**"not in the local cache and not on the remote"** (push) — The pointer was
+committed but its content was never uploaded. Push from the clone that
+committed it.
+
+**"not a pointer in git (git add --renormalize)"** — The file was committed
+before its `filter=bigstore` rule existed, so git holds its raw content. Run
+`git add --renormalize <path>` and commit to move it into bigstore.
 
 **"pointer only (needs pull)"** — The file is tracked but not downloaded. Run
 `git bigstore pull`.
