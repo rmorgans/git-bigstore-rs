@@ -1162,7 +1162,7 @@ fn ref_creates_md5_pointer_from_dvc_file() {
     t.write_file(
         "model.bin.dvc",
         format!(
-            "outs:\n- md5: {md5_hash}\n  size: {}\n  path: model.bin\n",
+            "outs:\n- md5: {md5_hash}\n  size: {}\n  hash: md5\n  path: model.bin\n",
             content.len()
         )
         .as_bytes(),
@@ -1195,7 +1195,7 @@ fn ref_rejects_missing_dvc_cache() {
     let md5 = "ab".repeat(16);
     t.write_file(
         "model.bin.dvc",
-        format!("outs:\n- md5: {md5}\n  size: 1234\n  path: model.bin\n").as_bytes(),
+        format!("outs:\n- md5: {md5}\n  size: 1234\n  hash: md5\n  path: model.bin\n").as_bytes(),
     );
 
     let output = bigstore(&t.repo_dir, &["ref", "model.bin.dvc", "model.bin"]);
@@ -1230,7 +1230,7 @@ fn ref_imports_from_dvc_cache_with_verification() {
     t.write_file(
         "data.bin.dvc",
         format!(
-            "outs:\n- md5: {md5_hash}\n  size: {}\n  path: data.bin\n",
+            "outs:\n- md5: {md5_hash}\n  size: {}\n  hash: md5\n  path: data.bin\n",
             content.len()
         )
         .as_bytes(),
@@ -1310,6 +1310,23 @@ fn ref_rejects_invalid_dvc_file() {
 }
 
 #[test]
+fn ref_refuses_a_dvc2_pointer_and_says_why() {
+    // DVC 2 pointers have no `hash:` field: their md5 is md5-dos2unix and the
+    // object lives in DVC 2's cache layout, so reading it as DVC 3 would
+    // report the object missing (or fail verification for CRLF text).
+    let t = TestRepo::new();
+    let md5 = "ab".repeat(16);
+    t.write_file(
+        "old.dvc",
+        format!("outs:\n- md5: {md5}\n  size: 1\n  path: old.bin\n").as_bytes(),
+    );
+    let output = bigstore(&t.repo_dir, &["ref", "old.dvc", "old.bin"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("DVC 2"), "{stderr}");
+}
+
+#[test]
 fn pull_rejects_corrupted_dvc_cache() {
     let t = TestRepo::new();
 
@@ -1358,7 +1375,7 @@ fn ref_rejects_path_traversal() {
     let md5 = "ab".repeat(16);
     t.write_file(
         "model.dvc",
-        format!("outs:\n- md5: {md5}\n  size: 100\n  path: model.bin\n").as_bytes(),
+        format!("outs:\n- md5: {md5}\n  size: 100\n  hash: md5\n  path: model.bin\n").as_bytes(),
     );
 
     // dest with path traversal should be rejected
@@ -1384,7 +1401,7 @@ fn ref_rejects_multi_output_dvc_file() {
     t.write_file(
         "multi.dvc",
         format!(
-            "outs:\n- md5: {md5}\n  size: 100\n  path: a.bin\n- md5: {md5}\n  size: 200\n  path: b.bin\n"
+            "outs:\n- md5: {md5}\n  size: 100\n  hash: md5\n  path: a.bin\n- md5: {md5}\n  size: 200\n  hash: md5\n  path: b.bin\n"
         ).as_bytes(),
     );
 
@@ -1905,7 +1922,7 @@ fn dvc_ls_rejects_single_file_dvc() {
     t.write_file(
         "data.dvc",
         format!(
-            "outs:\n- md5: {md5_hash}\n  size: {}\n  path: data.bin\n",
+            "outs:\n- md5: {md5_hash}\n  size: {}\n  hash: md5\n  path: data.bin\n",
             content.len()
         )
         .as_bytes(),

@@ -161,6 +161,13 @@ impl RepoPath {
             "path must be relative to the repository root: {s:?}"
         );
         anyhow::ensure!(!s.contains('\0'), "path contains a NUL byte: {s:?}");
+        // On Windows `\` is a separator and `C:x` is drive-relative, so either
+        // could make `to_fs_path` land outside the root (`a\..\..\x`).
+        #[cfg(windows)]
+        anyhow::ensure!(
+            !s.contains(['\\', ':']),
+            "path contains '\\' or ':', which Windows would misread: {s:?}"
+        );
         let mut parts = Vec::new();
         for part in s.split('/') {
             match part {
@@ -202,6 +209,66 @@ impl RepoPath {
 impl fmt::Display for RepoPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Checks one path component is safe to create on Windows, macOS and Linux:
+/// printable ASCII only (which also rules out Unicode NFC/NFD twins), none of
+/// `\ / : * ? " < > |`, not a Windows device name (`CON`, `nul.txt`, `COM1`…),
+/// no trailing `.` or space, and not `.` or `..`.
+pub fn check_portable_component(c: &str) -> Result<()> {
+    anyhow::ensure!(
+        !c.is_empty() && c != "." && c != "..",
+        "invalid path component: {c:?}"
+    );
+    anyhow::ensure!(
+        c.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+        "{c:?}: only printable ASCII names are portable"
+    );
+    anyhow::ensure!(
+        !c.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']),
+        "{c:?}: contains a character Windows does not allow"
+    );
+    anyhow::ensure!(
+        !c.ends_with(['.', ' ']),
+        "{c:?}: Windows drops a trailing '.' or space"
+    );
+    let stem = c.split('.').next().unwrap_or(c).to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    anyhow::ensure!(!reserved, "{c:?}: reserved device name on Windows");
+    Ok(())
+}
+
+/// A [`RepoPath`] whose every component passes [`check_portable_component`],
+/// so it can be created on any OS bigstore runs on. Used for everything
+/// folder mode writes into a manifest or remote key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PortableRelPath(RepoPath);
+
+impl PortableRelPath {
+    pub fn new(s: &str) -> Result<Self> {
+        let path = RepoPath::new(s)?;
+        for c in path.as_str().split('/') {
+            check_portable_component(c).with_context(|| format!("path {s:?}"))?;
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn as_repo_path(&self) -> &RepoPath {
+        &self.0
+    }
+}
+
+impl fmt::Display for PortableRelPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.as_str())
     }
 }
 
@@ -425,6 +492,40 @@ mod tests {
     fn repo_path_rejects_non_utf8_git_bytes() {
         let err = RepoPath::from_git_bytes(b"caf\xe9.bin").unwrap_err();
         assert!(format!("{err:#}").contains("caf"), "{err:#}");
+    }
+
+    #[test]
+    fn portable_rel_path_accepts_the_annotation_layout() {
+        for ok in [
+            "annotations/reviewer=rick/host=xenoglossicist/site=s1/date=2026-09-01/src_01/labels.jsonl",
+            "views/v1/mask.json",
+            ".DS_Store",
+            "a b/c-d_e.parquet",
+        ] {
+            PortableRelPath::new(ok).unwrap();
+        }
+    }
+
+    #[test]
+    fn portable_rel_path_rejects_what_some_os_cannot_create() {
+        for bad in [
+            "café.txt",
+            "a\\b",
+            "c:d",
+            "q\"uote",
+            "tab\there",
+            "CON",
+            "sub/nul.txt",
+            "com1.log",
+            "trailing.",
+            "trailing ",
+            "a/../b",
+        ] {
+            assert!(PortableRelPath::new(bad).is_err(), "{bad:?} accepted");
+        }
+        // Not reserved: only the exact device stems are.
+        PortableRelPath::new("console.txt").unwrap();
+        PortableRelPath::new("COM.txt").unwrap();
     }
 
     // Layout tests

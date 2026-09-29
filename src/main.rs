@@ -11,7 +11,7 @@ use bigstore::config::BigstoreConfig;
 use bigstore::filter::{self, WorktreeFile};
 use bigstore::git::{self, IndexBlob};
 use bigstore::transfer::{self, Remote};
-use bigstore::types::{Hexdigest, RepoPath};
+use bigstore::types::{self, Hexdigest, RepoPath};
 use bigstore::{dvc, hash};
 
 #[derive(Parser)]
@@ -379,13 +379,14 @@ fn cmd_ref(source: &RepoPath, dest: &RepoPath) -> Result<()> {
     let git_dir = git::common_dir()?;
 
     let source_path = source.to_fs_path(&repo_root);
-    let dvc::DvcKind::File {
-        pointer,
+    let dvc::DvcPointer {
+        output: dvc::DvcOutput::File { md5, .. },
         path: dvc_out_path,
-    } = dvc::parse_dvc_file(&source_path)?
+    } = dvc::DvcPointer::load(&source_path)?
     else {
         anyhow::bail!("{source} is a .dir .dvc file — use `git bigstore import-dvc-dir` instead");
     };
+    let pointer = types::Pointer::new(md5);
     let dvc_cache_root = resolve_dvc_cache(&repo_root, &source_path)?;
 
     match cache::import_from_dvc_cache(&dvc_cache_root, &git_dir, pointer.hexdigest())? {
@@ -555,8 +556,8 @@ fn cmd_import_dvc_dir(
 fn resolve_dir_manifest(
     dvc_cache_root: &Path,
     source_path: &Path,
-) -> Result<(Hexdigest, Vec<dvc::DirEntry>)> {
-    let dvc::DvcKind::Dir { manifest } = dvc::parse_dvc_file(source_path)? else {
+) -> Result<(Hexdigest, Vec<dvc::ManifestEntry>)> {
+    let dvc::DvcOutput::Dir { manifest, .. } = dvc::DvcPointer::load(source_path)?.output else {
         anyhow::bail!(
             "{} is a single-file .dvc — use `git bigstore ref` instead",
             source_path.display()

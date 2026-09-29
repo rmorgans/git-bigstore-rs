@@ -1,0 +1,24 @@
+$ /tmp/FolderModePlan/venv/bin/dvc version
+[0]
+DVC version: 3.67.1 (pip)
+-------------------------
+Platform: Python 3.12.10 on macOS-26.6.2-arm64-arm-64bit
+Subprojects:
+	dvc_data = 3.18.3
+	dvc_objects = 5.2.0
+	dvc_render = 1.0.2
+	dvc_task = 0.40.2
+	scmrepo = 3.6.2
+Supports:
+	http (aiohttp = 3.14.3, aiohttp-retry = 2.9.1),
+	https (aiohttp = 3.14.3, aiohttp-retry = 2.9.1)
+Config:
+	Global: /tmp/FolderModePlan/gcfg
+	System: /tmp/FolderModePlan/scfg
+Cache types: reflink, hardlink, symlink
+Cache directory: apfs on /dev/disk3s1s1
+Caches: local
+Remotes: local
+Workspace directory: apfs on /dev/disk3s1s1
+Repo: dvc (no_scm)
+Repo.site_cache_dir: /tmp/FolderModePlan/site/repo/cbe3cca6b25ac63fd8c989b5b4194222

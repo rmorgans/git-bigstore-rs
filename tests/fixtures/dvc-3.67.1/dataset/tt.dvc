@@ -1,0 +1,6 @@
+outs:
+- md5: 3fba99371c772a1b91bcc82e63975e8a.dir
+  size: 52
+  nfiles: 11
+  hash: md5
+  path: tt
