@@ -36,6 +36,9 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
+      - name: Install rclone
+        run: sudo apt-get update && sudo apt-get install -y rclone
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -43,7 +46,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --all-targets -- --include-ignored
 
       - name: Supply-chain checks
         run: cargo deny check
