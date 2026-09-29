@@ -241,17 +241,16 @@ fn cmd_init(url: &str, endpoint: Option<&str>) -> Result<()> {
     cfg.save(&repo_root.join(".bigstore.toml"))?;
 
     // Read existing filter config as a unit — detects partial/broken state
-    let existing = git::FilterConfig::load()?;
-    if existing.is_none() {
-        git::FilterConfig::default_commands().save()?;
-    }
+    let filters = git::ensure_filter_config()?;
 
     cache::ensure_cache_dir(&git_dir)?;
 
     eprintln!("Initialized bigstore with backend: {}", cfg.backend_type());
     eprintln!("Config written to .bigstore.toml");
-    if existing.is_some() {
-        eprintln!("Filter config preserved (already configured)");
+    match filters {
+        git::Ensured::Configured => {}
+        git::Ensured::AddedProcess => eprintln!("Enabled the bigstore filter process"),
+        git::Ensured::Unchanged => eprintln!("Filter config preserved (already configured)"),
     }
     eprintln!();
     eprintln!("Add patterns to .gitattributes:");
@@ -291,10 +290,14 @@ fn cmd_pull(patterns: &[String], jobs: Option<NonZeroUsize>) -> Result<()> {
     let git_dir = git::common_dir()?;
     let cfg = BigstoreConfig::find_and_load(&repo_root)?;
 
-    // Checkout goes through the smudge filter, so a fresh clone needs it.
-    if git::FilterConfig::load()?.is_none() {
-        git::FilterConfig::default_commands().save()?;
-        eprintln!("Configured bigstore git filters for this clone");
+    // Checkout goes through the filter, so a fresh clone needs it; legacy
+    // config gains the (much faster) filter process.
+    match git::ensure_filter_config()? {
+        git::Ensured::Configured => eprintln!("Configured bigstore git filters for this clone"),
+        git::Ensured::AddedProcess => {
+            eprintln!("Enabled the bigstore filter process for this clone")
+        }
+        git::Ensured::Unchanged => {}
     }
 
     let entries = git::bigstore_entries(&repo_root, patterns)?;

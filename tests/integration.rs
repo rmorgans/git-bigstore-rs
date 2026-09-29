@@ -60,23 +60,25 @@ fn bigstore_stdin(dir: &Path, args: &[&str], input: &[u8]) -> std::process::Outp
 /// Point the bigstore filter at the test binary, which is not on PATH (as
 /// `init` writes it). Sets every key, so it also configures a fresh clone.
 fn use_test_filters(dir: &Path) {
-    let bin = env!("CARGO_BIN_EXE_git-bigstore");
-    git(
-        dir,
-        &[
-            "config",
-            "filter.bigstore.clean",
-            &format!("{bin} filter-clean %f"),
-        ],
-    );
-    git(
-        dir,
-        &[
-            "config",
-            "filter.bigstore.smudge",
-            &format!("{bin} filter-smudge"),
-        ],
-    );
+    set_filters(dir, env!("CARGO_BIN_EXE_git-bigstore"));
+}
+
+/// Every bigstore filter key, run through `bin`.
+fn set_filters(dir: &Path, bin: &str) {
+    for (key, command) in [
+        ("clean", "filter-clean %f"),
+        ("smudge", "filter-smudge"),
+        ("process", "filter-process"),
+    ] {
+        git(
+            dir,
+            &[
+                "config",
+                &format!("filter.bigstore.{key}"),
+                &format!("{bin} {command}"),
+            ],
+        );
+    }
     git(dir, &["config", "filter.bigstore.required", "true"]);
 }
 
@@ -181,16 +183,36 @@ fn init_creates_config_and_sets_git_filters() {
     assert!(t.file_exists(".bigstore.toml"));
 
     // Git filters should be configured (we override to full path in TestRepo::new,
-    // so just check they contain "filter-clean" / "filter-smudge")
+    // so just check the subcommands)
     let clean = git(&t.repo_dir, &["config", "filter.bigstore.clean"]);
     assert!(
-        clean.contains("filter-clean"),
+        clean.ends_with("filter-clean %f"),
         "clean filter not set: {clean}"
     );
     let smudge = git(&t.repo_dir, &["config", "filter.bigstore.smudge"]);
     assert!(
         smudge.contains("filter-smudge"),
         "smudge filter not set: {smudge}"
+    );
+    let process = git(&t.repo_dir, &["config", "filter.bigstore.process"]);
+    assert!(
+        process.ends_with("filter-process"),
+        "filter process not set: {process}"
+    );
+
+    // What init itself writes, before the test harness overrides it.
+    let (_tmp, repo_dir, storage_dir) = bare_test_repo();
+    let storage_url = format!("local://{}", storage_dir.display());
+    bigstore_ok(&repo_dir, &["init", &storage_url]);
+    assert_eq!(
+        git(
+            &repo_dir,
+            &["config", "--get-regexp", "^filter\\.bigstore\\."]
+        ),
+        "filter.bigstore.clean git-bigstore filter-clean %f\n\
+         filter.bigstore.smudge git-bigstore filter-smudge\n\
+         filter.bigstore.required true\n\
+         filter.bigstore.process git-bigstore filter-process"
     );
 }
 
@@ -227,6 +249,59 @@ fn init_preserves_existing_filter_config() {
     assert_eq!(
         smudge_after, custom_smudge,
         "smudge filter should be preserved"
+    );
+    assert_eq!(
+        git(&t.repo_dir, &["config", "filter.bigstore.process"]),
+        format!("{} filter-process", env!("CARGO_BIN_EXE_git-bigstore"))
+    );
+}
+
+/// `init` in a repo holding the filter config `keys` fails with `expected`
+/// and changes nothing.
+fn assert_init_rejects(keys: &[(&str, &str)], expected: &str) {
+    let (_tmp, repo_dir, storage_dir) = bare_test_repo();
+    for (key, value) in keys {
+        git(
+            &repo_dir,
+            &["config", &format!("filter.bigstore.{key}"), value],
+        );
+    }
+    let before = git(&repo_dir, &["config", "--get-regexp", "^filter\\."]);
+    let storage_url = format!("local://{}", storage_dir.display());
+    let output = bigstore(&repo_dir, &["init", &storage_url]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "should fail for {keys:?}");
+    assert!(stderr.contains(expected), "{keys:?}: {stderr}");
+    assert_eq!(
+        git(&repo_dir, &["config", "--get-regexp", "^filter\\."]),
+        before
+    );
+}
+
+#[test]
+fn init_rejects_a_filter_process_with_another_binary_or_subcommand() {
+    for process in [
+        "/b/git-bigstore filter-process",
+        "/a/git-bigstore filter-smudge",
+        "",
+    ] {
+        assert_init_rejects(
+            &[
+                ("clean", "/a/git-bigstore filter-clean %f"),
+                ("smudge", "/a/git-bigstore filter-smudge"),
+                ("required", "true"),
+                ("process", process),
+            ],
+            "Fix: git config filter.bigstore.process \"/a/git-bigstore filter-process\"",
+        );
+    }
+}
+
+#[test]
+fn init_rejects_a_filter_process_without_the_one_shot_filters() {
+    assert_init_rejects(
+        &[("process", "git-bigstore filter-process")],
+        "filter.bigstore.process is set but the one-shot filters are missing",
     );
 }
 
@@ -975,60 +1050,62 @@ fn killed_pull_is_recovered_by_the_next_pull() {
     commit_mixed_pointers(&t);
     let clone = t.clone_repo("clone");
 
-    // A filter binary that lets the first smudge through, then SIGKILLs pull
-    // and git in the middle of checkout.
+    // A filter process that answers the handshake and the first file
+    // (a_md5.bin), then, once git has written that file and asked for the
+    // second, SIGKILLs pull and stops git mid-checkout. The second reply
+    // never reaches git.
     let dir = clone.parent().unwrap();
     let killer = dir.join("killer.sh");
     std::fs::write(
         &killer,
         r#"#!/bin/sh
-[ "$1" = filter-smudge ] || exec "$BIGSTORE_BIN" "$@"
-n=$(cat "$KILL_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$KILL_COUNT"
-[ "$n" -lt 2 ] && exec "$BIGSTORE_BIN" filter-smudge
-p=$PPID
-while [ "${p:-1}" -gt 1 ]; do
-  case "$(ps -o command= -p "$p")" in
-    *"git-bigstore pull"*) kill -KILL "$p";;
-    *checkout-index*) kill -TERM "$p";;
-  esac
-  p=$(ps -o ppid= -p "$p" | tr -d ' ')
-done
+[ "$1" = filter-process ] || exec "$BIGSTORE_BIN" "$@"
+parent=$PPID
+"$BIGSTORE_BIN" filter-process | {
+  dd bs=1 count="$FORWARD_BYTES" 2>/dev/null
+  dd bs=1 count=1 of=/dev/null 2>/dev/null
+  p=$parent
+  while [ "${p:-1}" -gt 1 ]; do
+    case "$(ps -o command= -p "$p")" in
+      *"git-bigstore pull"*) kill -KILL "$p";;
+      *checkout-index*) kill -TERM "$p";;
+    esac
+    p=$(ps -o ppid= -p "$p" | tr -d ' ')
+  done
+}
 exit 1
 "#,
     )
     .unwrap();
     std::fs::set_permissions(&killer, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let killer = killer.to_str().unwrap();
-    for (key, cmd) in [("clean", "filter-clean %f"), ("smudge", "filter-smudge")] {
-        let value = format!("{killer} {cmd}");
-        git(
-            &clone,
-            &["config", &format!("filter.bigstore.{key}"), &value],
-        );
-    }
+    set_filters(&clone, killer.to_str().unwrap());
+    // Handshake reply (welcome, version, clean and smudge capabilities),
+    // then a_md5.bin's reply: status, flush, one content packet, flush,
+    // empty trailer.
+    let handshake = 22 + 14 + 4 + 21 + 22 + 4;
+    let first_reply = 19 + 4 + (4 + b"md5-addressed content\n".len()) + 4 + 4;
 
     let bin = env!("CARGO_BIN_EXE_git-bigstore");
     let killed = Command::new(bin)
         .arg("pull")
         .current_dir(&clone)
-        .env("KILL_COUNT", dir.join("count"))
+        .env("FORWARD_BYTES", (handshake + first_reply).to_string())
         .env("BIGSTORE_BIN", bin)
         .output()
         .unwrap();
     assert!(!killed.status.success(), "pull should have been killed");
+    assert_eq!(
+        std::fs::read(clone.join("a_md5.bin")).unwrap(),
+        b"md5-addressed content\n",
+        "sanity: git wrote the first file before the kill"
+    );
+
+    use_test_filters(&clone);
     assert_ne!(
         git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
         "",
         "sanity: the kill left the tree damaged"
     );
-
-    for (key, cmd) in [("clean", "filter-clean %f"), ("smudge", "filter-smudge")] {
-        let value = format!("{bin} {cmd}");
-        git(
-            &clone,
-            &["config", &format!("filter.bigstore.{key}"), &value],
-        );
-    }
     let out = bigstore(&clone, &["pull"]);
     assert!(
         out.status.success(),
