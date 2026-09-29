@@ -618,3 +618,384 @@ fn an_ambiguous_version_id_is_refused_and_lists_the_candidates() {
     assert!(!msg.contains("ambiguous"), "{msg}");
     assert!(!e.data.join("f").exists());
 }
+
+fn history(key: &str, at: Selector) -> PointerSource {
+    PointerSource::History {
+        key: HistoryKey::new(key).unwrap(),
+        at,
+    }
+}
+
+#[test]
+#[ignore = "needs the rclone binary; CI installs it and runs ignored tests"]
+fn round_trips_through_an_rclone_remote() {
+    // `:local:` is an on-the-fly rclone remote: no config file, no env.
+    let e = env();
+    let w = writer_dir(&e);
+    let url = format!("rclone://:local:{}", e.store.display());
+    let remote = Remote::open(&RemoteConfig {
+        url,
+        endpoint: None,
+        region: None,
+        credentials: Credentials::FromEnv,
+    })
+    .unwrap();
+    let report = folder::push(&remote, &w, &opts(KEY)).unwrap();
+    assert_eq!(report.uploaded, 4);
+    let DvcOutput::Dir { manifest, .. } = &report.pointer.output else {
+        panic!("expected a directory pointer")
+    };
+    let manifest_key = format!("files/md5/{}/{}.dir", manifest.prefix(), manifest.rest());
+    assert!(remote_keys(&e.store).contains(&manifest_key));
+
+    let restore = e.data.parent().unwrap().join("restore");
+    let pulled = folder::pull(
+        &remote,
+        &history(KEY, Selector::Latest),
+        &pull_opts(Some(restore.clone())),
+    )
+    .unwrap();
+    assert_eq!(pulled.written, 4);
+    assert_eq!(tree(&restore), tree(&w));
+}
+
+#[test]
+fn at_or_before_restores_the_version_in_force_at_that_time() {
+    let e = env();
+    let w = writer_dir(&e);
+    let labels = w.join("site=s1/date=2026-09-02/src_02/labels.jsonl");
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    std::fs::write(&labels, b"{\"t\":4}\n").unwrap();
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let log = folder::log(&e.remote, &HistoryKey::new(KEY).unwrap()).unwrap();
+    let [v1, v2] = &log[..] else {
+        panic!("{log:?}")
+    };
+    let rfc =
+        |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let restore = |at: String, into: &str| {
+        let into = e.data.parent().unwrap().join(into);
+        folder::pull(
+            &e.remote,
+            &history(KEY, Selector::AtOrBefore(at)),
+            &pull_opts(Some(into.clone())),
+        )
+        .map(|r| (r, into))
+    };
+
+    let err = restore(rfc(v1.time - chrono::Duration::seconds(1)), "early").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no matching version"),
+        "{err:#}"
+    );
+
+    // Just before the second push, the first version was current.
+    let (r, into) = restore(rfc(v2.time - chrono::Duration::nanoseconds(1)), "mid").unwrap();
+    assert_eq!(r.pointer.output, v1.pointer.output);
+    let rel = labels.strip_prefix(&w).unwrap();
+    assert_eq!(std::fs::read(into.join(rel)).unwrap(), b"{\"t\":3}\n");
+
+    let (r, _) = restore(rfc(v2.time), "at").unwrap();
+    assert_eq!(r.pointer.output, v2.pointer.output);
+
+    let err = restore("yesterday".into(), "bad").unwrap_err();
+    assert!(format!("{err:#}").contains("RFC 3339"), "{err:#}");
+}
+
+#[test]
+fn history_holds_only_its_own_outputs_records() {
+    // Key `k/sub` is nested under key `k`; neither sees the other's
+    // versions, and stray objects under the prefix are not versions.
+    let e = env();
+    let md5 = |c: char| c.to_string().repeat(32);
+    write_record(&e, "k", "20260901T000000.000000000Z", &md5('a'));
+    write_record(&e, "k/sub", "20260902T000000.000000000Z", &md5('b'));
+    write(&e.store.join("bigstore-history/k/README.txt"), b"notes");
+    write(&e.store.join("bigstore-history/k/not-a-time.dvc"), b"x");
+
+    let ids = |key: &str| -> Vec<String> {
+        folder::log(&e.remote, &HistoryKey::new(key).unwrap())
+            .unwrap()
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    };
+    assert_eq!(ids("k"), [md5('a')]);
+    assert_eq!(ids("k/sub"), [md5('b')]);
+}
+
+#[cfg(unix)]
+#[test]
+fn pull_never_writes_through_a_symlinked_directory_or_over_a_non_file() {
+    let e = env();
+    let w = writer_dir(&e);
+    let report = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let pull = |into: &Path| {
+        folder::pull(
+            &e.remote,
+            &PointerSource::File(report.pointer_path.clone()),
+            &PullOptions {
+                overwrite: Overwrite::Force,
+                ..pull_opts(Some(into.to_path_buf()))
+            },
+        )
+    };
+    let root = e.data.parent().unwrap();
+
+    // `site=s1` is a symlink to a directory outside the restore target.
+    let outside = root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let into = root.join("r1");
+    std::fs::create_dir(&into).unwrap();
+    std::os::unix::fs::symlink(&outside, into.join("site=s1")).unwrap();
+    let err = pull(&into).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("refusing to write through"),
+        "{err:#}"
+    );
+    assert!(tree(&outside).is_empty(), "nothing written outside");
+    assert!(tree(&into).is_empty(), "nothing written at all");
+
+    // A directory, or a symlink, where a file belongs is never replaced.
+    let labels = "site=s1/date=2026-09-02/src_02/labels.jsonl";
+    for (name, make) in [
+        (
+            "r2",
+            (|p: &Path| std::fs::create_dir_all(p).unwrap()) as fn(&Path),
+        ),
+        ("r3", |p: &Path| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("/dev/null", p).unwrap();
+        }),
+    ] {
+        let into = root.join(name);
+        make(&into.join(labels));
+        let err = pull(&into).unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        assert!(tree(&into).is_empty(), "{name}: nothing written");
+    }
+}
+
+#[test]
+fn names_differing_only_by_case_are_refused_before_writing() {
+    let e = env();
+    let pointer = dvc_pushed_dir(&e, &[("Labels.jsonl", b"A"), ("labels.jsonl", b"a")]);
+    let err = folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("differ only by case"), "{msg}");
+    assert!(
+        msg.contains("Labels.jsonl") && msg.contains("\"labels.jsonl\""),
+        "{msg}"
+    );
+    assert!(!e.data.join("out").exists());
+}
+
+#[test]
+fn a_single_jsonl_file_without_a_final_newline_warns() {
+    let e = env();
+    let file = e.data.join("labels.jsonl");
+    write(&file, b"{\"t\":1}\n{\"t\":");
+    let report = folder::push(&e.remote, &file, &opts("ds/labels")).unwrap();
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("labels.jsonl"));
+
+    write(&file, b"{\"t\":1}\n");
+    let report = folder::push(&e.remote, &file, &opts("ds/labels")).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
+#[test]
+fn a_refused_pull_lists_every_differing_file_and_writes_nothing() {
+    let e = env();
+    let w = writer_dir(&e);
+    let report = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let a = w.join("site=s1/date=2026-09-01/src_01/labels.jsonl");
+    let b = w.join("site=s1/date=2026-09-02/src_02/labels.jsonl");
+    std::fs::write(&a, b"edit a\n").unwrap();
+    std::fs::write(&b, b"edit b\n").unwrap();
+    std::fs::remove_file(w.join("site=s1/date=2026-09-01/src_01/regions.jsonl")).unwrap();
+
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path),
+        &pull_opts(None),
+    )
+    .unwrap_err();
+    let conflict = err.downcast_ref::<PullConflict>().expect("typed conflict");
+    assert_eq!(conflict.paths, [a.clone(), b.clone()]);
+    let shown = err.to_string();
+    assert!(shown.starts_with("2 local file(s) differ"), "{shown}");
+    assert!(shown.contains(&a.display().to_string()) && shown.contains(&b.display().to_string()));
+    // Refusal is all or nothing: the missing file was not restored either.
+    assert!(!w
+        .join("site=s1/date=2026-09-01/src_01/regions.jsonl")
+        .exists());
+    assert_eq!(std::fs::read(&a).unwrap(), b"edit a\n");
+}
+
+#[test]
+fn remotes_other_than_s3_local_and_rclone_are_refused() {
+    let err = Remote::open(&RemoteConfig {
+        url: "gs://bucket/dvc".into(),
+        endpoint: None,
+        region: None,
+        credentials: Credentials::FromEnv,
+    })
+    .err()
+    .expect("must refuse");
+    assert!(format!("{err:#}").contains("gs://bucket/dvc"), "{err:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn push_refuses_an_output_that_is_a_symlink() {
+    let e = env();
+    let w = writer_dir(&e);
+    let link = e.data.join("link");
+    std::os::unix::fs::symlink(&w, &link).unwrap();
+    let err = folder::push(&e.remote, &link, &opts(KEY)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("neither a regular file nor a directory"),
+        "{err:#}"
+    );
+    assert!(!e.data.join("link.dvc").exists());
+    assert!(remote_keys(&e.store).is_empty());
+}
+
+#[test]
+fn push_refuses_to_replace_a_pointer_it_cannot_read_or_that_names_another_output() {
+    let e = env();
+    let file = e.data.join("store.toml");
+    write(&file, b"x = 1\n");
+    let pointer = e.data.join("store.toml.dvc");
+    let foreign = "outs:\n- md5: 3253b41059cac6e987c5a5e9233ea5d0\n  size: 6\n  hash: md5\n  path: other.toml\n";
+    write(&pointer, foreign.as_bytes());
+    let err = folder::push(&e.remote, &file, &opts("ds/store.toml")).unwrap_err();
+    assert!(format!("{err:#}").contains("\"other.toml\""), "{err:#}");
+    assert_eq!(std::fs::read_to_string(&pointer).unwrap(), foreign);
+
+    // A directory where the pointer goes cannot be read as one.
+    std::fs::remove_file(&pointer).unwrap();
+    std::fs::create_dir(&pointer).unwrap();
+    let err = folder::push(&e.remote, &file, &opts("ds/store.toml")).unwrap_err();
+    assert!(format!("{err:#}").contains("failed to read"), "{err:#}");
+    assert!(remote_keys(&e.store).is_empty(), "nothing uploaded");
+}
+
+/// A target pull cannot stat is an error, never taken for "missing".
+#[cfg(unix)]
+#[test]
+fn pull_stops_at_a_directory_it_cannot_search() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env();
+    let w = writer_dir(&e);
+    let report = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let into = e.data.parent().unwrap().join("r");
+    let locked = into.join("site=s1");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path),
+        &pull_opts(Some(into.clone())),
+    )
+    .unwrap_err();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(format!("{err:#}").contains("ermission denied"), "{err:#}");
+    assert!(tree(&into).is_empty(), "nothing written");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_fails_the_push_before_anything_is_published() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env();
+    let w = writer_dir(&e);
+    let secret = w.join("secret.jsonl");
+    write(&secret, b"{}\n");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let err = folder::push(&e.remote, &w, &opts(KEY)).unwrap_err();
+    assert!(format!("{err:#}").contains("secret.jsonl"), "{err:#}");
+    assert!(!w
+        .parent()
+        .unwrap()
+        .join("host=ricks-macbook-pro.dvc")
+        .exists());
+    assert!(remote_keys(&e.store).is_empty());
+}
+
+#[test]
+fn a_corrupt_history_record_fails_log_and_names_the_record() {
+    let e = env();
+    let dir = e.store.join("bigstore-history/k");
+    let not_utf8 = "20260901T000000.000000000Z-a.dvc";
+    write(&dir.join(not_utf8), b"\xff\xfe");
+    let err = folder::log(&e.remote, &HistoryKey::new("k").unwrap()).unwrap_err();
+    assert!(format!("{err:#}").contains(not_utf8), "{err:#}");
+
+    std::fs::remove_file(dir.join(not_utf8)).unwrap();
+    let not_a_pointer = "20260901T000000.000000000Z-b.dvc";
+    write(&dir.join(not_a_pointer), b"outs: []\n");
+    let err = folder::log(&e.remote, &HistoryKey::new("k").unwrap()).unwrap_err();
+    assert!(format!("{err:#}").contains(not_a_pointer), "{err:#}");
+}
+
+#[test]
+fn records_pushed_in_the_same_nanosecond_have_a_stable_latest() {
+    let e = env();
+    let time = "20260901T000000.000000000Z";
+    let (a, b) = ("a".repeat(32), "b".repeat(32));
+    write_record(&e, "k", time, &b);
+    write_record(&e, "k", time, &a);
+    let log = folder::log(&e.remote, &HistoryKey::new("k").unwrap()).unwrap();
+    let ids: Vec<String> = log.iter().map(|r| r.id().to_string()).collect();
+    assert_eq!(ids, [a, b], "ties are ordered by record key");
+}
+
+#[test]
+fn push_needs_an_existing_output_with_a_name() {
+    let e = env();
+    let err = folder::push(&e.remote, &e.data.join("missing"), &opts(KEY)).unwrap_err();
+    assert!(format!("{err:#}").contains("failed to stat"), "{err:#}");
+    let err = folder::push(&e.remote, &e.data.join(".."), &opts(KEY)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no usable file name"),
+        "{err:#}"
+    );
+    assert!(remote_keys(&e.store).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_remote_fails_the_upload_and_publishes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env();
+    let w = writer_dir(&e);
+    std::fs::set_permissions(&e.store, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let err = folder::push(&e.remote, &w, &opts(KEY)).unwrap_err();
+    std::fs::set_permissions(&e.store, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(format!("{err:#}").contains("upload of"), "{err:#}");
+    assert!(!w
+        .parent()
+        .unwrap()
+        .join("host=ricks-macbook-pro.dvc")
+        .exists());
+    assert!(remote_keys(&e.store).is_empty());
+}
+
+#[test]
+fn pull_of_a_version_whose_manifest_is_missing_names_it() {
+    let e = env();
+    let pointer = dvc_pushed_dir(&e, &[("a.txt", b"a")]);
+    let manifest = remote_keys(&e.store)
+        .into_iter()
+        .find(|k| k.ends_with(".dir"))
+        .unwrap();
+    std::fs::remove_file(e.store.join(&manifest)).unwrap();
+    let err = folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("is not on the remote"),
+        "{err:#}"
+    );
+    assert!(!e.data.join("out").exists());
+}
