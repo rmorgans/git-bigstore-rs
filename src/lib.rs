@@ -4,6 +4,7 @@ pub mod catfile;
 pub mod config;
 pub mod dvc;
 pub mod filter;
+pub mod filter_process;
 pub mod folder;
 pub mod git;
 pub mod hash;

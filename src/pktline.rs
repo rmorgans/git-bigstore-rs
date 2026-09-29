@@ -256,13 +256,15 @@ pub struct ContentWriter<'w, W: Write> {
     w: &'w mut PktWriter<W>,
 }
 
-impl<W: Write> ContentWriter<'_, W> {
-    /// Emit the remaining bytes, then a flush.
-    pub fn finish(self) -> io::Result<()> {
+impl<'w, W: Write> ContentWriter<'w, W> {
+    /// Emit the remaining bytes, then a flush. Returns the writer for what
+    /// follows the content.
+    pub fn finish(self) -> io::Result<&'w mut PktWriter<W>> {
         if !self.w.data.is_empty() {
             self.w.emit_data()?;
         }
-        self.w.flush_pkt()
+        self.w.flush_pkt()?;
+        Ok(self.w)
     }
 }
 

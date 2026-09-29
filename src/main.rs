@@ -126,6 +126,10 @@ enum Commands {
     #[command(name = "filter-smudge", hide = true)]
     FilterSmudge,
 
+    /// Internal: git's long-running filter process (pkt-line on stdin/stdout)
+    #[command(name = "filter-process", hide = true)]
+    FilterProcess,
+
     /// Internal: Git LFS custom transfer adapter (stdin/stdout JSON protocol)
     #[command(name = "lfs-adapter", hide = true)]
     LfsAdapter,
@@ -214,6 +218,7 @@ fn main() -> Result<()> {
         Commands::Folder(cmd) => cmd_folder(cmd),
         Commands::FilterClean { path } => filter::clean(path.as_deref()),
         Commands::FilterSmudge => filter::smudge(),
+        Commands::FilterProcess => bigstore::filter_process::run(),
         Commands::LfsAdapter => bigstore::lfs_adapter::run(),
     }
 }
