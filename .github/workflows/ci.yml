@@ -39,11 +39,22 @@ jobs:
       - name: Install rclone
         run: sudo apt-get update && sudo apt-get install -y rclone
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install pinned DVC
+        run: |
+          uv tool install dvc==3.67.1
+          echo "BIGSTORE_TEST_DVC=$(command -v dvc)" >> "$GITHUB_ENV"
+
       - name: Check formatting
         run: cargo fmt --check
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Library builds without the CLI
+        run: cargo build --lib --no-default-features
 
       - name: Test
         run: cargo test --all-targets -- --include-ignored
@@ -53,3 +64,41 @@ jobs:
 
       - name: Coverage
         run: cargo llvm-cov --all-targets --fail-under-lines 80 --summary-only
+
+  windows:
+    name: Windows (folder mode)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install pinned DVC
+        shell: bash
+        run: |
+          uv tool install dvc==3.67.1
+          echo "BIGSTORE_TEST_DVC=$(command -v dvc)" >> "$GITHUB_ENV"
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Folder-mode tests
+        run: |
+          cargo test --lib -- folder dvc types
+          cargo test --test folder
+          cargo test --test dvc_compat -- --ignored
+
+      - name: Upload git-bigstore.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-bigstore-windows-x86_64
+          path: target/release/git-bigstore.exe

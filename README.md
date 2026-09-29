@@ -360,6 +360,81 @@ The default storage layout (`files/{hash_fn}/{prefix}/{rest}`) is
 DVC-compatible. Objects uploaded by bigstore can coexist with DVC objects in the
 same bucket.
 
+## Folder mode: DVC-compatible backup without git
+
+`git bigstore folder` (and the `bigstore::folder` library) backs up plain
+folders, with no git repository involved, in DVC 3's exact format. Real DVC can
+`dvc pull`/`dvc status` what it writes, and it can pull what `dvc push` wrote.
+
+```bash
+export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
+export AWS_ENDPOINT_URL=https://s3.ap-southeast-2.wasabisys.com AWS_REGION=ap-southeast-2
+R=s3://my-bucket/dvc
+
+# Back up a directory or a single file; writes <name>.dvc beside it.
+git bigstore folder push ds/annotations/reviewer=rick/host=mac \
+    --history ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
+git bigstore folder push ds/store.toml --history ST032/Beatons/store.toml --remote $R
+
+# Every version ever pushed, oldest first.
+git bigstore folder log ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
+
+# Restore: from a .dvc file, or any version from history.
+git bigstore folder pull ds/store.toml.dvc --remote $R
+git bigstore folder pull --history ST032/Beatons/annotations/reviewer=rick/host=mac \
+    --at 9f9acd0a --into /tmp/v1 --remote $R
+```
+
+What it guarantees:
+
+- **Byte-exact DVC 3.** It writes `.dir` manifests and `.dvc` pointers exactly
+  as DVC 3.67.1 does, including `hash: md5`. Objects go to `files/md5/xx/rest`,
+  and a manifest is uploaded only after every object it lists. CI checks this
+  against the real DVC, in both directions, on Linux and Windows.
+- **Safe with files being appended to.** Each file is copied to a private
+  snapshot while being hashed, so an uploaded object always matches its key.
+  Files that change or vanish mid-push are retried; after 3 tries push fails.
+  A `.jsonl` without a final newline is a warning.
+- **History without git.** Every push that changes an output appends its
+  pointer to `bigstore-history/<key>/` on the remote. A push that changes
+  nothing adds nothing. Versions are ordered by push time; each record is a
+  valid `.dvc` file.
+- **Pull never destroys local work.** It refuses to replace a file that
+  differs unless forced, never deletes files missing from the version, never
+  writes through a symlink, and writes via temp file plus rename (never a
+  link).
+- **Refuses ambiguity instead of guessing.** It refuses directory and broken
+  symlinks, nested `.git`/`.dvc`, `*.dvc` inside an output, and names that
+  aren't portable (non-ASCII, or not allowed on Windows). Empty directories
+  are reported; DVC cannot record them.
+- **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
+  defaults to AWS and never falls back to instance-metadata credentials.
+
+Do not run `dvc gc --cloud` against this remote: DVC only knows the latest
+`.dvc` files, and would delete the objects of older versions.
+
+As a library (`default-features = false` drops the CLI's dependencies):
+
+```rust
+use bigstore::folder::{self, Credentials, HistoryKey, PushOptions, Remote, RemoteConfig};
+
+let remote = Remote::open(&RemoteConfig {
+    url: "s3://my-bucket/dvc".into(),
+    endpoint: Some("https://s3.ap-southeast-2.wasabisys.com".into()),
+    region: Some("ap-southeast-2".into()),
+    credentials: Credentials::Static { access_key_id, secret_access_key },
+})?;
+let report = folder::push(&remote, dir, &PushOptions {
+    history: HistoryKey::new("ST032/Beatons/annotations/reviewer=rick/host=mac")?,
+    jobs: 8,
+})?;
+```
+
+The functions block and run their own tokio runtime. Calling them from inside
+a runtime returns an error; use `spawn_blocking`. A pull refused because of
+differing local files returns a typed `folder::PullConflict` in the error
+chain.
+
 ## Comparison: bigstore vs Git LFS vs DVC
 
 All three solve "large files in git." They differ in where control sits.
