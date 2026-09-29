@@ -191,11 +191,16 @@ mod tests {
             std::thread::spawn(move || {
                 let mut i = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let mut f = std::fs::OpenOptions::new().append(true).open(&src).unwrap();
+                    // Like Track Inspector: open for write, cut a torn tail
+                    // or seek to the end and append. (Windows refuses
+                    // set_len on an append-only handle.)
+                    let mut f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
                     if i % 7 == 6 {
                         let len = f.metadata().unwrap().len();
                         f.set_len(len.saturating_sub(3)).unwrap();
                     } else {
+                        use std::io::Seek;
+                        f.seek(std::io::SeekFrom::End(0)).unwrap();
                         writeln!(f, "{{\"row\":{i}}}").unwrap();
                     }
                     i += 1;

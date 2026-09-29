@@ -86,7 +86,8 @@ jobs:
         shell: bash
         run: |
           uv tool install dvc==3.67.1
-          echo "BIGSTORE_TEST_DVC=$(command -v dvc)" >> "$GITHUB_ENV"
+          # A native path: the tests spawn it without a POSIX shell.
+          echo "BIGSTORE_TEST_DVC=$(cygpath -w "$(command -v dvc.exe || command -v dvc)")" >> "$GITHUB_ENV"
 
       - name: Build release
         run: cargo build --release --locked
