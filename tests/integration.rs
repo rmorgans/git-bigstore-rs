@@ -2363,3 +2363,91 @@ fn lfs_adapter_rejects_upload_oid_mismatch() {
         "a mismatched upload must not poison storage"
     );
 }
+
+/// Parse the adapter's `complete` event for `oid` from its stdout.
+fn lfs_complete_for(stdout: &str, oid: &str) -> serde_json::Value {
+    stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["event"] == "complete" && v["oid"] == oid)
+        .unwrap_or_else(|| panic!("no complete event for {oid}: {stdout}"))
+}
+
+#[test]
+fn lfs_adapter_invalid_oid_fails_only_that_object() {
+    let t = TestRepo::new();
+    let content = b"valid object after an invalid oid\n";
+    let oid = push_object_for_lfs(&t, content);
+
+    let session = format!(
+        "{{\"event\":\"init\",\"operation\":\"download\",\"remote\":\"origin\",\"concurrent\":true,\"concurrenttransfers\":1}}\n\
+         {{\"event\":\"download\",\"oid\":\"../not-a-sha256\",\"size\":3}}\n\
+         {{\"event\":\"download\",\"oid\":\"{oid}\",\"size\":{}}}\n\
+         {{\"event\":\"terminate\"}}\n",
+        content.len()
+    );
+    let out = bigstore_stdin(&t.repo_dir, &["lfs-adapter"], session.as_bytes());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "adapter must survive a bad oid: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bad = lfs_complete_for(&stdout, "../not-a-sha256");
+    assert!(
+        bad["error"]["message"].is_string(),
+        "invalid oid must error: {bad}"
+    );
+    assert!(
+        bad["path"].is_null(),
+        "invalid oid must not report a path: {bad}"
+    );
+
+    let good = lfs_complete_for(&stdout, &oid);
+    assert!(
+        good["error"].is_null(),
+        "valid oid must still download: {good}"
+    );
+    assert!(
+        good["path"].is_string(),
+        "valid oid must report a path: {good}"
+    );
+}
+
+#[test]
+fn lfs_adapter_download_before_init_is_an_object_error() {
+    let t = TestRepo::new();
+    let content = b"object requested before init\n";
+    let oid = push_object_for_lfs(&t, content);
+
+    let session = format!(
+        "{{\"event\":\"download\",\"oid\":\"{oid}\",\"size\":{size}}}\n\
+         {{\"event\":\"init\",\"operation\":\"download\",\"remote\":\"origin\",\"concurrent\":true,\"concurrenttransfers\":1}}\n\
+         {{\"event\":\"download\",\"oid\":\"{oid}\",\"size\":{size}}}\n\
+         {{\"event\":\"terminate\"}}\n",
+        size = content.len()
+    );
+    let out = bigstore_stdin(&t.repo_dir, &["lfs-adapter"], session.as_bytes());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "adapter must not crash on a download before init: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let completes: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "complete")
+        .collect();
+    assert_eq!(completes.len(), 2, "one complete per request: {stdout}");
+    assert!(
+        completes[0]["error"]["message"].is_string(),
+        "download before init must error: {stdout}"
+    );
+    assert!(
+        completes[1]["error"].is_null() && completes[1]["path"].is_string(),
+        "download after init must succeed: {stdout}"
+    );
+}
