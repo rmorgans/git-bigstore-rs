@@ -86,6 +86,24 @@ impl RcloneBackend {
         );
         Ok(())
     }
+
+    /// Keys of all objects under `prefix`. A missing prefix lists as empty.
+    pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let base = prefix.trim_end_matches('/');
+        let remote = self.remote_path(base);
+        let output = run(["lsf", "-R", "--files-only", "--", remote.as_str()]).await?;
+        match output.status.code() {
+            Some(0) => {}
+            Some(EXIT_DIR_NOT_FOUND | EXIT_FILE_NOT_FOUND) => return Ok(Vec::new()),
+            _ => anyhow::bail!("rclone lsf {remote} failed: {}", describe(&output)),
+        }
+        Ok(String::from_utf8(output.stdout)
+            .context("rclone lsf returned non-UTF-8 names")?
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| format!("{base}/{l}"))
+            .collect())
+    }
 }
 
 /// Run rclone with `args`, capturing its output. stdout is never inherited:
