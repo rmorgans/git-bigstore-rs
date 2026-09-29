@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::transfer;
-use crate::types::{HashFunction, Hexdigest};
+use crate::hash;
+use crate::types::Hexdigest;
 
-/// Root cache directory inside .git
+/// Root cache directory inside the (common) git directory.
 pub fn cache_dir(git_dir: &Path) -> PathBuf {
     git_dir.join("bigstore").join("objects")
 }
@@ -13,9 +13,9 @@ pub fn cache_dir(git_dir: &Path) -> PathBuf {
 /// Layout: .git/bigstore/objects/{hash_fn}/<first2>/<rest>
 ///
 /// Safe: Hexdigest is validated — no path traversal possible.
-pub fn object_path(git_dir: &Path, hexdigest: &Hexdigest, hash_fn: HashFunction) -> PathBuf {
+pub fn object_path(git_dir: &Path, hexdigest: &Hexdigest) -> PathBuf {
     cache_dir(git_dir)
-        .join(hash_fn.as_str())
+        .join(hexdigest.hash_fn().as_str())
         .join(hexdigest.prefix())
         .join(hexdigest.rest())
 }
@@ -98,50 +98,47 @@ pub fn resolve_dvc_cache_root(dvc_project_root: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Path to a DVC cache object under a resolved cache root.
-/// Layout: {dvc_cache_root}/files/md5/<first2>/<rest>
+/// Path to an object under a resolved DVC cache root.
+/// Layout: {dvc_cache_root}/files/{hash_fn}/<first2>/<rest>. DVC itself only
+/// writes md5 objects, so other hash functions simply never exist there.
 pub fn dvc_cache_path(dvc_cache_root: &Path, hexdigest: &Hexdigest) -> PathBuf {
     dvc_cache_root
-        .join("files/md5")
+        .join("files")
+        .join(hexdigest.hash_fn().as_str())
         .join(hexdigest.prefix())
         .join(hexdigest.rest())
 }
 
-/// Atomically copy a file into place.
-/// Writes to a temp file in the destination directory, then renames.
-pub fn copy_atomically(src: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Atomically write a copy of `src` to a working-tree path. The file gets the
+/// permissions of any newly created file (0666 minus umask), not the
+/// owner-only mode of a temp file.
+pub fn copy_to_worktree(src: &Path, dest: &Path) -> Result<()> {
+    let parent = dest
+        .parent()
+        .with_context(|| format!("{} has no parent directory", dest.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    let parent = dest.parent().expect("dest has a parent directory");
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut tmp = builder.tempfile_in(parent)?;
     std::io::copy(&mut std::fs::File::open(src)?, &mut tmp)?;
-    std::io::Write::flush(&mut tmp)?;
     tmp.persist(dest)?;
     Ok(())
 }
 
 /// Atomically copy a file into place, failing if the destination already exists.
-pub fn copy_atomically_noclobber(src: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let parent = dest.parent().expect("dest has a parent directory");
+fn copy_atomically_noclobber(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let parent = dest.parent().expect("cache object paths have a parent");
+    std::fs::create_dir_all(parent)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     std::io::copy(&mut std::fs::File::open(src)?, &mut tmp)?;
-    std::io::Write::flush(&mut tmp)?;
-    match tmp.persist_noclobber(dest) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.error.into()),
-    }
+    tmp.persist_noclobber(dest).map(drop).map_err(|e| e.error)
 }
 
-/// Copy a cached object to the working tree atomically.
-pub fn copy_to_working_tree(cache_path: &Path, dest: &Path) -> Result<()> {
-    copy_atomically(cache_path, dest)
-}
-
-/// Result of attempting to import an MD5 object from the local DVC cache.
+/// Result of attempting to import an object from the local DVC cache.
 pub enum DvcImportResult {
     /// Object was verified and imported into bigstore cache.
     Imported,
@@ -151,46 +148,41 @@ pub enum DvcImportResult {
     NotInDvcCache,
 }
 
-/// Import an MD5 object from the local DVC cache into the bigstore cache.
-///
-/// MD5-specific by design: DVC cache paths are always MD5-sharded,
-/// so this function only accepts MD5 hexdigests.
+/// Import an object from the local DVC cache into the bigstore cache.
 ///
 /// `dvc_cache_root` is the resolved DVC cache directory (from `resolve_dvc_cache_root`).
 ///
 /// On success, the object is hash-verified and atomically persisted.
 /// Returns `Err` for integrity failures or I/O errors.
-pub fn import_md5_from_dvc_cache(
+pub fn import_from_dvc_cache(
     dvc_cache_root: &Path,
     git_dir: &Path,
     hexdigest: &Hexdigest,
 ) -> Result<DvcImportResult> {
-    let bs_cache = object_path(git_dir, hexdigest, HashFunction::Md5);
-    if bs_cache.exists() {
+    let bs_cache = object_path(git_dir, hexdigest);
+    if bs_cache.is_file() {
         return Ok(DvcImportResult::AlreadyCached);
     }
 
     let dvc_path = dvc_cache_path(dvc_cache_root, hexdigest);
-    if !dvc_path.exists() {
+    if !dvc_path.is_file() {
         return Ok(DvcImportResult::NotInDvcCache);
     }
 
     // Verify hash before trusting DVC cache
-    let actual = transfer::hash_file(&dvc_path, HashFunction::Md5)
+    let actual = hash::hash_file(&dvc_path, hexdigest.hash_fn())
         .context("failed to hash DVC cache object")?;
     anyhow::ensure!(
         actual == *hexdigest,
         "DVC cache integrity check failed: expected {hexdigest}, got {actual}"
     );
 
-    // Atomic persist to bigstore cache
-    if let Some(parent) = bs_cache.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     match copy_atomically_noclobber(&dvc_path, &bs_cache) {
         Ok(()) => Ok(DvcImportResult::Imported),
-        Err(_) if bs_cache.exists() => Ok(DvcImportResult::AlreadyCached),
-        Err(e) => Err(e),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(DvcImportResult::AlreadyCached)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -204,7 +196,7 @@ mod tests {
         let git_dir = PathBuf::from("/repo/.git");
         let hex = "ab".repeat(32);
         let digest = Hexdigest::new(&hex, HashFunction::Sha256).unwrap();
-        let path = object_path(&git_dir, &digest, HashFunction::Sha256);
+        let path = object_path(&git_dir, &digest);
         assert_eq!(
             path,
             PathBuf::from(format!(
@@ -220,7 +212,7 @@ mod tests {
         let git_dir = PathBuf::from("/repo/.git");
         let hex = "ab".repeat(16);
         let digest = Hexdigest::new(&hex, HashFunction::Md5).unwrap();
-        let path = object_path(&git_dir, &digest, HashFunction::Md5);
+        let path = object_path(&git_dir, &digest);
         assert_eq!(
             path,
             PathBuf::from(format!(

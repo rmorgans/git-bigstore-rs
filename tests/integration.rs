@@ -123,6 +123,60 @@ impl TestRepo {
     fn file_exists(&self, name: &str) -> bool {
         self.repo_dir.join(name).exists()
     }
+
+    /// `git clone` the repo into a sibling directory, the way a teammate would.
+    /// The clone starts without filter config, so checkout leaves pointer
+    /// files; the filters are then configured to use the test binary.
+    fn clone_repo(&self, name: &str) -> PathBuf {
+        let dest = self.repo_dir.parent().unwrap().join(name);
+        git(
+            self.repo_dir.parent().unwrap(),
+            &["clone", "-q", self.repo_dir.to_str().unwrap(), name],
+        );
+        git(&dest, &["config", "user.email", "test@test.com"]);
+        git(&dest, &["config", "user.name", "Test"]);
+        let bin = env!("CARGO_BIN_EXE_git-bigstore");
+        git(
+            &dest,
+            &[
+                "config",
+                "filter.bigstore.clean",
+                &format!("{bin} filter-clean"),
+            ],
+        );
+        git(
+            &dest,
+            &[
+                "config",
+                "filter.bigstore.smudge",
+                &format!("{bin} filter-smudge"),
+            ],
+        );
+        git(&dest, &["config", "filter.bigstore.required", "true"]);
+        dest
+    }
+
+    /// Commit `.gitattributes` (with `attrs`) and `.bigstore.toml`.
+    fn track(&self, attrs: &str) {
+        self.write_file(".gitattributes", attrs.as_bytes());
+        git(&self.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
+        git(&self.repo_dir, &["commit", "-q", "-m", "track"]);
+    }
+
+    fn storage_objects(&self) -> usize {
+        walkdir::WalkDir::new(&self.storage_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .count()
+    }
+
+    fn drop_cache(&self) {
+        let cache = self.repo_dir.join(".git/bigstore");
+        if cache.exists() {
+            std::fs::remove_dir_all(cache).unwrap();
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────
@@ -450,11 +504,12 @@ fn push_is_idempotent() {
 
     // First push
     bigstore_ok(&t.repo_dir, &["push"]);
-    // Second push — should skip (already uploaded)
+    // Second push — nothing to upload, and it must say so
     let output = bigstore(&t.repo_dir, &["push"]);
+    assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("already up to date") || stderr.contains("0 file(s) uploaded"),
+        stderr.contains("1 file(s) already up to date") && !stderr.contains("uploaded"),
         "second push should skip: {stderr}"
     );
 }
@@ -483,22 +538,44 @@ fn clean_filter_is_idempotent() {
     assert_eq!(pointer1, pointer2, "clean filter should be idempotent");
 }
 
+/// Find the status label printed for `path` (`{label:>40}  {path}`).
+fn status_label(stdout: &str, path: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_suffix(&format!("  {path}")))
+        .unwrap_or_else(|| panic!("no status line for {path}: {stdout}"))
+        .trim()
+        .to_string()
+}
+
 #[test]
 fn status_shows_file_states() {
     let t = TestRepo::new();
+    // legacy.bin is committed before tracking, so git holds its raw content.
+    t.write_file("legacy.bin", &[0xff, 0x00, 0xfe, b'\n']);
+    git(&t.repo_dir, &["add", "legacy.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "legacy"]);
+    t.track("*.bin filter=bigstore\n");
 
-    t.write_file(".gitattributes", b"*.bin filter=bigstore\n");
-    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
-    git(&t.repo_dir, &["commit", "-m", "init"]);
+    for name in ["ok.bin", "pointer.bin", "gone.bin"] {
+        t.write_file(name, format!("content of {name}\n").as_bytes());
+    }
+    git(&t.repo_dir, &["add", "ok.bin", "pointer.bin", "gone.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+    let pointer = git(&t.repo_dir, &["cat-file", "blob", ":pointer.bin"]);
+    t.write_file("pointer.bin", pointer.as_bytes());
+    std::fs::remove_file(t.repo_dir.join("gone.bin")).unwrap();
 
-    t.write_file("test.bin", b"content for status\n");
-    git(&t.repo_dir, &["add", "test.bin"]);
-    git(&t.repo_dir, &["commit", "-m", "add"]);
-
-    let output = bigstore_ok(&t.repo_dir, &["status"]);
-    assert!(
-        output.contains("test.bin"),
-        "status should show tracked file"
+    let out = bigstore_ok(&t.repo_dir, &["status"]);
+    assert_eq!(status_label(&out, "ok.bin"), "ok");
+    assert_eq!(
+        status_label(&out, "pointer.bin"),
+        "cached (not checked out)"
+    );
+    assert_eq!(status_label(&out, "gone.bin"), "missing from working tree");
+    assert_eq!(
+        status_label(&out, "legacy.bin"),
+        "not a pointer in git (git add --renormalize)"
     );
 }
 
@@ -565,25 +642,23 @@ fn status_verify_detects_corrupted_cache() {
 }
 
 #[test]
-fn rejects_invalid_gitattributes_glob() {
+fn nested_gitattributes_are_honoured() {
+    // Git applies the clean filter using every .gitattributes file, so push
+    // must see the same set — a file tracked only by a nested .gitattributes
+    // is otherwise stored as a pointer in git but never uploaded.
     let t = TestRepo::new();
-
-    // An unclosed character class is not a valid glob. Previously this silently
-    // fell back to matching every file; it must now surface an error.
-    t.write_file(".gitattributes", b"[ filter=bigstore\n");
-    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
-    git(&t.repo_dir, &["commit", "-m", "init"]);
-
-    let output = bigstore(&t.repo_dir, &["status"]);
-    assert!(
-        !output.status.success(),
-        "invalid .gitattributes glob should fail, not match everything"
+    t.write_file("models/.gitattributes", b"*.dat filter=bigstore\n");
+    git(
+        &t.repo_dir,
+        &["add", ".bigstore.toml", "models/.gitattributes"],
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("invalid pattern"),
-        "should report the bad pattern: {stderr}"
-    );
+    t.write_file("models/m.dat", b"model weights\n");
+    t.write_file("readme.dat", b"not tracked outside models/\n");
+    git(&t.repo_dir, &["add", "models/m.dat", "readme.dat"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "nested"]);
+
+    bigstore_ok(&t.repo_dir, &["push"]);
+    assert_eq!(t.storage_objects(), 1, "models/m.dat should be uploaded");
 }
 
 #[test]
@@ -617,6 +692,450 @@ fn multiple_files_tracked() {
         3,
         "should have 3 objects in storage (one per unique file)"
     );
+}
+
+// ──────────────────────────────────────────────────
+// Regressions: working-tree safety, paths, pointer classification
+// ──────────────────────────────────────────────────
+
+#[test]
+fn pull_keeps_uncommitted_local_edits() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("data.bin", b"v1\n");
+    git(&t.repo_dir, &["add", "data.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "v1"]);
+    bigstore_ok(&t.repo_dir, &["push"]);
+
+    t.write_file("data.bin", b"v2, not yet committed\n");
+    bigstore_ok(&t.repo_dir, &["pull"]);
+
+    assert_eq!(t.read_file("data.bin"), b"v2, not yet committed\n");
+}
+
+#[test]
+fn fresh_clone_pull_restores_content_mode_and_clean_status() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("data.bin", b"payload\n");
+    t.write_file("run.bin", b"#!/bin/sh\necho hi\n");
+    git(&t.repo_dir, &["add", "data.bin", "run.bin"]);
+    git(&t.repo_dir, &["update-index", "--chmod=+x", "run.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+    bigstore_ok(&t.repo_dir, &["push"]);
+
+    let clone = t.clone_repo("clone");
+    assert!(std::fs::read(clone.join("data.bin"))
+        .unwrap()
+        .starts_with(b"bigstore\n"));
+
+    bigstore_ok(&clone, &["pull"]);
+
+    assert_eq!(std::fs::read(clone.join("data.bin")).unwrap(), b"payload\n");
+    assert_eq!(
+        std::fs::read(clone.join("run.bin")).unwrap(),
+        b"#!/bin/sh\necho hi\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(clone.join("run.bin"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o100, 0, "run.bin lost its executable bit: {mode:o}");
+    }
+    // The index must agree with the restored files, or git reports them as
+    // modified and refuses to switch branches.
+    assert_eq!(git(&clone, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn push_and_pull_from_a_subdirectory_with_non_ascii_names() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    let files: [(&str, &[u8]); 3] = [
+        ("café.bin", b"accented name\n"),
+        ("data.bin", b"root data\n"),
+        ("sub/data.bin", b"sub data\n"),
+    ];
+    for (name, content) in files {
+        t.write_file(name, content);
+    }
+    git(&t.repo_dir, &["add", "-A"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+
+    bigstore_ok(&t.repo_dir.join("sub"), &["push"]);
+    assert_eq!(
+        t.storage_objects(),
+        3,
+        "every tracked file must be uploaded"
+    );
+
+    let clone = t.clone_repo("clone");
+    bigstore_ok(&clone.join("sub"), &["pull"]);
+    for (name, content) in files {
+        assert_eq!(std::fs::read(clone.join(name)).unwrap(), content, "{name}");
+    }
+}
+
+#[test]
+fn legacy_non_pointer_blobs_do_not_block_push_or_pull() {
+    let t = TestRepo::new();
+    // Committed before tracking: git holds raw (non-UTF-8) content, as it
+    // does for every existing file until `git add --renormalize`.
+    t.write_file("legacy.bin", &[0xff, 0x00, 0xfe, b'\n']);
+    git(&t.repo_dir, &["add", "legacy.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "legacy"]);
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("new.bin", b"tracked content\n");
+    git(&t.repo_dir, &["add", "new.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "new"]);
+
+    bigstore_ok(&t.repo_dir, &["push"]);
+    assert_eq!(t.storage_objects(), 1);
+
+    let clone = t.clone_repo("clone");
+    bigstore_ok(&clone, &["pull"]);
+    assert_eq!(
+        std::fs::read(clone.join("new.bin")).unwrap(),
+        b"tracked content\n"
+    );
+    assert_eq!(
+        std::fs::read(clone.join("legacy.bin")).unwrap(),
+        [0xff, 0x00, 0xfe, b'\n']
+    );
+}
+
+#[test]
+fn content_that_starts_like_a_pointer_round_trips() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    let hex = "ab".repeat(32);
+    let files: [(&str, Vec<u8>); 2] = [
+        ("notes.bin", b"bigstore\nis a great tool\n".to_vec()),
+        (
+            "trailing.bin",
+            format!("bigstore\nsha256\n{hex}\nTRAILING PAYLOAD\n").into_bytes(),
+        ),
+    ];
+    for (name, content) in &files {
+        t.write_file(name, content);
+    }
+    git(&t.repo_dir, &["add", "notes.bin", "trailing.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+
+    for (name, content) in &files {
+        let blob = git(&t.repo_dir, &["cat-file", "blob", &format!(":{name}")]);
+        assert!(
+            blob.starts_with("bigstore\nsha256\n") && blob.as_bytes() != &content[..],
+            "{name} must be stored as a pointer, not passed through: {blob:?}"
+        );
+    }
+
+    // Smudge from the cache restores the exact bytes and leaves git clean.
+    for (name, _) in &files {
+        std::fs::remove_file(t.repo_dir.join(name)).unwrap();
+    }
+    git(
+        &t.repo_dir,
+        &["checkout", "--", "notes.bin", "trailing.bin"],
+    );
+    for (name, content) in &files {
+        assert_eq!(&t.read_file(name), content, "{name}");
+    }
+    assert_eq!(git(&t.repo_dir, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn push_fails_when_an_object_is_neither_cached_nor_on_the_remote() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("a.bin", b"never pushed\n");
+    git(&t.repo_dir, &["add", "a.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+    t.drop_cache();
+
+    let output = bigstore(&t.repo_dir, &["push"]);
+    assert!(!output.status.success(), "silent data loss: push exited 0");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a.bin") && stderr.contains("not in the local cache and not on the remote"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn local_backend_creates_missing_storage_directory() {
+    let t = TestRepo::new();
+    std::fs::remove_dir_all(&t.storage_dir).unwrap();
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("a.bin", b"content\n");
+    git(&t.repo_dir, &["add", "a.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+
+    bigstore_ok(&t.repo_dir, &["push"]);
+    assert_eq!(t.storage_objects(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn unrelated_non_utf8_path_does_not_block_push() {
+    use std::os::unix::ffi::OsStrExt;
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("a.bin", b"tracked\n");
+    git(&t.repo_dir, &["add", "a.bin"]);
+    // An index entry named with Latin-1 bytes (not creatable on every
+    // filesystem, so add it to the index directly).
+    let oid = git(&t.repo_dir, &["hash-object", "-w", "a.bin"]);
+    let mut spec = format!("100644,{oid},caf").into_bytes();
+    spec.extend_from_slice(b"\xe9.txt");
+    let status = Command::new("git")
+        .current_dir(&t.repo_dir)
+        .args(["update-index", "--add", "--cacheinfo"])
+        .arg(std::ffi::OsStr::from_bytes(&spec))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+
+    bigstore_ok(&t.repo_dir, &["push"]);
+    assert_eq!(t.storage_objects(), 1);
+}
+
+/// Cache object path for a committed pointer in `repo`.
+fn cached_object(repo: &Path, path: &str) -> PathBuf {
+    let pointer = git(repo, &["cat-file", "blob", &format!(":{path}")]);
+    let mut lines = pointer.lines().skip(1);
+    let (hash_fn, hex) = (lines.next().unwrap(), lines.next().unwrap());
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    PathBuf::from(common).join(format!(
+        "bigstore/objects/{hash_fn}/{}/{}",
+        &hex[..2],
+        &hex[2..]
+    ))
+}
+
+/// Commit `a_md5.bin` as an md5 pointer (as `ref` produces) whose object is
+/// in the cache, plus sha256 files `b.bin` and `z.bin`, and push them.
+fn commit_mixed_pointers(t: &TestRepo) {
+    t.track("*.bin filter=bigstore\n");
+    let content = b"md5-addressed content\n";
+    let hex = format!("{:x}", md5::Md5::digest(content));
+    let object = t.repo_dir.join(format!(
+        ".git/bigstore/objects/md5/{}/{}",
+        &hex[..2],
+        &hex[2..]
+    ));
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, content).unwrap();
+    t.write_file("a_md5.bin", format!("bigstore\nmd5\n{hex}\n").as_bytes());
+    t.write_file("b.bin", b"object b\n");
+    t.write_file("z.bin", b"object z\n");
+    git(&t.repo_dir, &["add", "a_md5.bin", "b.bin", "z.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+    bigstore_ok(&t.repo_dir, &["push"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_checkout_keeps_the_index_and_retry_converges() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = TestRepo::new();
+    commit_mixed_pointers(&t);
+
+    // z.bin sorts last: git writes a_md5.bin and b.bin, then dies on z.bin,
+    // whose cached object is unreadable, without writing any index.
+    let clone = t.clone_repo("clone");
+    let object = cached_object(&clone, "z.bin");
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::copy(cached_object(&t.repo_dir, "z.bin"), &object).unwrap();
+    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = bigstore(&clone, &["pull"]);
+    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    assert!(!output.status.success(), "a failed checkout must fail pull");
+    assert_eq!(
+        std::fs::read(clone.join("a_md5.bin")).unwrap(),
+        b"md5-addressed content\n"
+    );
+    assert_eq!(std::fs::read(clone.join("b.bin")).unwrap(), b"object b\n");
+    assert!(std::fs::read(clone.join("z.bin"))
+        .unwrap()
+        .starts_with(b"bigstore\n"));
+    // Nothing staged: the md5 pointer must not be re-cleaned into a sha256
+    // one. (md5 files are left out of `status`: git's racy-timestamp
+    // re-check runs the clean filter, which always yields sha256.)
+    assert_eq!(git(&clone, &["diff", "--cached", "--name-only"]), "");
+    assert_eq!(
+        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
+        ""
+    );
+
+    bigstore_ok(&clone, &["pull"]);
+    assert_eq!(std::fs::read(clone.join("z.bin")).unwrap(), b"object z\n");
+    assert_eq!(
+        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
+        ""
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_pull_is_recovered_by_the_next_pull() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = TestRepo::new();
+    commit_mixed_pointers(&t);
+    let clone = t.clone_repo("clone");
+
+    // A filter binary that lets the first smudge through, then SIGKILLs pull
+    // and git in the middle of checkout.
+    let dir = clone.parent().unwrap();
+    let killer = dir.join("killer.sh");
+    std::fs::write(
+        &killer,
+        r#"#!/bin/sh
+[ "$1" = filter-smudge ] || exec "$BIGSTORE_BIN" "$@"
+n=$(cat "$KILL_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$KILL_COUNT"
+[ "$n" -lt 2 ] && exec "$BIGSTORE_BIN" filter-smudge
+p=$PPID
+while [ "${p:-1}" -gt 1 ]; do
+  case "$(ps -o command= -p "$p")" in
+    *"git-bigstore pull"*) kill -KILL "$p";;
+    *checkout-index*) kill -TERM "$p";;
+  esac
+  p=$(ps -o ppid= -p "$p" | tr -d ' ')
+done
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&killer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let killer = killer.to_str().unwrap();
+    for (key, cmd) in [("clean", "filter-clean"), ("smudge", "filter-smudge")] {
+        let value = format!("{killer} {cmd}");
+        git(
+            &clone,
+            &["config", &format!("filter.bigstore.{key}"), &value],
+        );
+    }
+
+    let bin = env!("CARGO_BIN_EXE_git-bigstore");
+    let killed = Command::new(bin)
+        .arg("pull")
+        .current_dir(&clone)
+        .env("KILL_COUNT", dir.join("count"))
+        .env("BIGSTORE_BIN", bin)
+        .output()
+        .unwrap();
+    assert!(!killed.status.success(), "pull should have been killed");
+    assert_ne!(
+        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
+        "",
+        "sanity: the kill left the tree damaged"
+    );
+
+    for (key, cmd) in [("clean", "filter-clean"), ("smudge", "filter-smudge")] {
+        let value = format!("{bin} {cmd}");
+        git(
+            &clone,
+            &["config", &format!("filter.bigstore.{key}"), &value],
+        );
+    }
+    let out = bigstore(&clone, &["pull"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("interrupted pull recovered"));
+    assert_eq!(
+        std::fs::read(clone.join("a_md5.bin")).unwrap(),
+        b"md5-addressed content\n"
+    );
+    assert_eq!(std::fs::read(clone.join("b.bin")).unwrap(), b"object b\n");
+    assert_eq!(std::fs::read(clone.join("z.bin")).unwrap(), b"object z\n");
+    assert_eq!(git(&clone, &["diff", "--cached", "--name-only"]), "");
+    // md5 pointers are excluded: git's racy-timestamp re-check runs the clean
+    // filter, which always yields a sha256 pointer.
+    assert_eq!(
+        git(&clone, &["status", "--porcelain", "--", "b.bin", "z.bin"]),
+        ""
+    );
+}
+
+#[test]
+fn pull_never_restores_a_file_the_user_deleted() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("a.bin", b"content\n");
+    git(&t.repo_dir, &["add", "a.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+    bigstore_ok(&t.repo_dir, &["push"]);
+
+    std::fs::remove_file(t.repo_dir.join("a.bin")).unwrap();
+    bigstore_ok(&t.repo_dir, &["pull"]);
+    assert!(!t.file_exists("a.bin"));
+}
+
+#[test]
+fn pull_skips_files_outside_a_sparse_checkout() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    t.write_file("keep/a.bin", b"in the cone\n");
+    t.write_file("skip/b.bin", b"outside the cone\n");
+    git(&t.repo_dir, &["add", "-A"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add"]);
+    bigstore_ok(&t.repo_dir, &["push"]);
+
+    let clone = t.clone_repo("clone");
+    git(&clone, &["sparse-checkout", "set", "keep"]);
+    bigstore_ok(&clone, &["pull"]);
+
+    assert_eq!(
+        std::fs::read(clone.join("keep/a.bin")).unwrap(),
+        b"in the cone\n"
+    );
+    assert!(!clone.join("skip/b.bin").exists());
+    assert!(
+        !cached_object(&clone, "skip/b.bin").exists(),
+        "objects outside the sparse checkout must not be downloaded"
+    );
+    let status = bigstore_ok(&clone, &["status"]);
+    assert_eq!(
+        status_label(&status, "skip/b.bin"),
+        "outside sparse checkout"
+    );
+}
+
+#[test]
+fn linked_worktrees_share_the_object_cache() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+    let wt = t.repo_dir.parent().unwrap().join("wt");
+    git(
+        &t.repo_dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(wt.join("f.bin"), b"added in a linked worktree\n").unwrap();
+    git(&wt, &["add", "f.bin"]);
+    git(&wt, &["commit", "-q", "-m", "wt"]);
+
+    // Checking the commit out in the main worktree smudges from the cache the
+    // linked worktree's clean filter wrote to.
+    git(&t.repo_dir, &["merge", "-q", "feature"]);
+    assert_eq!(t.read_file("f.bin"), b"added in a linked worktree\n");
 }
 
 // ──────────────────────────────────────────────────
@@ -827,7 +1346,7 @@ fn pull_rejects_corrupted_dvc_cache() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("integrity") || stderr.contains("failed"),
+        stderr.contains("integrity check failed"),
         "should report integrity failure: {stderr}"
     );
 }
@@ -1842,5 +2361,145 @@ fn lfs_adapter_rejects_upload_oid_mismatch() {
         storage_object_count(&t),
         0,
         "a mismatched upload must not poison storage"
+    );
+}
+
+#[test]
+fn log_shows_non_ascii_paths() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+
+    // git C-quotes non-ASCII paths ("caf\303\251.bin") unless told otherwise.
+    t.write_file("café.bin", b"non-ascii name\n");
+    git(&t.repo_dir, &["add", "café.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add cafe"]);
+    git(&t.repo_dir, &["mv", "café.bin", "naïve.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "rename cafe"]);
+
+    let output = bigstore_ok(&t.repo_dir, &["log"]);
+    assert!(
+        output.contains("+ café.bin  sha256:"),
+        "add of a non-ASCII path missing: {output}"
+    );
+    assert!(
+        output.contains("R café.bin -> naïve.bin  sha256:"),
+        "rename between non-ASCII paths missing: {output}"
+    );
+
+    let filtered = bigstore_ok(&t.repo_dir, &["log", "naïve.bin"]);
+    assert!(
+        filtered.contains("R café.bin -> naïve.bin"),
+        "path filter must match the unquoted name: {filtered}"
+    );
+}
+
+#[test]
+fn log_shows_paths_with_quotes_and_spaces() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+
+    let name = "say \"hi\" now.bin";
+    t.write_file(name, b"quoted name\n");
+    git(&t.repo_dir, &["add", name]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add quoted"]);
+    git(&t.repo_dir, &["rm", "-q", name]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "delete quoted"]);
+
+    let output = bigstore_ok(&t.repo_dir, &["log"]);
+    assert!(
+        output.contains(&format!("+ {name}  sha256:")),
+        "add missing: {output}"
+    );
+    assert!(
+        output.contains(&format!("- {name}  sha256:")),
+        "delete missing: {output}"
+    );
+}
+
+/// Parse the adapter's `complete` event for `oid` from its stdout.
+fn lfs_complete_for(stdout: &str, oid: &str) -> serde_json::Value {
+    stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["event"] == "complete" && v["oid"] == oid)
+        .unwrap_or_else(|| panic!("no complete event for {oid}: {stdout}"))
+}
+
+#[test]
+fn lfs_adapter_invalid_oid_fails_only_that_object() {
+    let t = TestRepo::new();
+    let content = b"valid object after an invalid oid\n";
+    let oid = push_object_for_lfs(&t, content);
+
+    let session = format!(
+        "{{\"event\":\"init\",\"operation\":\"download\",\"remote\":\"origin\",\"concurrent\":true,\"concurrenttransfers\":1}}\n\
+         {{\"event\":\"download\",\"oid\":\"../not-a-sha256\",\"size\":3}}\n\
+         {{\"event\":\"download\",\"oid\":\"{oid}\",\"size\":{}}}\n\
+         {{\"event\":\"terminate\"}}\n",
+        content.len()
+    );
+    let out = bigstore_stdin(&t.repo_dir, &["lfs-adapter"], session.as_bytes());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "adapter must survive a bad oid: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bad = lfs_complete_for(&stdout, "../not-a-sha256");
+    assert!(
+        bad["error"]["message"].is_string(),
+        "invalid oid must error: {bad}"
+    );
+    assert!(
+        bad["path"].is_null(),
+        "invalid oid must not report a path: {bad}"
+    );
+
+    let good = lfs_complete_for(&stdout, &oid);
+    assert!(
+        good["error"].is_null(),
+        "valid oid must still download: {good}"
+    );
+    assert!(
+        good["path"].is_string(),
+        "valid oid must report a path: {good}"
+    );
+}
+
+#[test]
+fn lfs_adapter_download_before_init_is_an_object_error() {
+    let t = TestRepo::new();
+    let content = b"object requested before init\n";
+    let oid = push_object_for_lfs(&t, content);
+
+    let session = format!(
+        "{{\"event\":\"download\",\"oid\":\"{oid}\",\"size\":{size}}}\n\
+         {{\"event\":\"init\",\"operation\":\"download\",\"remote\":\"origin\",\"concurrent\":true,\"concurrenttransfers\":1}}\n\
+         {{\"event\":\"download\",\"oid\":\"{oid}\",\"size\":{size}}}\n\
+         {{\"event\":\"terminate\"}}\n",
+        size = content.len()
+    );
+    let out = bigstore_stdin(&t.repo_dir, &["lfs-adapter"], session.as_bytes());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "adapter must not crash on a download before init: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let completes: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "complete")
+        .collect();
+    assert_eq!(completes.len(), 2, "one complete per request: {stdout}");
+    assert!(
+        completes[0]["error"]["message"].is_string(),
+        "download before init must error: {stdout}"
+    );
+    assert!(
+        completes[1]["error"].is_null() && completes[1]["path"].is_string(),
+        "download after init must succeed: {stdout}"
     );
 }

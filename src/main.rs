@@ -1,11 +1,18 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use globset::Glob;
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::future::Future;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 
-use bigstore::{cache, config, dvc, filter, git, transfer, types};
+use bigstore::backend;
+use bigstore::cache::{self, DvcImportResult};
+use bigstore::config::BigstoreConfig;
+use bigstore::filter::{self, WorktreeFile};
+use bigstore::git::{self, IndexBlob};
+use bigstore::transfer::{self, Remote};
+use bigstore::types::{Hexdigest, RepoPath};
+use bigstore::{dvc, hash};
 
 #[derive(Parser)]
 #[command(name = "git-bigstore", version, about = "Large files in git, your bucket, one binary.", long_about = None)]
@@ -28,22 +35,22 @@ enum Commands {
 
     /// Upload cached objects to remote storage
     Push {
-        /// Only push files matching these patterns
+        /// Only push files matching these patterns (relative to the repository root)
         patterns: Vec<String>,
 
         /// Number of concurrent transfers (default: 8, env: BIGSTORE_JOBS)
         #[arg(short, long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
     },
 
     /// Download objects from remote storage (with integrity verification)
     Pull {
-        /// Only pull files matching these patterns
+        /// Only pull files matching these patterns (relative to the repository root)
         patterns: Vec<String>,
 
         /// Number of concurrent transfers (default: 8, env: BIGSTORE_JOBS)
         #[arg(short, long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
     },
 
     /// Show status of tracked large files
@@ -66,29 +73,34 @@ enum Commands {
         paths: Vec<String>,
     },
 
-    /// Create a bigstore pointer from a .dvc file
+    /// Create a bigstore file from a single-file .dvc file
     Ref {
-        /// Path to .dvc file
-        source: String,
-        /// Destination path for the pointer file
-        dest: String,
+        /// Path to .dvc file (relative to the repository root)
+        #[arg(value_parser = RepoPath::new)]
+        source: RepoPath,
+        /// Destination path (relative to the repository root)
+        #[arg(value_parser = RepoPath::new)]
+        dest: RepoPath,
     },
 
     /// List files in a DVC .dir manifest
     #[command(name = "dvc-ls")]
     DvcLs {
         /// Path to .dvc file (must be a .dir type)
-        source: String,
+        #[arg(value_parser = RepoPath::new)]
+        source: RepoPath,
     },
 
     /// Import files from a DVC .dir manifest into bigstore
     #[command(name = "import-dvc-dir")]
     ImportDvcDir {
         /// Path to .dvc file (must be a .dir type)
-        source: String,
+        #[arg(value_parser = RepoPath::new)]
+        source: RepoPath,
 
-        /// Destination root directory for pointer files
-        dest_root: String,
+        /// Destination root directory (relative to the repository root)
+        #[arg(value_parser = RepoPath::new)]
+        dest_root: RepoPath,
 
         /// Only import files matching these glob patterns (default: all)
         patterns: Vec<String>,
@@ -114,17 +126,6 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if matches!(cli.command, Commands::LfsAdapter) {
-        return bigstore::lfs_adapter::run();
-    }
-
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async_main(cli))
-}
-
-async fn async_main(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -132,11 +133,11 @@ async fn async_main(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::Init { url, endpoint } => cmd_init(&url, endpoint.as_deref()),
-        Commands::Push { patterns, jobs } => cmd_push(&patterns, jobs).await,
-        Commands::Pull { patterns, jobs } => cmd_pull(&patterns, jobs).await,
+        Commands::Push { patterns, jobs } => cmd_push(&patterns, jobs),
+        Commands::Pull { patterns, jobs } => cmd_pull(&patterns, jobs),
         Commands::Status { verify } => cmd_status(verify),
         Commands::MigrateConfig { force } => cmd_migrate_config(force),
-        Commands::Log { paths } => cmd_log(&paths),
+        Commands::Log { paths } => bigstore::log::run(&paths),
         Commands::Ref { source, dest } => cmd_ref(&source, &dest),
         Commands::DvcLs { source } => cmd_dvc_ls(&source),
         Commands::ImportDvcDir {
@@ -147,27 +148,31 @@ async fn async_main(cli: Cli) -> Result<()> {
         } => cmd_import_dvc_dir(&source, &dest_root, &patterns, force),
         Commands::FilterClean => filter::clean(),
         Commands::FilterSmudge => filter::smudge(),
-        Commands::LfsAdapter => unreachable!("dispatched before async runtime"),
+        Commands::LfsAdapter => bigstore::lfs_adapter::run(),
     }
 }
 
+/// Only push and pull do async I/O; everything else stays synchronous and
+/// never pays for a runtime (the filters run once per file).
+fn block_on<F: Future>(fut: F) -> Result<F::Output> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start async runtime")?;
+    Ok(rt.block_on(fut))
+}
+
 fn cmd_init(url: &str, endpoint: Option<&str>) -> Result<()> {
-    let git_dir = git::git_dir()?;
+    let git_dir = git::common_dir()?;
     let repo_root = git::repo_root()?;
 
-    let cfg = config::BigstoreConfig::from_url(url, endpoint)?;
-    let config_path = repo_root.join(".bigstore.toml");
-    cfg.save(&config_path)?;
+    let cfg = BigstoreConfig::from_url(url, endpoint)?;
+    cfg.save(&repo_root.join(".bigstore.toml"))?;
 
     // Read existing filter config as a unit — detects partial/broken state
     let existing = git::FilterConfig::load()?;
-    match &existing {
-        Some(_) => {
-            // Already configured (both clean and smudge present) — preserve
-        }
-        None => {
-            git::FilterConfig::default_commands().save()?;
-        }
+    if existing.is_none() {
+        git::FilterConfig::default_commands().save()?;
     }
 
     cache::ensure_cache_dir(&git_dir)?;
@@ -185,91 +190,155 @@ fn cmd_init(url: &str, endpoint: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_push(patterns: &[String], jobs: Option<usize>) -> Result<()> {
+fn cmd_push(patterns: &[String], jobs: Option<NonZeroUsize>) -> Result<()> {
+    let jobs = resolve_jobs(jobs)?;
     let repo_root = git::repo_root()?;
-    let tracked = tracked_files(&repo_root, patterns)?;
-    let concurrency = resolve_jobs(jobs)?;
-    let summary = transfer::push(&tracked, concurrency).await?;
-    summary.print();
-    if !summary.failed.is_empty() {
-        anyhow::bail!("{} file(s) failed", summary.failed.len());
-    }
+    let git_dir = git::common_dir()?;
+    let cfg = BigstoreConfig::find_and_load(&repo_root)?;
+    let entries = git::bigstore_entries(&repo_root, patterns)?;
+    let objects = transfer::objects(&entries);
+    let store = backend::from_config(&cfg)?;
+    let remote = Remote {
+        store: &store,
+        cfg: &cfg,
+        git_dir: &git_dir,
+    };
+
+    let report = block_on(transfer::push(&remote, &objects, jobs.get()))?;
+    report.print();
+    anyhow::ensure!(
+        report.failed.is_empty(),
+        "{} file(s) failed",
+        report.failed.iter().map(|f| f.paths.len()).sum::<usize>()
+    );
     Ok(())
 }
 
-async fn cmd_pull(patterns: &[String], jobs: Option<usize>) -> Result<()> {
+fn cmd_pull(patterns: &[String], jobs: Option<NonZeroUsize>) -> Result<()> {
+    let jobs = resolve_jobs(jobs)?;
     let repo_root = git::repo_root()?;
-    let tracked = tracked_files(&repo_root, patterns)?;
-    let concurrency = resolve_jobs(jobs)?;
-    let summary = transfer::pull(&tracked, concurrency).await?;
-    summary.print();
-    if !summary.failed.is_empty() {
-        anyhow::bail!("{} file(s) failed", summary.failed.len());
+    let git_dir = git::common_dir()?;
+    let cfg = BigstoreConfig::find_and_load(&repo_root)?;
+
+    // Checkout goes through the smudge filter, so a fresh clone needs it.
+    if git::FilterConfig::load()?.is_none() {
+        git::FilterConfig::default_commands().save()?;
+        eprintln!("Configured bigstore git filters for this clone");
     }
+
+    let entries = git::bigstore_entries(&repo_root, patterns)?;
+    let objects = transfer::objects(entries.iter().filter(|e| !e.skip_worktree));
+    let dvc_cache_root = match cache::find_dvc_project_root(&repo_root) {
+        Some(dvc_root) => cache::resolve_dvc_cache_root(&dvc_root)?,
+        None => repo_root.join(".dvc/cache"),
+    };
+    let store = backend::from_config(&cfg)?;
+    let remote = Remote {
+        store: &store,
+        cfg: &cfg,
+        git_dir: &git_dir,
+    };
+
+    let report = block_on(transfer::pull(
+        &remote,
+        &dvc_cache_root,
+        &objects,
+        jobs.get(),
+    ))?;
+    report.print();
+    // Check out whatever did arrive, even if some objects failed.
+    let journal = git::worktree_git_dir()?.join("bigstore-pull-journal");
+    let checkout = transfer::checkout(&repo_root, &git_dir, &journal, &entries)?;
+    if checkout.recovered > 0 {
+        eprintln!(
+            "{} file(s) left by an interrupted pull recovered",
+            checkout.recovered
+        );
+    }
+    if checkout.checked_out > 0 {
+        eprintln!("{} file(s) checked out", checkout.checked_out);
+    }
+    for f in &checkout.failed {
+        let paths: Vec<&str> = f.paths.iter().map(RepoPath::as_str).collect();
+        eprintln!("FAILED checkout: {} — {}", paths.join(", "), f.error);
+    }
+    let failed = report.failed.iter().chain(&checkout.failed);
+    let failed_files: usize = failed.map(|f| f.paths.len()).sum();
+    anyhow::ensure!(failed_files == 0, "{failed_files} file(s) failed");
     Ok(())
 }
 
 fn cmd_status(verify: bool) -> Result<()> {
     let repo_root = git::repo_root()?;
-    let git_dir = git::git_dir()?;
-    let _cfg = config::BigstoreConfig::find_and_load(&repo_root)?;
+    let git_dir = git::common_dir()?;
+    BigstoreConfig::find_and_load(&repo_root)?;
 
-    let tracked = tracked_files(&repo_root, &[])?;
-    let mut corrupted: Vec<String> = Vec::new();
+    let mut corrupted: Vec<(RepoPath, PathBuf)> = Vec::new();
+    for entry in git::bigstore_entries(&repo_root, &[])? {
+        let IndexBlob::Pointer(pointer) = &entry.blob else {
+            println!(
+                "{:>40}  {}",
+                "not a pointer in git (git add --renormalize)", entry.path
+            );
+            continue;
+        };
+        let cache_path = cache::object_path(&git_dir, pointer.hexdigest());
+        let cached = cache_path.is_file();
+        if entry.skip_worktree {
+            let label = if cached {
+                "outside sparse checkout (cached)"
+            } else {
+                "outside sparse checkout"
+            };
+            println!("{label:>40}  {}", entry.path);
+            continue;
+        }
+        let worktree = filter::worktree_file(&entry.path.to_fs_path(&repo_root))?;
 
-    for (path, _filter) in &tracked {
-        let pointer = filter::read_pointer_from_git(path);
-        let status = match pointer {
-            Ok(Some(p)) => {
-                let cache_path = cache::object_path(&git_dir, &p.hexdigest, p.hash_fn);
-                let cached = cache_path.exists();
-                let full_path = repo_root.join(path);
-                let smudged = full_path.exists() && !filter::is_pointer_file(&full_path);
-
-                if verify && cached {
-                    match transfer::hash_file(&cache_path, p.hash_fn) {
-                        Ok(actual) if actual == p.hexdigest => {
-                            if smudged {
-                                "ok (verified)"
-                            } else {
-                                "cached (not checked out, verified)"
-                            }
-                        }
-                        Ok(_) => {
-                            corrupted.push(path.clone());
-                            "CORRUPTED (hash mismatch)"
-                        }
-                        Err(_) => {
-                            corrupted.push(path.clone());
-                            "CORRUPTED (unreadable)"
-                        }
-                    }
-                } else {
-                    match (cached, smudged) {
-                        (true, true) => "ok",
-                        (true, false) => "cached (not checked out)",
-                        (false, true) => "local only (not cached)",
-                        (false, false) => "pointer only (needs pull)",
-                    }
+        let verified = if verify && cached {
+            match hash::hash_file(&cache_path, pointer.hash_fn()) {
+                Ok(actual) if actual == *pointer.hexdigest() => true,
+                Ok(_) => {
+                    println!("{:>40}  {}", "CORRUPTED (hash mismatch)", entry.path);
+                    corrupted.push((entry.path, cache_path));
+                    continue;
+                }
+                Err(_) => {
+                    println!("{:>40}  {}", "CORRUPTED (unreadable)", entry.path);
+                    corrupted.push((entry.path, cache_path));
+                    continue;
                 }
             }
-            _ => "not a bigstore file",
+        } else {
+            false
         };
-        println!("{status:>40}  {path}");
+        let v = if verified { ", verified" } else { "" };
+
+        let label = match (&worktree, cached) {
+            (WorktreeFile::Missing, _) => "missing from working tree".to_string(),
+            (WorktreeFile::Content, true) if verified => "ok (verified)".to_string(),
+            (WorktreeFile::Content, true) => "ok".to_string(),
+            (WorktreeFile::Content, false) => "local only (not cached)".to_string(),
+            (WorktreeFile::Pointer(p), true) if p == pointer => {
+                format!("cached (not checked out{v})")
+            }
+            (WorktreeFile::Pointer(p), false) if p == pointer => {
+                "pointer only (needs pull)".to_string()
+            }
+            (WorktreeFile::Pointer(_), _) => "pointer differs from git".to_string(),
+        };
+        println!("{label:>40}  {}", entry.path);
     }
 
     if !corrupted.is_empty() {
         eprintln!();
         eprintln!(
-            "{} corrupted cache object(s) found. To repair:",
+            "{} corrupted cache object(s) found. Delete them and re-pull:",
             corrupted.len()
         );
-        for path in &corrupted {
-            eprintln!("  {path}");
+        for (path, object) in &corrupted {
+            eprintln!("  rm {}    # {path}", object.display());
         }
-        eprintln!();
-        eprintln!("Delete corrupted cache and re-pull:");
-        eprintln!("  rm -rf .git/bigstore/objects");
         eprintln!("  git bigstore pull");
         anyhow::bail!("{} corrupted object(s)", corrupted.len());
     }
@@ -292,7 +361,7 @@ fn cmd_migrate_config(force: bool) -> Result<()> {
     }
 
     // Load from legacy, save as toml (validates + normalizes)
-    let cfg = config::BigstoreConfig::load(&legacy_path)?;
+    let cfg = BigstoreConfig::load(&legacy_path)?;
     cfg.save(&toml_path)?;
 
     eprintln!("Migrated .bigstore -> .bigstore.toml");
@@ -305,441 +374,42 @@ fn cmd_migrate_config(force: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_log(paths: &[String]) -> Result<()> {
-    // Get commit list (first-parent only to avoid merge noise)
-    let rev_output = Command::new("git")
-        .args(["rev-list", "--first-parent", "HEAD"])
-        .output()?;
-    anyhow::ensure!(rev_output.status.success(), "git rev-list failed");
-    let commits = String::from_utf8(rev_output.stdout)?;
-
-    // Optional path filter matchers
-    let path_matchers: Vec<_> = paths
-        .iter()
-        .map(|p| {
-            Glob::new(p)
-                .with_context(|| format!("invalid path pattern: {p:?}"))
-                .map(|g| g.compile_matcher())
-        })
-        .collect::<Result<_>>()?;
-
-    // Single long-lived process for all blob reads
-    let mut cat_file = CatFileBatch::start()?;
-    let mut found_any = false;
-
-    for commit in commits.lines() {
-        // Check if this is a root commit (no parents)
-        let parent_check = Command::new("git")
-            .args(["rev-parse", "--verify", &format!("{commit}^")])
-            .stderr(Stdio::null())
-            .output()?;
-        let is_root = !parent_check.status.success();
-
-        // For root commits: diff against empty tree (--root)
-        // For all others (including merges): diff against first parent explicitly
-        let diff_output = if is_root {
-            Command::new("git")
-                .args([
-                    "diff-tree",
-                    "--root",
-                    "-r",
-                    "-M",
-                    "-C",
-                    "--name-status",
-                    commit,
-                ])
-                .output()?
-        } else {
-            let parent = format!("{commit}~1");
-            Command::new("git")
-                .args([
-                    "diff-tree",
-                    "-r",
-                    "-M",
-                    "-C",
-                    "--name-status",
-                    &parent,
-                    commit,
-                ])
-                .output()?
-        };
-        if !diff_output.status.success() {
-            continue;
-        }
-        let diff_text = String::from_utf8_lossy(&diff_output.stdout);
-
-        let mut changes: Vec<LogChange> = Vec::new();
-
-        for line in diff_text.lines() {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let status = parts[0];
-            let (old_path, new_path) = if status.starts_with('R') || status.starts_with('C') {
-                if parts.len() < 3 {
-                    continue;
-                }
-                (Some(parts[1]), parts[2])
-            } else {
-                (None, parts[1])
-            };
-
-            // Path filter
-            if !path_matchers.is_empty() {
-                let matches = path_matchers.iter().any(|m| m.is_match(new_path))
-                    || old_path.is_some_and(|op| path_matchers.iter().any(|m| m.is_match(op)));
-                if !matches {
-                    continue;
-                }
-            }
-
-            let status_char = status.chars().next().unwrap_or('M');
-
-            let new_pointer = if status_char == 'D' {
-                None
-            } else {
-                cat_file.read_pointer(commit, new_path)?
-            };
-
-            let old_pointer = if status_char == 'A' {
-                None
-            } else {
-                let old_ref = format!("{commit}~1");
-                let check_path = old_path.unwrap_or(new_path);
-                cat_file.read_pointer(&old_ref, check_path)?
-            };
-
-            if new_pointer.is_none() && old_pointer.is_none() {
-                continue;
-            }
-
-            // For copies, old path still exists — only the new path matters.
-            // If the copy didn't produce a pointer, it's not a bigstore event.
-            if status_char == 'C' && new_pointer.is_none() {
-                continue;
-            }
-
-            let kind = match (status_char, &old_pointer, &new_pointer) {
-                // File added as pointer, or non-pointer converted to pointer
-                ('A', _, Some(_)) | ('M' | 'T', None, Some(_)) => ChangeKind::Added,
-                // File deleted, or pointer converted to non-pointer
-                ('D', Some(_), _) | ('M' | 'T', Some(_), None) => ChangeKind::Deleted,
-                // Copy produced a pointer (old path still exists, this is a new pointer)
-                ('C', _, Some(_)) => ChangeKind::Copied,
-                // Rename where bigstore tracking was added
-                ('R', None, Some(_)) => ChangeKind::RenamedAdded,
-                // Rename where bigstore tracking was removed
-                ('R', Some(_), None) => ChangeKind::RenamedDeleted,
-                // Pure rename (same content hash)
-                ('R', _, _)
-                    if old_pointer.as_ref().map(|p| &p.hexdigest)
-                        == new_pointer.as_ref().map(|p| &p.hexdigest) =>
-                {
-                    ChangeKind::Renamed
-                }
-                // Everything else: content change
-                _ => ChangeKind::Modified,
-            };
-
-            changes.push(LogChange {
-                kind,
-                path: new_path.to_string(),
-                old_path: old_path.map(String::from),
-                old_pointer,
-                new_pointer,
-            });
-        }
-
-        if changes.is_empty() {
-            continue;
-        }
-
-        // Get commit metadata
-        let meta_output = Command::new("git")
-            .args(["log", "-1", "--format=%h %ai %s", commit])
-            .output()?;
-        let meta = String::from_utf8_lossy(&meta_output.stdout)
-            .trim()
-            .to_string();
-
-        if found_any {
-            println!();
-        }
-        println!("  {meta}");
-
-        for c in &changes {
-            let symbol = match c.kind {
-                ChangeKind::Added | ChangeKind::RenamedAdded => "+",
-                ChangeKind::Deleted | ChangeKind::RenamedDeleted => "-",
-                ChangeKind::Modified => "~",
-                ChangeKind::Renamed => "R",
-                ChangeKind::Copied => "C",
-            };
-
-            match c.kind {
-                ChangeKind::Added => {
-                    if let Some(p) = &c.new_pointer {
-                        println!(
-                            "    {symbol} {}  {}:{}",
-                            c.path,
-                            p.hash_fn,
-                            short_hash(&p.hexdigest)
-                        );
-                    }
-                }
-                ChangeKind::Deleted => {
-                    if let Some(p) = &c.old_pointer {
-                        println!(
-                            "    {symbol} {}  {}:{}",
-                            c.path,
-                            p.hash_fn,
-                            short_hash(&p.hexdigest)
-                        );
-                    }
-                }
-                ChangeKind::RenamedAdded | ChangeKind::Copied => {
-                    let old = c.old_path.as_deref().unwrap_or("?");
-                    if let Some(p) = &c.new_pointer {
-                        println!(
-                            "    {symbol} {old} -> {}  {}:{}",
-                            c.path,
-                            p.hash_fn,
-                            short_hash(&p.hexdigest)
-                        );
-                    }
-                }
-                ChangeKind::RenamedDeleted => {
-                    let old = c.old_path.as_deref().unwrap_or("?");
-                    if let Some(p) = &c.old_pointer {
-                        println!(
-                            "    {symbol} {old} -> {}  {}:{}",
-                            c.path,
-                            p.hash_fn,
-                            short_hash(&p.hexdigest)
-                        );
-                    }
-                }
-                ChangeKind::Modified => {
-                    let old_desc = c
-                        .old_pointer
-                        .as_ref()
-                        .map(|p| format!("{}:{}", p.hash_fn, short_hash(&p.hexdigest)))
-                        .unwrap_or_else(|| "(not a pointer)".to_string());
-                    let new_desc = c
-                        .new_pointer
-                        .as_ref()
-                        .map(|p| format!("{}:{}", p.hash_fn, short_hash(&p.hexdigest)))
-                        .unwrap_or_else(|| "(not a pointer)".to_string());
-                    let path_str = if let Some(op) = &c.old_path {
-                        format!("{op} -> {}", c.path)
-                    } else {
-                        c.path.clone()
-                    };
-                    println!("    {symbol} {path_str}  {old_desc} -> {new_desc}");
-                }
-                ChangeKind::Renamed => {
-                    let old = c.old_path.as_deref().unwrap_or("?");
-                    if let Some(p) = &c.new_pointer {
-                        println!(
-                            "    {symbol} {old} -> {}  {}:{}",
-                            c.path,
-                            p.hash_fn,
-                            short_hash(&p.hexdigest)
-                        );
-                    }
-                }
-            }
-        }
-
-        found_any = true;
-    }
-
-    drop(cat_file);
-
-    if !found_any {
-        eprintln!("No bigstore file changes found in history.");
-    }
-
-    Ok(())
-}
-
-// ──────────────────────────────────────────────────
-// git cat-file --batch wrapper
-// ──────────────────────────────────────────────────
-//
-// Single long-lived process for all blob reads during log.
-// Protocol: write "<ref>\n" to stdin, read response from stdout.
-// Response is either:
-//   <sha> blob <size>\n<content>\n   (object found)
-//   <ref> missing\n                  (object not found)
-
-struct CatFileBatch {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    stdout: BufReader<std::process::ChildStdout>,
-}
-
-impl CatFileBatch {
-    fn start() -> Result<Self> {
-        let mut child = Command::new("git")
-            .args(["cat-file", "--batch"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to start git cat-file --batch")?;
-
-        let stdin = child.stdin.take().expect("stdin was piped");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout was piped"));
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout,
-        })
-    }
-
-    /// Read a blob and try to parse it as a bigstore pointer.
-    /// Returns Ok(None) if the blob doesn't exist or isn't a pointer.
-    fn read_pointer(&mut self, rev: &str, path: &str) -> Result<Option<types::Pointer>> {
-        let stdin = self.stdin.as_mut().context("cat-file already closed")?;
-        let ref_spec = format!("{rev}:{path}\n");
-        stdin.write_all(ref_spec.as_bytes())?;
-        stdin.flush()?;
-
-        // Read header line: "<sha> <type> <size>\n" or "<ref> missing\n"
-        let mut header = String::new();
-        self.stdout.read_line(&mut header)?;
-
-        if header.trim_end().ends_with("missing") {
-            return Ok(None);
-        }
-
-        let size: usize = header
-            .trim_end()
-            .rsplit_once(' ')
-            .and_then(|(_, s)| s.parse().ok())
-            .context("failed to parse cat-file header")?;
-
-        // A bigstore pointer is ~81 bytes. `log` walks every changed blob in
-        // history — including large non-bigstore blobs — so read only enough to
-        // recognize a pointer and drain the rest of the blob (+ trailing LF)
-        // without buffering it. This bounds memory to MAX_POINTER_BYTES per blob
-        // while keeping the shared cat-file pipe byte-aligned.
-        let head_len = size.min(MAX_POINTER_BYTES);
-        let mut head = vec![0u8; head_len];
-        std::io::Read::read_exact(&mut self.stdout, &mut head)?;
-        discard_exact(&mut self.stdout, (size + 1) - head_len)?; // remainder + trailing LF
-
-        if size > MAX_POINTER_BYTES {
-            // Too large to be a pointer; pipe is already resynced.
-            return Ok(None);
-        }
-        Ok(types::Pointer::parse(&head).ok().flatten())
-    }
-}
-
-/// Upper bound on a bigstore pointer's size. Real pointers are ~81 bytes; this
-/// leaves generous headroom while capping per-blob memory in `log`.
-const MAX_POINTER_BYTES: usize = 512;
-
-/// Read and discard exactly `n` bytes, keeping a shared pipe byte-aligned
-/// without buffering the skipped data.
-fn discard_exact(reader: &mut impl std::io::Read, mut n: usize) -> Result<()> {
-    let mut scratch = [0u8; 16 * 1024];
-    while n > 0 {
-        let take = n.min(scratch.len());
-        reader.read_exact(&mut scratch[..take])?;
-        n -= take;
-    }
-    Ok(())
-}
-
-impl Drop for CatFileBatch {
-    fn drop(&mut self) {
-        // Close stdin so cat-file sees EOF and exits
-        self.stdin.take();
-        let _ = self.child.wait();
-    }
-}
-
-fn short_hash(hexdigest: &types::Hexdigest) -> String {
-    let s = hexdigest.to_string();
-    if s.len() > 12 {
-        format!("{}..{}", &s[..6], &s[s.len() - 6..])
-    } else {
-        s
-    }
-}
-
-enum ChangeKind {
-    Added,
-    Deleted,
-    Modified,
-    Renamed,
-    RenamedAdded,   // Rename + became a pointer
-    RenamedDeleted, // Rename + stopped being a pointer
-    Copied,         // Copy produced a pointer (source still exists)
-}
-
-struct LogChange {
-    kind: ChangeKind,
-    path: String,
-    old_path: Option<String>,
-    old_pointer: Option<types::Pointer>,
-    new_pointer: Option<types::Pointer>,
-}
-
-fn cmd_ref(source: &str, dest: &str) -> Result<()> {
+fn cmd_ref(source: &RepoPath, dest: &RepoPath) -> Result<()> {
     let repo_root = git::repo_root()?;
-    let git_dir = git::git_dir()?;
+    let git_dir = git::common_dir()?;
 
-    // Reject paths that escape the repository
-    validate_relative_path("source", source)?;
-    validate_relative_path("dest", dest)?;
+    let source_path = source.to_fs_path(&repo_root);
+    let dvc::DvcKind::File {
+        pointer,
+        path: dvc_out_path,
+    } = dvc::parse_dvc_file(&source_path)?
+    else {
+        anyhow::bail!("{source} is a .dir .dvc file — use `git bigstore import-dvc-dir` instead");
+    };
+    let dvc_cache_root = resolve_dvc_cache(&repo_root, &source_path)?;
 
-    let source_path = repo_root.join(source);
-    let (pointer, dvc_out_path) = dvc::parse_dvc_pointer(&source_path)?;
-
-    let dvc_cache_root = resolve_dvc_cache(&source_path)?;
-
-    // Try to import the object from DVC cache into bigstore cache
-    match cache::import_md5_from_dvc_cache(&dvc_cache_root, &git_dir, &pointer.hexdigest)? {
-        cache::DvcImportResult::Imported => {
+    match cache::import_from_dvc_cache(&dvc_cache_root, &git_dir, pointer.hexdigest())? {
+        DvcImportResult::Imported => {
             eprintln!("Imported from DVC cache (verified): {dvc_out_path}");
         }
-        cache::DvcImportResult::AlreadyCached => {
+        DvcImportResult::AlreadyCached => {
             eprintln!("Already in bigstore cache: {dvc_out_path}");
         }
-        cache::DvcImportResult::NotInDvcCache => {
+        DvcImportResult::NotInDvcCache => {
             anyhow::bail!(
                 "object not found in DVC cache at {}\n\
                  Run `dvc pull {source}` first to populate the DVC cache, then retry.",
-                cache::dvc_cache_path(&dvc_cache_root, &pointer.hexdigest).display()
+                cache::dvc_cache_path(&dvc_cache_root, pointer.hexdigest()).display()
             );
         }
     }
 
-    // Write the pointer file
-    let dest_path = repo_root.join(dest);
-    if let Some(parent) = dest_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&dest_path, pointer.encode())?;
+    // Write the real content; the clean filter turns it into the pointer on `git add`.
+    let cache_path = cache::object_path(&git_dir, pointer.hexdigest());
+    cache::copy_to_worktree(&cache_path, &dest.to_fs_path(&repo_root))?;
 
-    // Restore content from cache so working tree has real data (not pointer text).
-    // The clean filter will convert back to pointer on `git add`.
-    let cache_path = cache::object_path(&git_dir, &pointer.hexdigest, pointer.hash_fn);
-    if cache_path.exists() {
-        cache::copy_to_working_tree(&cache_path, &dest_path)?;
-        eprintln!("Created: {dest} (content restored from cache)");
-    } else {
-        eprintln!("Created pointer: {dest} (run `git bigstore pull` to restore content)");
-    }
-
-    eprintln!("  Source: {source} (md5:{})", pointer.hexdigest);
+    eprintln!("Created: {dest} (content restored from cache)");
+    eprintln!("  Source: {source} (md5:{})", pointer.hexdigest());
     eprintln!();
     eprintln!("Next steps:");
     eprintln!("  1. Ensure {dest} is tracked: echo '{dest} filter=bigstore' >> .gitattributes");
@@ -750,17 +420,15 @@ fn cmd_ref(source: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_dvc_ls(source: &str) -> Result<()> {
-    validate_relative_path("source", source)?;
+fn cmd_dvc_ls(source: &RepoPath) -> Result<()> {
     let repo_root = git::repo_root()?;
-    let source_path = repo_root.join(source);
-    let dvc_cache_root = resolve_dvc_cache(&source_path)?;
-    let (manifest_hash, entries) = resolve_dir_manifest(&dvc_cache_root, &source_path)?;
+    let source_path = source.to_fs_path(&repo_root);
+    let dvc_cache_root = resolve_dvc_cache(&repo_root, &source_path)?;
+    let (manifest, entries) = resolve_dir_manifest(&dvc_cache_root, &source_path)?;
 
     eprintln!(
-        "{} entries in {} (manifest md5:{manifest_hash})",
-        entries.len(),
-        source,
+        "{} entries in {source} (manifest md5:{manifest})",
+        entries.len()
     );
     eprintln!();
     for entry in &entries {
@@ -771,19 +439,17 @@ fn cmd_dvc_ls(source: &str) -> Result<()> {
 }
 
 fn cmd_import_dvc_dir(
-    source: &str,
-    dest_root: &str,
+    source: &RepoPath,
+    dest_root: &RepoPath,
     patterns: &[String],
     force: bool,
 ) -> Result<()> {
-    validate_relative_path("source", source)?;
-    validate_relative_path("dest_root", dest_root)?;
     let repo_root = git::repo_root()?;
-    let git_dir = git::git_dir()?;
+    let git_dir = git::common_dir()?;
 
-    let source_path = repo_root.join(source);
-    let dvc_cache_root = resolve_dvc_cache(&source_path)?;
-    let (_manifest_hash, entries) = resolve_dir_manifest(&dvc_cache_root, &source_path)?;
+    let source_path = source.to_fs_path(&repo_root);
+    let dvc_cache_root = resolve_dvc_cache(&repo_root, &source_path)?;
+    let (_manifest, entries) = resolve_dir_manifest(&dvc_cache_root, &source_path)?;
 
     // Filter entries by patterns (if any)
     let entries = if patterns.is_empty() {
@@ -799,7 +465,7 @@ fn cmd_import_dvc_dir(
             .collect::<Result<_>>()?;
         entries
             .into_iter()
-            .filter(|e| matchers.iter().any(|m| m.is_match(&e.relpath)))
+            .filter(|e| matchers.iter().any(|m| m.is_match(e.relpath.as_str())))
             .collect()
     };
 
@@ -810,68 +476,49 @@ fn cmd_import_dvc_dir(
 
     // Pre-check: fail if any destination exists (unless --force)
     if !force {
-        let mut conflicts = Vec::new();
-        for entry in &entries {
-            let dest = repo_root.join(dest_root).join(&entry.relpath);
-            if dest.exists() {
-                conflicts.push(entry.relpath.clone());
-            }
-        }
+        let conflicts: Vec<RepoPath> = entries
+            .iter()
+            .map(|e| dest_root.join(&e.relpath))
+            .filter(|dest| dest.to_fs_path(&repo_root).exists())
+            .collect();
         if !conflicts.is_empty() {
             eprintln!("Destination files already exist (use --force to overwrite):");
             for c in &conflicts {
-                eprintln!("  {dest_root}/{c}");
+                eprintln!("  {c}");
             }
             anyhow::bail!("{} destination file(s) already exist", conflicts.len());
         }
     }
 
-    // Import each entry
     let mut imported = 0u64;
     let mut cached = 0u64;
-    let mut failed: Vec<(String, String)> = Vec::new();
+    let mut failed: Vec<(&RepoPath, String)> = Vec::new();
 
     for entry in &entries {
-        let hexdigest = &entry.md5;
-        let relpath = &entry.relpath;
-        let dest_path = repo_root.join(dest_root).join(relpath);
-
-        // Import from DVC cache into bigstore cache
-        match cache::import_md5_from_dvc_cache(&dvc_cache_root, &git_dir, hexdigest) {
-            Ok(cache::DvcImportResult::Imported) => imported += 1,
-            Ok(cache::DvcImportResult::AlreadyCached) => cached += 1,
-            Ok(cache::DvcImportResult::NotInDvcCache) => {
+        match cache::import_from_dvc_cache(&dvc_cache_root, &git_dir, &entry.md5) {
+            Ok(DvcImportResult::Imported) => imported += 1,
+            Ok(DvcImportResult::AlreadyCached) => cached += 1,
+            Ok(DvcImportResult::NotInDvcCache) => {
                 failed.push((
-                    relpath.clone(),
+                    &entry.relpath,
                     format!(
                         "not found in DVC cache at {}",
-                        cache::dvc_cache_path(&dvc_cache_root, hexdigest).display()
+                        cache::dvc_cache_path(&dvc_cache_root, &entry.md5).display()
                     ),
                 ));
                 continue;
             }
             Err(e) => {
-                failed.push((relpath.clone(), format!("{e:#}")));
+                failed.push((&entry.relpath, format!("{e:#}")));
                 continue;
             }
         }
 
-        // Write pointer file, then restore content from cache
-        let pointer = types::Pointer::new(types::HashFunction::Md5, hexdigest.clone());
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&dest_path, pointer.encode())?;
-
-        // Restore real content so working tree has data, not pointer text.
-        // The clean filter will convert back to pointer on `git add`.
-        let cache_path = cache::object_path(&git_dir, hexdigest, types::HashFunction::Md5);
-        if cache_path.exists() {
-            cache::copy_to_working_tree(&cache_path, &dest_path)?;
-        }
+        // Write the real content; the clean filter turns it into a pointer on `git add`.
+        let dest = dest_root.join(&entry.relpath).to_fs_path(&repo_root);
+        cache::copy_to_worktree(&cache::object_path(&git_dir, &entry.md5), &dest)?;
     }
 
-    // Summary
     let total = imported + cached;
     eprintln!();
     if imported > 0 {
@@ -880,7 +527,7 @@ fn cmd_import_dvc_dir(
     if cached > 0 {
         eprintln!("{cached} file(s) already in bigstore cache");
     }
-    eprintln!("{total} pointer(s) written under {dest_root}/");
+    eprintln!("{total} file(s) written under {dest_root}/");
 
     if !failed.is_empty() {
         eprintln!();
@@ -908,28 +555,17 @@ fn cmd_import_dvc_dir(
 fn resolve_dir_manifest(
     dvc_cache_root: &Path,
     source_path: &Path,
-) -> Result<(String, Vec<dvc::DirEntry>)> {
-    let kind = dvc::parse_dvc_file(source_path)?;
-    let (manifest_hash, _output_path) = match kind {
-        dvc::DvcKind::Dir {
-            manifest_hash,
-            output_path,
-        } => (manifest_hash, output_path),
-        dvc::DvcKind::File(..) => {
-            anyhow::bail!(
-                "{} is a single-file .dvc — use `git bigstore ref` instead",
-                source_path.display()
-            );
-        }
+) -> Result<(Hexdigest, Vec<dvc::DirEntry>)> {
+    let dvc::DvcKind::Dir { manifest } = dvc::parse_dvc_file(source_path)? else {
+        anyhow::bail!(
+            "{} is a single-file .dvc — use `git bigstore ref` instead",
+            source_path.display()
+        );
     };
 
-    // Find the manifest in DVC cache
-    let manifest_digest = types::Hexdigest::new(&manifest_hash, types::HashFunction::Md5)?;
-    let manifest_path = cache::dvc_cache_path(dvc_cache_root, &manifest_digest);
-
-    // Also try with .dir suffix (some DVC versions store it this way)
+    // DVC stores the manifest either bare or with a .dir suffix.
+    let manifest_path = cache::dvc_cache_path(dvc_cache_root, &manifest);
     let manifest_path_dir = manifest_path.with_extension("dir");
-
     let actual_path = if manifest_path.exists() {
         manifest_path
     } else if manifest_path_dir.exists() {
@@ -945,97 +581,28 @@ fn resolve_dir_manifest(
     };
 
     let entries = dvc::parse_dir_manifest(&actual_path)?;
-    Ok((manifest_hash, entries))
+    Ok((manifest, entries))
 }
 
 /// Find the DVC project root from a .dvc source file and resolve its cache directory.
 /// If no DVC project exists (no `.dvc/` directory), falls back to repo-local `.dvc/cache`.
-fn resolve_dvc_cache(source_path: &Path) -> Result<std::path::PathBuf> {
+fn resolve_dvc_cache(repo_root: &Path, source_path: &Path) -> Result<PathBuf> {
     match cache::find_dvc_project_root(source_path) {
         Some(dvc_root) => cache::resolve_dvc_cache_root(&dvc_root),
-        None => {
-            // No DVC project — use default location relative to repo root.
-            // import_md5_from_dvc_cache will return NotInDvcCache if nothing's there.
-            let repo_root = git::repo_root()?;
-            Ok(repo_root.join(".dvc/cache"))
-        }
+        None => Ok(repo_root.join(".dvc/cache")),
     }
-}
-
-/// Reject absolute paths and path traversal.
-fn validate_relative_path(label: &str, p: &str) -> Result<()> {
-    let path = Path::new(p);
-    anyhow::ensure!(
-        !path.is_absolute(),
-        "{label} must be a relative path: {p:?}"
-    );
-    anyhow::ensure!(
-        !path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir)),
-        "{label} must not contain '..': {p:?}"
-    );
-    Ok(())
 }
 
 /// Resolve concurrency: --jobs flag > BIGSTORE_JOBS env > default (8).
-fn resolve_jobs(flag: Option<usize>) -> Result<usize> {
-    let jobs = match flag {
-        Some(n) => n,
-        None => match std::env::var("BIGSTORE_JOBS") {
-            Ok(s) => s
-                .parse::<usize>()
-                .context("BIGSTORE_JOBS must be a positive integer")?,
-            Err(_) => transfer::DEFAULT_CONCURRENCY,
-        },
-    };
-    anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
-    Ok(jobs)
-}
-
-/// Parse .gitattributes for bigstore filter patterns, then list matching tracked files.
-fn tracked_files(repo_root: &Path, patterns: &[String]) -> Result<Vec<(String, String)>> {
-    let attrs_path = repo_root.join(".gitattributes");
-    let filter_patterns = filter::parse_gitattributes(&attrs_path)?;
-
-    if filter_patterns.is_empty() {
-        anyhow::bail!("no bigstore filters found in .gitattributes");
+fn resolve_jobs(flag: Option<NonZeroUsize>) -> Result<NonZeroUsize> {
+    if let Some(n) = flag {
+        return Ok(n);
     }
-
-    let attr_matchers: Vec<_> = filter_patterns
-        .iter()
-        .map(|(pattern, filter_name)| {
-            let glob = Glob::new(pattern)
-                .with_context(|| format!("invalid pattern in .gitattributes: {pattern:?}"))?;
-            Ok((glob.compile_matcher(), filter_name.clone()))
-        })
-        .collect::<Result<_>>()?;
-
-    let user_matchers: Vec<_> = patterns
-        .iter()
-        .map(|p| {
-            Glob::new(p)
-                .with_context(|| format!("invalid pattern: {p:?}"))
-                .map(|g| g.compile_matcher())
-        })
-        .collect::<Result<_>>()?;
-
-    let output = std::process::Command::new("git")
-        .args(["ls-files"])
-        .output()?;
-    let files = String::from_utf8(output.stdout)?;
-
-    let mut results = Vec::new();
-    for file in files.lines() {
-        for (matcher, filter_name) in &attr_matchers {
-            if matcher.is_match(file)
-                && (user_matchers.is_empty() || user_matchers.iter().any(|m| m.is_match(file)))
-            {
-                results.push((file.to_string(), filter_name.clone()));
-                break;
-            }
-        }
+    match std::env::var("BIGSTORE_JOBS") {
+        Ok(s) => s
+            .parse()
+            .context("BIGSTORE_JOBS must be a positive integer"),
+        Err(_) => Ok(NonZeroUsize::new(transfer::DEFAULT_CONCURRENCY)
+            .expect("default concurrency is non-zero")),
     }
-
-    Ok(results)
 }

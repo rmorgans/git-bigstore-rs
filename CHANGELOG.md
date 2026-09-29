@@ -4,24 +4,92 @@
 
 ### Fixed
 
+- `pull` no longer overwrites uncommitted edits. It fills the cache, then
+  replaces only files that are still the index's pointer, via
+  `git checkout-index`: restored files keep their committed mode (executables
+  stay executable, no more 0600), `git status` is clean afterwards, and missing
+  files (deleted or outside a sparse checkout) are left alone. A fresh clone
+  gets the bigstore filters configured on first `pull`.
+- Files with non-ASCII names were silently never pushed or pulled (`git
+  ls-files` quoted them), and running from a subdirectory acted on the wrong
+  files. Paths are now read NUL-separated and root-relative.
+- Which files bigstore handles is now decided by git (`git check-attr`), so
+  files tracked through nested `.gitattributes` or `.git/info/attributes` are
+  pushed and pulled instead of being silently skipped.
+- One blob that is not a pointer (e.g. committed before its `filter=bigstore`
+  rule) no longer aborts the whole push or pull; `status` reports it as
+  `not a pointer in git (git add --renormalize)`.
+- Content that merely starts like a pointer (first line `bigstore`, or a
+  pointer followed by more data) is now stored as a large file. Previously the
+  clean filter passed it through unchanged and checkout then failed or
+  truncated it. A single rule (`Pointer::parse`) now decides pointer vs content
+  for both filters, the index and the working tree.
+- `push` fails for an object that is neither on the remote nor in the local
+  cache, instead of exiting 0 and leaving a committed pointer with no content
+  anywhere.
+- The object cache lives in the common git directory, so linked worktrees
+  share it; a commit made in one worktree can be checked out in another.
+  Objects an older version cached from inside a linked worktree
+  (`.git/worktrees/<name>/bigstore/objects`) are no longer read: already
+  pushed ones are simply re-downloaded; for unpushed ones, move that
+  directory's contents into `.git/bigstore/objects` (or run
+  `git add --renormalize <path>` in that worktree), then push.
+- A pull whose checkout fails part-way (e.g. an unreadable cache object) puts
+  the affected pointer files back and reports them; the other files are still
+  checked out and the index blobs are never changed. A pull that is killed
+  (Ctrl-C, SIGKILL) leaves a journal in the worktree's git directory, and the
+  next pull repairs exactly the files it had touched — files the user deleted
+  stay deleted. Pull never replaces a file that appears at a path while it
+  runs.
+- Known limitation, unchanged: files whose committed pointer is md5 (DVC
+  imports) can show as modified after git re-checks their timestamps, because
+  the clean filter always produces sha256. `git add --renormalize <path>`
+  converts them.
+- Files outside a sparse checkout (skip-worktree) are no longer downloaded;
+  `status` shows them as `outside sparse checkout`.
+- `status --verify` repair advice names the corrupted object files instead of
+  suggesting deleting the whole cache (via a path that is wrong in linked
+  worktrees).
+- `ref` and `import-dvc-dir` write files with normal permissions (0666 minus
+  umask) and no longer write a pointer only to overwrite it.
+- Pull and push transfer each object once, however many paths share it, and
+  hash DVC-cache imports off the async runtime.
+- A failed large (multipart) upload is now aborted instead of leaving billed
+  incomplete parts in the bucket.
+- `local://` backends create the storage directory on first use.
+- rclone backend: `exists` no longer reports auth, network or config failures
+  as "not found"; rclone runs asynchronously (so `--jobs` applies), its errors
+  include rclone's stderr, and non-UTF-8 local paths work.
+- LFS adapter: every per-object failure (invalid oid, remote error, request
+  before `init`) is reported as an error `complete` for that object instead of
+  killing the adapter and every queued transfer. Requests are parsed into a
+  typed enum; object keys come from the shared config.
+- `log` shows files with non-ASCII or quoted names (previously dropped), reads
+  pointers by blob id, spawns two git processes per commit fewer, and reports
+  a failing `git diff-tree` instead of skipping the commit.
 - Upload now uses `object_store`'s `BufWriter`, which sizes multipart parts
   correctly (single PUT for small objects, 10 MiB parts above). The previous
   raw `put_part` loop could forward short reads as sub-5 MiB parts and risk an
   `EntityTooSmall` rejection on large files.
 - `log` no longer buffers entire blobs into memory to check the pointer header;
   it reads a bounded header and drains the rest, capping per-blob memory.
-- Invalid globs in `.gitattributes` and in CLI patterns now error instead of
-  silently matching everything (or nothing).
+- Invalid globs in CLI patterns now error instead of silently matching
+  nothing.
 - LFS adapter verifies every transfer against its OID — downloads before
   reporting `complete`, uploads before writing to shared storage (so a corrupt
   upload can't poison the bucket) — writes downloads to a private per-run temp
   dir (no predictable shared path), and cleans up on failure.
-- `Pointer::parse` rejects any trailing non-whitespace content after the digest
-  line, including content that follows a blank line.
 - Push/pull progress bar now advances for skipped and not-found objects.
 
 ### Changed
 
+- Library types carry their invariants: `Hexdigest` includes its hash
+  function (a digest can no longer be paired with the wrong algorithm, and
+  `Pointer::new` cannot panic), `Pointer::parse` is total (`Option`), paths
+  are validated `RepoPath`s, `--jobs` is a `NonZeroUsize`, and CLI paths are
+  validated by the argument parser.
+- The clean/smudge filters and other synchronous commands no longer start an
+  async runtime; only `push` and `pull` do.
 - Core modules (`cache`, `dvc`, `filter`, `git`, `transfer`) moved into the
   library crate; the binary is now a thin CLI shell. Removes duplicated git
   helpers in the LFS adapter and makes the core unit-testable.
