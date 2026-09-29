@@ -2364,6 +2364,58 @@ fn lfs_adapter_rejects_upload_oid_mismatch() {
     );
 }
 
+#[test]
+fn log_shows_non_ascii_paths() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+
+    // git C-quotes non-ASCII paths ("caf\303\251.bin") unless told otherwise.
+    t.write_file("café.bin", b"non-ascii name\n");
+    git(&t.repo_dir, &["add", "café.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add cafe"]);
+    git(&t.repo_dir, &["mv", "café.bin", "naïve.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "rename cafe"]);
+
+    let output = bigstore_ok(&t.repo_dir, &["log"]);
+    assert!(
+        output.contains("+ café.bin  sha256:"),
+        "add of a non-ASCII path missing: {output}"
+    );
+    assert!(
+        output.contains("R café.bin -> naïve.bin  sha256:"),
+        "rename between non-ASCII paths missing: {output}"
+    );
+
+    let filtered = bigstore_ok(&t.repo_dir, &["log", "naïve.bin"]);
+    assert!(
+        filtered.contains("R café.bin -> naïve.bin"),
+        "path filter must match the unquoted name: {filtered}"
+    );
+}
+
+#[test]
+fn log_shows_paths_with_quotes_and_spaces() {
+    let t = TestRepo::new();
+    t.track("*.bin filter=bigstore\n");
+
+    let name = "say \"hi\" now.bin";
+    t.write_file(name, b"quoted name\n");
+    git(&t.repo_dir, &["add", name]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "add quoted"]);
+    git(&t.repo_dir, &["rm", "-q", name]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "delete quoted"]);
+
+    let output = bigstore_ok(&t.repo_dir, &["log"]);
+    assert!(
+        output.contains(&format!("+ {name}  sha256:")),
+        "add missing: {output}"
+    );
+    assert!(
+        output.contains(&format!("- {name}  sha256:")),
+        "delete missing: {output}"
+    );
+}
+
 /// Parse the adapter's `complete` event for `oid` from its stdout.
 fn lfs_complete_for(stdout: &str, oid: &str) -> serde_json::Value {
     stdout

@@ -1,23 +1,16 @@
 //! `git bigstore log`: file-level history of bigstore pointers.
 
-use anyhow::{Context, Result};
-use globset::Glob;
-use std::process::{Command, Stdio};
+use anyhow::{bail, Context, Result};
+use globset::{Glob, GlobMatcher};
+use std::fmt;
+use std::process::Command;
 
 use crate::catfile::CatFileBatch;
 use crate::git;
-use crate::types;
+use crate::types::{Pointer, RepoPath};
 
 pub fn run(paths: &[String]) -> Result<()> {
-    // Get commit list (first-parent only to avoid merge noise)
-    let rev_output = Command::new("git")
-        .args(["rev-list", "--first-parent", "HEAD"])
-        .output()?;
-    anyhow::ensure!(rev_output.status.success(), "git rev-list failed");
-    let commits = String::from_utf8(rev_output.stdout)?;
-
-    // Optional path filter matchers
-    let path_matchers: Vec<_> = paths
+    let matchers: Vec<GlobMatcher> = paths
         .iter()
         .map(|p| {
             Glob::new(p)
@@ -26,240 +19,43 @@ pub fn run(paths: &[String]) -> Result<()> {
         })
         .collect::<Result<_>>()?;
 
+    // First-parent only to avoid merge noise; merges are diffed against their
+    // first parent.
+    let history = git_stdout(&[
+        "rev-list",
+        "--first-parent",
+        "--format=%P%n%h %ai %s",
+        "HEAD",
+    ])?;
+    let history = String::from_utf8_lossy(&history);
+
     // Single long-lived process for all blob reads
     let mut cat_file = CatFileBatch::start(&git::repo_root()?)?;
     let mut found_any = false;
 
-    for commit in commits.lines() {
-        // Check if this is a root commit (no parents)
-        let parent_check = Command::new("git")
-            .args(["rev-parse", "--verify", &format!("{commit}^")])
-            .stderr(Stdio::null())
-            .output()?;
-        let is_root = !parent_check.status.success();
-
-        // For root commits: diff against empty tree (--root)
-        // For all others (including merges): diff against first parent explicitly
-        let diff_output = if is_root {
-            Command::new("git")
-                .args([
-                    "diff-tree",
-                    "--root",
-                    "-r",
-                    "-M",
-                    "-C",
-                    "--name-status",
-                    commit,
-                ])
-                .output()?
-        } else {
-            let parent = format!("{commit}~1");
-            Command::new("git")
-                .args([
-                    "diff-tree",
-                    "-r",
-                    "-M",
-                    "-C",
-                    "--name-status",
-                    &parent,
-                    commit,
-                ])
-                .output()?
-        };
-        if !diff_output.status.success() {
-            continue;
+    for commit in parse_history(&history)? {
+        let diff = git_stdout(&commit.diff_tree_args())?;
+        let mut changes = Vec::new();
+        for delta in parse_raw_diff(&diff)
+            .with_context(|| format!("reading the diff of commit {}", commit.id))?
+        {
+            if matchers.is_empty() || delta.matches(&matchers) {
+                changes.extend(delta.resolve(&mut cat_file)?);
+            }
         }
-        let diff_text = String::from_utf8_lossy(&diff_output.stdout);
-
-        let mut changes: Vec<LogChange> = Vec::new();
-
-        for line in diff_text.lines() {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let status = parts[0];
-            let (old_path, new_path) = if status.starts_with('R') || status.starts_with('C') {
-                if parts.len() < 3 {
-                    continue;
-                }
-                (Some(parts[1]), parts[2])
-            } else {
-                (None, parts[1])
-            };
-
-            // Path filter
-            if !path_matchers.is_empty() {
-                let matches = path_matchers.iter().any(|m| m.is_match(new_path))
-                    || old_path.is_some_and(|op| path_matchers.iter().any(|m| m.is_match(op)));
-                if !matches {
-                    continue;
-                }
-            }
-
-            let status_char = status.chars().next().unwrap_or('M');
-
-            let new_pointer = if status_char == 'D' {
-                None
-            } else {
-                cat_file.read_pointer(&format!("{commit}:{new_path}"))?
-            };
-
-            let old_pointer = if status_char == 'A' {
-                None
-            } else {
-                let old_ref = format!("{commit}~1");
-                let check_path = old_path.unwrap_or(new_path);
-                cat_file.read_pointer(&format!("{old_ref}:{check_path}"))?
-            };
-
-            if new_pointer.is_none() && old_pointer.is_none() {
-                continue;
-            }
-
-            // For copies, old path still exists — only the new path matters.
-            // If the copy didn't produce a pointer, it's not a bigstore event.
-            if status_char == 'C' && new_pointer.is_none() {
-                continue;
-            }
-
-            let kind = match (status_char, &old_pointer, &new_pointer) {
-                // File added as pointer, or non-pointer converted to pointer
-                ('A', _, Some(_)) | ('M' | 'T', None, Some(_)) => ChangeKind::Added,
-                // File deleted, or pointer converted to non-pointer
-                ('D', Some(_), _) | ('M' | 'T', Some(_), None) => ChangeKind::Deleted,
-                // Copy produced a pointer (old path still exists, this is a new pointer)
-                ('C', _, Some(_)) => ChangeKind::Copied,
-                // Rename where bigstore tracking was added
-                ('R', None, Some(_)) => ChangeKind::RenamedAdded,
-                // Rename where bigstore tracking was removed
-                ('R', Some(_), None) => ChangeKind::RenamedDeleted,
-                // Pure rename (same content hash)
-                ('R', _, _)
-                    if old_pointer.as_ref().map(|p| p.hexdigest())
-                        == new_pointer.as_ref().map(|p| p.hexdigest()) =>
-                {
-                    ChangeKind::Renamed
-                }
-                // Everything else: content change
-                _ => ChangeKind::Modified,
-            };
-
-            changes.push(LogChange {
-                kind,
-                path: new_path.to_string(),
-                old_path: old_path.map(String::from),
-                old_pointer,
-                new_pointer,
-            });
-        }
-
         if changes.is_empty() {
             continue;
         }
 
-        // Get commit metadata
-        let meta_output = Command::new("git")
-            .args(["log", "-1", "--format=%h %ai %s", commit])
-            .output()?;
-        let meta = String::from_utf8_lossy(&meta_output.stdout)
-            .trim()
-            .to_string();
-
         if found_any {
             println!();
         }
-        println!("  {meta}");
-
-        for c in &changes {
-            let symbol = match c.kind {
-                ChangeKind::Added | ChangeKind::RenamedAdded => "+",
-                ChangeKind::Deleted | ChangeKind::RenamedDeleted => "-",
-                ChangeKind::Modified => "~",
-                ChangeKind::Renamed => "R",
-                ChangeKind::Copied => "C",
-            };
-
-            match c.kind {
-                ChangeKind::Added => {
-                    if let Some(p) = &c.new_pointer {
-                        println!(
-                            "    {symbol} {}  {}:{}",
-                            c.path,
-                            p.hash_fn(),
-                            short_hash(p.hexdigest())
-                        );
-                    }
-                }
-                ChangeKind::Deleted => {
-                    if let Some(p) = &c.old_pointer {
-                        println!(
-                            "    {symbol} {}  {}:{}",
-                            c.path,
-                            p.hash_fn(),
-                            short_hash(p.hexdigest())
-                        );
-                    }
-                }
-                ChangeKind::RenamedAdded | ChangeKind::Copied => {
-                    let old = c.old_path.as_deref().unwrap_or("?");
-                    if let Some(p) = &c.new_pointer {
-                        println!(
-                            "    {symbol} {old} -> {}  {}:{}",
-                            c.path,
-                            p.hash_fn(),
-                            short_hash(p.hexdigest())
-                        );
-                    }
-                }
-                ChangeKind::RenamedDeleted => {
-                    let old = c.old_path.as_deref().unwrap_or("?");
-                    if let Some(p) = &c.old_pointer {
-                        println!(
-                            "    {symbol} {old} -> {}  {}:{}",
-                            c.path,
-                            p.hash_fn(),
-                            short_hash(p.hexdigest())
-                        );
-                    }
-                }
-                ChangeKind::Modified => {
-                    let old_desc = c
-                        .old_pointer
-                        .as_ref()
-                        .map(|p| format!("{}:{}", p.hash_fn(), short_hash(p.hexdigest())))
-                        .unwrap_or_else(|| "(not a pointer)".to_string());
-                    let new_desc = c
-                        .new_pointer
-                        .as_ref()
-                        .map(|p| format!("{}:{}", p.hash_fn(), short_hash(p.hexdigest())))
-                        .unwrap_or_else(|| "(not a pointer)".to_string());
-                    let path_str = if let Some(op) = &c.old_path {
-                        format!("{op} -> {}", c.path)
-                    } else {
-                        c.path.clone()
-                    };
-                    println!("    {symbol} {path_str}  {old_desc} -> {new_desc}");
-                }
-                ChangeKind::Renamed => {
-                    let old = c.old_path.as_deref().unwrap_or("?");
-                    if let Some(p) = &c.new_pointer {
-                        println!(
-                            "    {symbol} {old} -> {}  {}:{}",
-                            c.path,
-                            p.hash_fn(),
-                            short_hash(p.hexdigest())
-                        );
-                    }
-                }
-            }
+        println!("  {}", commit.summary);
+        for change in &changes {
+            println!("    {change}");
         }
-
         found_any = true;
     }
-
-    drop(cat_file);
 
     if !found_any {
         eprintln!("No bigstore file changes found in history.");
@@ -268,29 +64,308 @@ pub fn run(paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn short_hash(hexdigest: &types::Hexdigest) -> String {
-    let s = hexdigest.to_string();
-    if s.len() > 12 {
-        format!("{}..{}", &s[..6], &s[s.len() - 6..])
-    } else {
-        s
+fn git_stdout(args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .context("failed to run git")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+struct Commit<'a> {
+    id: &'a str,
+    /// `None` for a root commit, which is diffed against the empty tree.
+    first_parent: Option<&'a str>,
+    /// `<short hash> <date> <subject>`
+    summary: &'a str,
+}
+
+impl<'a> Commit<'a> {
+    fn diff_tree_args(&self) -> Vec<&'a str> {
+        let mut args = vec![
+            "diff-tree",
+            "-r",
+            "-M",
+            "-C",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--no-commit-id",
+        ];
+        match self.first_parent {
+            Some(parent) => args.extend([parent, self.id]),
+            None => args.extend(["--root", self.id]),
+        }
+        args
     }
 }
 
-enum ChangeKind {
-    Added,
-    Deleted,
-    Modified,
-    Renamed,
-    RenamedAdded,   // Rename + became a pointer
-    RenamedDeleted, // Rename + stopped being a pointer
-    Copied,         // Copy produced a pointer (source still exists)
+/// Parse `git rev-list --format=%P%n%h %ai %s`: per commit a `commit <id>`
+/// header, the parent ids, and the summary (`%s` is always a single line).
+fn parse_history(text: &str) -> Result<Vec<Commit<'_>>> {
+    let mut lines = text.lines();
+    let mut commits = Vec::new();
+    while let Some(header) = lines.next() {
+        let id = header
+            .strip_prefix("commit ")
+            .with_context(|| format!("unexpected git rev-list output: {header:?}"))?;
+        let (Some(parents), Some(summary)) = (lines.next(), lines.next()) else {
+            bail!("git rev-list output ends inside commit {id}");
+        };
+        commits.push(Commit {
+            id,
+            first_parent: parents.split(' ').next().filter(|p| !p.is_empty()),
+            summary: summary.trim(),
+        });
+    }
+    Ok(commits)
 }
 
-struct LogChange {
-    kind: ChangeKind,
-    path: String,
-    old_path: Option<String>,
-    old_pointer: Option<types::Pointer>,
-    new_pointer: Option<types::Pointer>,
+/// One record of `git diff-tree --raw -z`: what happened to which path(s),
+/// with the blob id of each side that exists.
+enum Delta<'a> {
+    Added {
+        path: RepoPath,
+        blob: &'a str,
+    },
+    Deleted {
+        path: RepoPath,
+        blob: &'a str,
+    },
+    /// Content or type change in place.
+    Modified {
+        path: RepoPath,
+        old_blob: &'a str,
+        new_blob: &'a str,
+    },
+    Renamed {
+        from: RepoPath,
+        to: RepoPath,
+        old_blob: &'a str,
+        new_blob: &'a str,
+    },
+    /// The source still exists, so only the new blob matters.
+    Copied {
+        from: RepoPath,
+        to: RepoPath,
+        blob: &'a str,
+    },
+}
+
+/// Parse `git diff-tree --raw -z` output. Each record is
+/// `:<old mode> <new mode> <old id> <new id> <status>\0<path>\0`, with a
+/// second path (the destination) for renames and copies. Paths are raw bytes,
+/// never C-quoted.
+fn parse_raw_diff(out: &[u8]) -> Result<Vec<Delta<'_>>> {
+    let Some(body) = out.strip_suffix(b"\0") else {
+        anyhow::ensure!(out.is_empty(), "diff-tree output is not NUL-terminated");
+        return Ok(Vec::new());
+    };
+    let mut fields = body.split(|&b| b == 0);
+    let mut deltas = Vec::new();
+    while let Some(record) = fields.next() {
+        let record = std::str::from_utf8(record)
+            .ok()
+            .and_then(|r| r.strip_prefix(':'))
+            .with_context(|| {
+                format!(
+                    "unexpected diff-tree record: {:?}",
+                    String::from_utf8_lossy(record)
+                )
+            })?;
+        let mut parts = record.split(' ');
+        let (Some(_), Some(_), Some(old_blob), Some(new_blob), Some(status), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            bail!("unexpected diff-tree record: {record:?}");
+        };
+        let mut path = || -> Result<RepoPath> {
+            RepoPath::from_git_bytes(fields.next().context("diff-tree record has no path")?)
+        };
+        deltas.push(match status.as_bytes().first() {
+            Some(b'A') => Delta::Added {
+                path: path()?,
+                blob: new_blob,
+            },
+            Some(b'D') => Delta::Deleted {
+                path: path()?,
+                blob: old_blob,
+            },
+            Some(b'M' | b'T') => Delta::Modified {
+                path: path()?,
+                old_blob,
+                new_blob,
+            },
+            Some(b'R') => Delta::Renamed {
+                from: path()?,
+                to: path()?,
+                old_blob,
+                new_blob,
+            },
+            Some(b'C') => Delta::Copied {
+                from: path()?,
+                to: path()?,
+                blob: new_blob,
+            },
+            _ => bail!("unexpected diff-tree status in record: {record:?}"),
+        });
+    }
+    Ok(deltas)
+}
+
+impl Delta<'_> {
+    fn matches(&self, matchers: &[GlobMatcher]) -> bool {
+        let is_match = |p: &RepoPath| matchers.iter().any(|m| m.is_match(p.as_str()));
+        match self {
+            Self::Added { path, .. } | Self::Deleted { path, .. } | Self::Modified { path, .. } => {
+                is_match(path)
+            }
+            Self::Renamed { from, to, .. } | Self::Copied { from, to, .. } => {
+                is_match(from) || is_match(to)
+            }
+        }
+    }
+
+    /// Read the pointers on each side; `None` when neither side is a pointer.
+    fn resolve(self, cat_file: &mut CatFileBatch) -> Result<Option<Change>> {
+        let mut read = |blob: &str| cat_file.read_pointer(blob);
+        Ok(match self {
+            Self::Added { path, blob } => {
+                read(blob)?.map(|pointer| Change::Added { path, pointer })
+            }
+            Self::Deleted { path, blob } => {
+                read(blob)?.map(|pointer| Change::Deleted { path, pointer })
+            }
+            Self::Modified {
+                path,
+                old_blob,
+                new_blob,
+            } => match (read(old_blob)?, read(new_blob)?) {
+                (None, None) => None,
+                // Non-pointer converted to a pointer
+                (None, Some(pointer)) => Some(Change::Added { path, pointer }),
+                // Pointer converted to a non-pointer
+                (Some(pointer), None) => Some(Change::Deleted { path, pointer }),
+                (Some(old), Some(new)) => Some(Change::Modified { path, old, new }),
+            },
+            Self::Renamed {
+                from,
+                to,
+                old_blob,
+                new_blob,
+            } => match (read(old_blob)?, read(new_blob)?) {
+                (None, None) => None,
+                (None, Some(pointer)) => Some(Change::RenamedAdded { from, to, pointer }),
+                (Some(pointer), None) => Some(Change::RenamedDeleted { from, to, pointer }),
+                (Some(old), Some(new)) if old == new => Some(Change::Renamed {
+                    from,
+                    to,
+                    pointer: new,
+                }),
+                (Some(old), Some(new)) => Some(Change::RenamedModified { from, to, old, new }),
+            },
+            Self::Copied { from, to, blob } => {
+                read(blob)?.map(|pointer| Change::Copied { from, to, pointer })
+            }
+        })
+    }
+}
+
+/// A bigstore event, carrying exactly the data its log line shows.
+enum Change {
+    /// `+ path`: pointer added, or a non-pointer became one.
+    Added { path: RepoPath, pointer: Pointer },
+    /// `- path`: pointer deleted, or it became a non-pointer.
+    Deleted { path: RepoPath, pointer: Pointer },
+    /// `~ path  old -> new`
+    Modified {
+        path: RepoPath,
+        old: Pointer,
+        new: Pointer,
+    },
+    /// `R from -> to`: same pointer under a new path.
+    Renamed {
+        from: RepoPath,
+        to: RepoPath,
+        pointer: Pointer,
+    },
+    /// `~ from -> to  old -> new`: renamed and its pointer changed.
+    RenamedModified {
+        from: RepoPath,
+        to: RepoPath,
+        old: Pointer,
+        new: Pointer,
+    },
+    /// `+ from -> to`: renamed and became a pointer.
+    RenamedAdded {
+        from: RepoPath,
+        to: RepoPath,
+        pointer: Pointer,
+    },
+    /// `- from -> to`: renamed and stopped being a pointer.
+    RenamedDeleted {
+        from: RepoPath,
+        to: RepoPath,
+        pointer: Pointer,
+    },
+    /// `C from -> to`: copy produced a pointer (the source still exists).
+    Copied {
+        from: RepoPath,
+        to: RepoPath,
+        pointer: Pointer,
+    },
+}
+
+impl fmt::Display for Change {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Added { path, pointer } => write!(f, "+ {path}  {}", Short(pointer)),
+            Self::Deleted { path, pointer } => write!(f, "- {path}  {}", Short(pointer)),
+            Self::Modified { path, old, new } => {
+                write!(f, "~ {path}  {} -> {}", Short(old), Short(new))
+            }
+            Self::Renamed { from, to, pointer } => {
+                write!(f, "R {from} -> {to}  {}", Short(pointer))
+            }
+            Self::RenamedModified { from, to, old, new } => {
+                write!(f, "~ {from} -> {to}  {} -> {}", Short(old), Short(new))
+            }
+            Self::RenamedAdded { from, to, pointer } => {
+                write!(f, "+ {from} -> {to}  {}", Short(pointer))
+            }
+            Self::RenamedDeleted { from, to, pointer } => {
+                write!(f, "- {from} -> {to}  {}", Short(pointer))
+            }
+            Self::Copied { from, to, pointer } => {
+                write!(f, "C {from} -> {to}  {}", Short(pointer))
+            }
+        }
+    }
+}
+
+/// `<hash fn>:<first 6>..<last 6>`; digests are always longer than 12 hex chars.
+struct Short<'a>(&'a Pointer);
+
+impl fmt::Display for Short<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hex = self.0.hexdigest().to_string();
+        write!(
+            f,
+            "{}:{}..{}",
+            self.0.hash_fn(),
+            &hex[..6],
+            &hex[hex.len() - 6..]
+        )
+    }
 }
