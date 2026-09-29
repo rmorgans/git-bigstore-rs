@@ -2,7 +2,7 @@ pub(crate) mod rclone;
 pub mod store;
 
 use anyhow::Result;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::path::Path;
 use std::sync::Arc;
 

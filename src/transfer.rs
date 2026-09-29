@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use futures::stream::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use object_store::ObjectStoreExt;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
