@@ -1849,3 +1849,57 @@ fn names_differing_only_by_normalization_or_unicode_case_are_refused() {
     let pointer = dvc_pushed_dir(&e, &[(nfc, b"1"), ("cafe.txt", b"2")]);
     folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap();
 }
+
+#[test]
+fn pull_restores_from_a_dvc_file_with_stage_fields_and_types_unreadable_ones() {
+    // `dvc import-url` writes deps, frozen and a stage md5; `dvc add --desc`
+    // writes annotations. Pull only reads the output, so both restore.
+    let e = env();
+    let plain = dvc_pushed_dir(&e, &[("a.txt", b"a"), ("b/c.txt", b"c")]);
+    let DvcOutput::Dir { manifest, .. } = DvcPointer::load(&plain).unwrap().output else {
+        panic!("a directory pointer")
+    };
+    std::fs::remove_file(&plain).unwrap();
+    for (fixture, dir) in [
+        ("imported_dir.dvc", "5b94ef7ba4840901cc23311660411a1d"),
+        ("annotated.dvc", "c1aa8378201c5b38b6b109d77fbf79bc"),
+    ] {
+        let text = std::fs::read_to_string(format!("{GOLDEN}/stage_fields/{fixture}")).unwrap();
+        let name = fixture.trim_end_matches(".dvc");
+        let text = text.replace(dir, &manifest.to_string());
+        let dvc = e.data.join(fixture);
+        write(&dvc, text.as_bytes());
+        let r = folder::pull(
+            &e.remote,
+            &PointerSource::File(dvc.clone()),
+            &pull_opts(None),
+        )
+        .unwrap_or_else(|err| panic!("{fixture}: {err:#}"));
+        assert_eq!(r.written, 2, "{fixture}");
+        assert_eq!(
+            std::fs::read(e.data.join(name).join("b/c.txt")).unwrap(),
+            b"c"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dvc).unwrap(),
+            text,
+            "pull rewrote it"
+        );
+    }
+
+    // What names no md5-addressed output is refused, typed.
+    for fixture in ["uncached.bin.dvc", "etag_only.bin.dvc"] {
+        let dvc = e.data.join(fixture);
+        std::fs::copy(format!("{GOLDEN}/stage_fields/{fixture}"), &dvc).unwrap();
+        let err = folder::pull(
+            &e.remote,
+            &PointerSource::File(dvc.clone()),
+            &pull_opts(None),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused(&err),
+            (dvc.as_path(), &Refusal::UnrestorablePointer)
+        );
+    }
+}

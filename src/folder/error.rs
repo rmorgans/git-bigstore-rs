@@ -107,6 +107,12 @@ pub enum Refusal {
     SpecialFile,
 
     // Pull.
+    /// The `.dvc` file is not a DVC 3 pointer to one md5-addressed output
+    /// (not YAML, several outputs, `cache: false`, an etag-only cloud
+    /// output, a `wdir:`…), so there is nothing to restore. Stage fields
+    /// and annotations are fine. The parse error is the next error in the
+    /// chain.
+    UnrestorablePointer,
     /// The `.dvc` file names an output that is not one file or directory
     /// name on this OS (`..`, an absolute path, `a/b`), so it could restore
     /// outside its own directory.
@@ -217,6 +223,10 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
         ),
         Refusal::BrokenSymlink => write!(f, "{p}: broken symlink"),
         Refusal::SpecialFile => write!(f, "{p}: not a regular file"),
+        Refusal::UnrestorablePointer => write!(
+            f,
+            "{p} is not a DVC 3 pointer to one md5-addressed output; nothing to restore"
+        ),
         Refusal::PointerPathEscapes { output } => write!(
             f,
             "{p} names its output {output:?}, which is not a single file or directory \

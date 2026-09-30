@@ -121,6 +121,12 @@
   fetches records that many at a time (`folder log -j`). A record whose
   pointer is not the version its name says is refused as a bad record, and
   a malformed `--at` is refused before the remote is contacted.
+- **`folder pull` reads any single-output DVC 3 `.dvc`**, ignoring stage
+  fields and annotations (`dvc import-url`'s `deps`/`frozen`/`md5`,
+  `dvc add --desc`), since it never rewrites the file; before, it refused
+  them ("has fields bigstore does not write"). A `.dvc` with nothing to
+  restore (`cache: false`, etag-only, several outputs, `wdir:`) is now the
+  typed `Refusal::UnrestorablePointer`, the parse error below it.
 
 ### Fixed
 

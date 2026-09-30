@@ -875,7 +875,15 @@ async fn pull_async(
 ) -> Result<PullReport> {
     let (pointer, default_into) = match source {
         PointerSource::File(path) => {
-            let pointer = DvcPointer::load(path)?;
+            // Pull never rewrites the .dvc, so stage fields and annotations
+            // (`dvc import-url`, `dvc add --desc`) do not matter. A missing
+            // file is an I/O error, not a refusal.
+            std::fs::metadata(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let pointer = DvcPointer::load_lenient(path).with_context(|| Error::Refused {
+                path: path.clone(),
+                reason: Refusal::UnrestorablePointer,
+            })?;
             let into = pointer_output(path, &pointer)?;
             (pointer, Some(into))
         }
