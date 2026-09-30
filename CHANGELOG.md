@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Async folder API**: `bigstore::folder::{push_async, status_async,
+  pull_async, log_async, keys_async}` take the same arguments and return the
+  same results as the blocking functions, on the caller's tokio runtime
+  (I/O and time drivers enabled; `current_thread` or `multi_thread`). Their
+  futures are `Send`, so they can be `tokio::spawn`ed with owned arguments.
+  Walking, snapshotting, hashing, `.dvc` reads and writes, pull's
+  classification and placing, and snapshot cleanup run on the blocking pool,
+  never on the thread polling the future. Dropping a future stops the
+  hashing it started at the next file. The blocking functions are now thin
+  wrappers over these; the CLI still uses them.
+
+### Changed
+
+- A blocking `bigstore::folder` function called inside a tokio runtime
+  still returns an error, which now names the async function to await
+  instead (`… await bigstore::folder::push_async instead`).
+
 ## 0.2.0 — 2026-09-30
 
 ### Added
