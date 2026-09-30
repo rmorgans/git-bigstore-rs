@@ -57,9 +57,13 @@ already built on ring (the folder-mode library, S3 only):
 bigstore = { package = "git-bigstore-rs", git = "…", rev = "…", default-features = false, features = ["ring"] }
 ```
 
-With `ring`, bigstore installs ring as the process's default rustls
-`CryptoProvider` when it builds its first cloud client, unless the
-application installed one already.
+With `ring` (and not `aws-lc-rs`), bigstore installs ring as the process's
+default rustls `CryptoProvider` when it builds its first cloud client
+(in folder mode, `Remote::open` of an `s3://` remote), unless the
+application installed one already. An application that installs its own
+provider must do so before that call: afterwards a default is set, so its
+`CryptoProvider::install_default()` returns `Err`, and the usual
+`.expect(…)` on it panics.
 
 ## Quick start
 
