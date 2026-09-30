@@ -58,6 +58,10 @@
   outside the pointer's directory. `path` must now be one name this OS can
   write (as push writes); anything else is refused, naming the value and the
   `.dvc` file, before anything is written.
+- `folder pull` of a directory output followed a symlink at the output root
+  (`out -> elsewhere` committed beside `out.dvc`) and wrote there. A
+  symlinked output root is now refused, like any symlinked directory below
+  it and like `folder push` already did.
 - One blob that is not a pointer (e.g. committed before its `filter=bigstore`
   rule) no longer aborts the whole push or pull; `status` reports it as
   `not a pointer in git (git add --renormalize)`.

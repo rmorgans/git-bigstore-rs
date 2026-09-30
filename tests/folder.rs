@@ -776,6 +776,34 @@ fn pull_never_writes_through_a_symlinked_directory_or_over_a_non_file() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn pull_refuses_a_directory_output_that_is_a_symlink() {
+    // A hostile checkout: `out.dvc` beside a committed symlink `out ->
+    // elsewhere`. Pulling must not follow it, from the pointer or `into`.
+    let e = env();
+    let w = writer_dir(&e);
+    let report = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let root = e.data.parent().unwrap();
+    let outside = root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::remove_dir_all(&w).unwrap();
+    std::os::unix::fs::symlink(&outside, &w).unwrap();
+
+    for into in [None, Some(w.clone())] {
+        let err = folder::pull(
+            &e.remote,
+            &PointerSource::File(report.pointer_path.clone()),
+            &pull_opts(into),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is a symlink"), "{msg}");
+        assert!(msg.contains(&w.display().to_string()), "{msg}");
+        assert!(tree(&outside).is_empty(), "nothing written outside");
+    }
+}
+
 #[test]
 fn names_differing_only_by_case_are_refused_before_writing() {
     let e = env();

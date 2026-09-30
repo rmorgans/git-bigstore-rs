@@ -714,6 +714,15 @@ async fn pull_async(
 
     let targets: Vec<(PathBuf, Hexdigest)> = match &pointer.output {
         DvcOutput::Dir { manifest, .. } => {
+            // The output root itself, like every directory below it, must
+            // not redirect writes (a committed `out -> elsewhere` beside
+            // `out.dvc`). A file output's symlink is refused per target.
+            if std::fs::symlink_metadata(&into).is_ok_and(|m| m.file_type().is_symlink()) {
+                anyhow::bail!(
+                    "{} is a symlink; refusing to write through it",
+                    into.display()
+                );
+            }
             let raw = backend::get_bytes(
                 &remote.backend,
                 &remote.manifest_key(manifest),
