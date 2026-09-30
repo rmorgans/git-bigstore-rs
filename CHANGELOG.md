@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **Archived objects are a typed error.** A read the store refuses with
+  S3's `InvalidObjectState` (an object in GLACIER or DEEP_ARCHIVE that was
+  not restored) fails with `bigstore::backend::Error::Archived { key }`,
+  and in folder mode with the new `bigstore::folder::Error::Archived { key }`
+  (pull, log, and the history reads of push and status). Any other 403
+  stays the permission error it was. object_store exposes neither S3's
+  error code nor the storage class as data, so the code is read from the
+  error response it reports.
+
 ### Changed
 
 - **Breaking (library): `bigstore::backend::Store`** replaces the `Backend`
@@ -17,6 +28,13 @@
   `download_verified`. `transfer::Remote::store` is now a `&Store`.
 - rclone remotes are listed with `rclone lsjson` instead of `rclone lsf`,
   for object sizes and times; the keys listed are unchanged.
+
+### Fixed
+
+- A read whose body ends before the object's length now fails with
+  `incomplete download of <key> (<got>/<expected> bytes)`. Before, a small
+  object (a `.dir` manifest or history record) was returned truncated, and
+  a download failed only as an integrity check.
 
 ## 0.2.1 — 2026-09-30
 

@@ -3,6 +3,8 @@
 
 pub(crate) mod rclone;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -40,6 +42,31 @@ pub struct Listed {
     pub size: u64,
     pub modified: DateTime<Utc>,
 }
+
+/// A failure a caller may want to handle by kind, found with
+/// `err.downcast_ref::<backend::Error>()`. Anything else a [`Store`] fails
+/// with is a plain [`anyhow::Error`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// `key` is in an archive storage class (S3 GLACIER or DEEP_ARCHIVE)
+    /// and was not restored, so it cannot be read: the store answered
+    /// `InvalidObjectState`. Restore it, then read again.
+    Archived { key: String },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Archived { key } => write!(
+                f,
+                "{key} is archived (InvalidObjectState): restore it before reading it"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl Store {
     /// The store `cfg` names.
@@ -91,10 +118,13 @@ impl Store {
                 let result = match store.get(&object_store::path::Path::from(key)).await {
                     Ok(r) => r,
                     Err(object_store::Error::NotFound { .. }) => return Ok(None),
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(read_error(key, e)),
                 };
                 check_limit(key, result.meta.size, limit)?;
-                Ok(Some(result.bytes().await?.to_vec()))
+                let length = result.range.end - result.range.start;
+                let bytes = result.bytes().await?;
+                check_complete(key, bytes.len() as u64, length)?;
+                Ok(Some(bytes.to_vec()))
             }
             Transport::Rclone(r) => {
                 let Some(meta) = r.stat(key).await? else {
@@ -180,14 +210,18 @@ impl Store {
             Transport::ObjectStore(store) => {
                 use futures::StreamExt;
                 use std::io::Write;
-                let mut stream = store
+                let result = store
                     .get(&object_store::path::Path::from(key))
-                    .await?
-                    .into_stream();
+                    .await
+                    .map_err(|e| read_error(key, e))?;
+                let length = result.range.end - result.range.start;
+                let mut stream = result.into_stream();
                 // The file and hasher go to the blocking pool with each chunk.
                 let mut state = (tmp, Hasher::new(hash_fn));
+                let mut got = 0;
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk?;
+                    got += chunk.len() as u64;
                     state = blocking(move || {
                         let (mut tmp, mut hasher) = state;
                         hasher.update(&chunk);
@@ -196,6 +230,7 @@ impl Store {
                     })
                     .await?;
                 }
+                check_complete(key, got, length)?;
                 let (tmp, hasher) = state;
                 (tmp, hasher.finalize())
             }
@@ -222,6 +257,45 @@ fn check_limit(key: &str, size: u64, limit: u64) -> Result<()> {
         "{key} is {size} bytes, over the {limit}-byte limit"
     );
     Ok(())
+}
+
+/// A body that ended before the object's length: cut short in transit, or
+/// a store that sends less than it says it holds. Not [`Error::Archived`]:
+/// only the store's own answer says that.
+fn check_complete(key: &str, got: u64, length: u64) -> Result<()> {
+    anyhow::ensure!(
+        got >= length,
+        "incomplete download of {key} ({got}/{length} bytes)"
+    );
+    Ok(())
+}
+
+/// `err`, from a GET of `key`, as [`Error::Archived`] if the store answered
+/// with S3's `InvalidObjectState` error code, otherwise unchanged. A 403
+/// alone is not enough: it is usually a permission failure. object_store
+/// keeps S3's error code only in the error's message (the response body),
+/// so that is where it is read from.
+fn read_error(key: &str, err: object_store::Error) -> anyhow::Error {
+    if s3_error_code(&err).as_deref() == Some("InvalidObjectState") {
+        return Error::Archived { key: key.into() }.into();
+    }
+    err.into()
+}
+
+/// The `<Code>` of the first S3 error response in `err`'s chain.
+fn s3_error_code(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut next = Some(err);
+    while let Some(e) = next {
+        let text = e.to_string();
+        let code = text
+            .split_once("<Code>")
+            .and_then(|(_, rest)| rest.split_once("</Code>"));
+        if let Some((code, _)) = code {
+            return Some(code.to_owned());
+        }
+        next = e.source();
+    }
+    None
 }
 
 /// Run blocking filesystem or CPU work on tokio's blocking pool, so it never
@@ -528,5 +602,68 @@ mod tests {
             store.inner.head(&path).await,
             Err(object_store::Error::NotFound { .. })
         ));
+    }
+
+    const KEY: &str = "files/md5/ab/cdef";
+    const BODY: &[u8] = &[7; 64];
+
+    /// A store holding [`BODY`] at [`KEY`] whose reads of it fail with
+    /// `fault`, and the digest `download_verified` expects of it.
+    async fn faulty(fault: testing::Fault) -> (Store, Hexdigest) {
+        let store = Store::from_object_store(Arc::new(testing::FaultStore::new("files/", fault)));
+        store.put(KEY, BODY.to_vec()).await.unwrap();
+        let mut hasher = crate::hash::Hasher::new(crate::types::HashFunction::Md5);
+        hasher.update(BODY);
+        (store, hasher.finalize())
+    }
+
+    /// `get` and `download_verified` of [`KEY`], both failing.
+    async fn read_errors(store: &Store, md5: &Hexdigest) -> [anyhow::Error; 2] {
+        let dir = tempfile::tempdir().unwrap();
+        [
+            store.get(KEY, 1 << 20).await.unwrap_err(),
+            store
+                .download_verified(KEY, md5, dir.path())
+                .await
+                .unwrap_err(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_read_the_store_refuses_as_invalid_object_state_is_archived() {
+        let (store, md5) = faulty(testing::Fault::Forbidden("InvalidObjectState")).await;
+        for err in read_errors(&store, &md5).await {
+            assert!(
+                matches!(err.downcast_ref::<Error>(), Some(Error::Archived { key }) if key == KEY),
+                "{err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn any_other_403_stays_a_permission_error() {
+        let (store, md5) = faulty(testing::Fault::Forbidden("AccessDenied")).await;
+        for err in read_errors(&store, &md5).await {
+            assert!(err.downcast_ref::<Error>().is_none(), "{err:#}");
+            assert!(
+                matches!(
+                    err.downcast_ref::<object_store::Error>(),
+                    Some(object_store::Error::PermissionDenied { .. })
+                ),
+                "{err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_shorter_than_the_object_is_an_incomplete_download() {
+        let (store, md5) = faulty(testing::Fault::Truncate).await;
+        for err in read_errors(&store, &md5).await {
+            assert!(err.downcast_ref::<Error>().is_none(), "{err:#}");
+            assert_eq!(
+                err.to_string(),
+                format!("incomplete download of {KEY} (32/64 bytes)")
+            );
+        }
     }
 }

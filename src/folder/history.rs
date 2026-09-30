@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
-use super::{block_on, each_in_order, CancelToken, Error, Remote};
+use super::{archived, block_on, each_in_order, CancelToken, Error, Remote};
 use crate::backend;
 use crate::dvc::{DvcOutput, DvcPointer};
 use crate::types::{Hexdigest, PortableRelPath};
@@ -124,7 +124,8 @@ async fn fetch(remote: &Remote, listed: &Listed) -> Result<HistoryRecord> {
     let bytes = remote
         .store
         .get(object, MAX_RECORD_BYTES)
-        .await?
+        .await
+        .map_err(archived)?
         .with_context(|| format!("history record {object} vanished"))?;
     let text = String::from_utf8(bytes).with_context(|| format!("{object} is not UTF-8"))?;
     let pointer = DvcPointer::parse(&text).with_context(|| format!("bad record {object}"))?;
@@ -576,5 +577,63 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(store.take().len(), 1, "no fetch starts once cancelled");
+    }
+
+    #[test]
+    fn reading_an_archived_object_or_record_is_an_archived_error() {
+        use crate::backend::testing::{Fault, FaultStore};
+        let archived = |under| Remote {
+            store: Store::from_object_store(Arc::new(FaultStore::new(
+                under,
+                Fault::Forbidden("InvalidObjectState"),
+            ))),
+            prefix: String::new(),
+        };
+        let archived_key = |err: anyhow::Error| match err.downcast_ref::<Error>() {
+            Some(Error::Archived { key }) => key.clone(),
+            _ => panic!("{err:#}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let tree = dir.path().join("d");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("a"), b"a").unwrap();
+        let d_opts = PushOptions::new(HistoryKey::new("d").unwrap());
+
+        // Objects: a file's content, and a directory's `.dir` manifest.
+        let remote = archived("files/");
+        let pushed = push(&remote, &file, &push_opts()).unwrap();
+        let key =
+            archived_key(pull_from(&remote, Selector::Latest, dir.path().join("o")).unwrap_err());
+        assert_eq!(
+            key,
+            remote.object_key(super::output_id(&pushed.pointer.output))
+        );
+        let pushed = push(&remote, &tree, &d_opts).unwrap();
+        let err = pull(
+            &remote,
+            &PointerSource::File(pushed.pointer_path),
+            &PullOptions {
+                into: Some(dir.path().join("o2")),
+                ..PullOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            archived_key(err),
+            remote.manifest_key(super::output_id(&pushed.pointer.output))
+        );
+
+        // History records.
+        let remote = archived("bigstore-history/");
+        let pushed = push(&remote, &file, &push_opts()).unwrap();
+        let err = log(
+            &remote,
+            &HistoryKey::new("k").unwrap(),
+            &LogOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(Some(archived_key(err)), pushed.history_record);
     }
 }

@@ -72,6 +72,12 @@ pub enum Error {
     /// uploaded stay: they are content-addressed); a pull left every file
     /// either as it was or fully restored, never partly written.
     Cancelled,
+    /// A remote object (`key`: a file, `.dir` manifest or history record)
+    /// is in an archive storage class and was not restored, so it cannot be
+    /// read; the store said so (S3 `InvalidObjectState`). Restore it on the
+    /// remote, then try again. Like any failed download it stops a pull:
+    /// files already restored stay, and none is partly written.
+    Archived { key: String },
 }
 
 /// Why a path was refused.
@@ -201,6 +207,10 @@ impl fmt::Display for Error {
                 f.write_str("pulling from history needs a destination (`into`)")
             }
             Self::Cancelled => f.write_str("cancelled"),
+            Self::Archived { key } => write!(
+                f,
+                "{key} is archived on the remote: restore it, then try again"
+            ),
         }
     }
 }

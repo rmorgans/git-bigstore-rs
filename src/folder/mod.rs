@@ -141,6 +141,15 @@ impl Remote {
     }
 }
 
+/// `err` as [`Error::Archived`] if a read failed because the object is
+/// archived, otherwise unchanged.
+fn archived(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast_ref::<backend::Error>() {
+        Some(backend::Error::Archived { key }) => Error::Archived { key: key.clone() }.into(),
+        _ => err,
+    }
+}
+
 /// Run `fut`, the future of `bigstore::folder::{name}_async`, on a private
 /// runtime for the blocking `name`. Refuses (instead of panicking) when the
 /// caller is already inside a tokio runtime.
@@ -1145,7 +1154,8 @@ pub async fn pull_async(
             let raw = remote
                 .store
                 .get(&remote.manifest_key(manifest), MAX_MANIFEST_BYTES)
-                .await?
+                .await
+                .map_err(archived)?
                 .with_context(|| format!("manifest {manifest}.dir is not on the remote"))?;
             let (root, id) = (into.clone(), manifest.clone());
             backend::blocking(move || manifest_targets(&root, &raw, &id)).await?
@@ -1434,7 +1444,8 @@ async fn fetch_and_place(
         let tmp = remote
             .store
             .download_verified(&remote.object_key(&md5), &md5, &long_path(dir)?)
-            .await?;
+            .await
+            .map_err(archived)?;
         let progress = opts.progress.clone();
         backend::blocking(move || place_all(tmp, &places, mode, &progress)).await
     })

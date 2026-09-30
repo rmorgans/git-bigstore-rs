@@ -742,6 +742,7 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `InvalidHistoryKey { key }` | `HistoryKey::new` of a key that is not a relative `/`-separated path of portable names |
 | `DestinationRequired` | a pull from history without `PullOptions::into` |
 | `Cancelled` | the caller's `CancelToken` was cancelled; a push published no `.dvc` or history record, a pull wrote no partial file |
+| `Archived { key }` | the remote says object `key` (file, `.dir` manifest or history record) is archived and not restored (S3 `InvalidObjectState`); restore it and retry |
 
 | `folder::Refusal` | Refused by | `path` is |
 | --- | --- | --- |
