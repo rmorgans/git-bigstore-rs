@@ -591,6 +591,52 @@ fn cli_works_without_git_on_path() {
     assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1);
 }
 
+/// Bare relative arguments, run from the parent directory: `dataset`'s and
+/// `store.toml.dvc`'s parent is the empty path, which must mean the current
+/// directory (on Windows it once failed after uploading everything).
+#[test]
+fn cli_accepts_bare_relative_paths_in_the_current_directory() {
+    let e = env();
+    writer_dir(&e);
+    let parent = e.data.parent().unwrap();
+    write(&parent.join("store.toml"), b"[store]\nurl = \"x\"\n");
+    let remote = format!("local://{}", e.store.display());
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_git-bigstore"))
+            .args(args)
+            .args(["--remote", &remote])
+            .current_dir(parent)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    run(&["folder", "push", "dataset", "--history", "ds/dir"]);
+    assert!(DvcPointer::load(&parent.join("dataset.dvc")).is_ok());
+    let log = run(&["folder", "log", "ds/dir"]);
+    assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1);
+
+    run(&["folder", "push", "store.toml", "--history", "ds/store"]);
+    std::fs::remove_file(parent.join("store.toml")).unwrap();
+    run(&["folder", "pull", "store.toml.dvc"]);
+    let want = b"[store]\nurl = \"x\"\n";
+    assert_eq!(std::fs::read(parent.join("store.toml")).unwrap(), want);
+
+    run(&[
+        "folder",
+        "pull",
+        "--history",
+        "ds/store",
+        "--into",
+        "out.bin",
+    ]);
+    assert_eq!(std::fs::read(parent.join("out.bin")).unwrap(), want);
+}
+
 /// Open files must be bounded by `--jobs`, not by the number of files: a
 /// launchd service gets 256 descriptors by default. The limit is lowered
 /// for the child process only.

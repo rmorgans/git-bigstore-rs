@@ -382,7 +382,15 @@ impl fmt::Display for PortableRelPath {
 /// that will be persisted must be created in a `long_path` directory and
 /// persisted to a `long_path` destination. Only for I/O: paths shown to
 /// users or returned to callers stay in the caller's form.
+///
+/// The empty path (the parent of a bare file name) means the current
+/// directory.
 pub(crate) fn long_path(path: &Path) -> std::io::Result<std::borrow::Cow<'_, Path>> {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
@@ -506,6 +514,18 @@ mod tests {
             long("rel/dir"),
             format!(r"\\?\{}\rel\dir", cwd.display()).as_str()
         );
+        // `Path::new("data.dvc").parent()` is `""`: the current directory.
+        assert_eq!(long(""), format!(r"\\?\{}", cwd.display()).as_str());
+    }
+
+    /// A bare file name's parent is the empty path; it must name the
+    /// current directory, not fail (`std::path::absolute("")` is an error).
+    #[test]
+    fn long_path_of_an_empty_path_is_the_current_directory() {
+        let empty = Path::new("data.dvc").parent().unwrap();
+        assert_eq!(empty, Path::new(""));
+        let long = long_path(empty).unwrap();
+        assert!(long.is_dir(), "{}", long.display());
     }
 
     #[test]
