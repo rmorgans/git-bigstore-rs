@@ -26,6 +26,21 @@
 - DVC pointers are parsed strictly as DVC 3. A pointer without `hash: md5`
   comes from DVC 2 (md5-dos2unix, a different cache layout) and is refused
   with a message saying so, instead of being reported as a missing object.
+- **git runs one bigstore filter process per command** instead of one
+  clean/smudge process per file. `init` and `pull` set
+  `filter.bigstore.process = "<bin> filter-process"` (git's long-running
+  filter protocol) beside the one-shot `clean`/`smudge`/`required` keys, which
+  stay as the fallback for git older than 2.11; clones configured by an older
+  version gain the key on their next `pull` or `init`. For 500 files of 1 KiB
+  (local backend, macOS arm64): `pull` 11 s → 0.4 s, `pull` with a warm cache
+  9.7 s → 0.3 s, `git add` 13.7 s → 0.4 s. A `process` key with another
+  binary or subcommand, or without the one-shot keys, is rejected with a fix.
+- **Downgrading** to a version without `filter-process` needs, in each clone
+  first, `git config --unset filter.bigstore.process` and
+  `git config filter.bigstore.clean "git-bigstore filter-clean"` (older
+  versions reject the `%f` now on the clean command); otherwise every
+  checkout, `git add` and `git status` of a tracked file fails (nothing is
+  corrupted).
 
 ### Fixed
 
@@ -87,10 +102,12 @@
   next pull repairs exactly the files it had touched — files the user deleted
   stay deleted. Pull never replaces a file that appears at a path while it
   runs.
-- Known limitation, unchanged: files whose committed pointer is md5 (DVC
-  imports) can show as modified after git re-checks their timestamps, because
-  the clean filter always produces sha256. `git add --renormalize <path>`
-  converts them.
+- Files whose committed pointer is md5 (DVC pointer text) no longer show as
+  modified, or get re-staged as sha256, after git re-checks their timestamps.
+  The clean filter now gets the path (`filter-clean %f`) and keeps the index's
+  md5 pointer when the content still matches it. `init` and `pull` write the
+  new command; an existing `filter-clean` without `%f` keeps working as
+  before.
 - Files outside a sparse checkout (skip-worktree) are no longer downloaded;
   `status` shows them as `outside sparse checkout`.
 - `status --verify` repair advice names the corrupted object files instead of

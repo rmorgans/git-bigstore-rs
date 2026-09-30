@@ -214,55 +214,94 @@ fn config_set(key: &str, value: &str) -> Result<()> {
 // Filter configuration
 // ──────────────────────────────────────────────────
 //
-// Git's clean/smudge filter has three config keys: clean, smudge, and
-// required. This type models them as a unit and enforces:
+// Git's filter driver has four keys here: clean, smudge and required (the
+// one-shot filters, which git older than 2.11 uses), and process (the
+// long-running filter, which newer git uses instead of clean/smudge
+// whenever it is set). They are modelled as a unit:
 //
-//   1. Presence-consistency: all three must be set, or none.
-//   2. Command-shape: clean must end with "filter-clean", smudge with
-//      "filter-smudge", and both must share the same binary prefix.
-//   3. Required must be "true".
+//   1. clean, smudge and required: all set, or none.
+//   2. clean ends with "filter-clean %f" (or plain "filter-clean", written
+//      by older versions), smudge with "filter-smudge", process with
+//      "filter-process", all with the same binary prefix.
+//   3. required is "true".
+//   4. process is optional (legacy config), but never set alone.
 //
-// Partial or malformed config is rejected on load() with repair guidance.
+// Partial or malformed config is rejected with repair guidance.
 
-/// A valid, complete filter configuration.
-///
-/// Invariants (enforced by load/new):
-/// - `binary` is the shared command prefix (e.g. "git-bigstore" or "/full/path/to/git-bigstore")
-/// - clean = "{binary} filter-clean", smudge = "{binary} filter-smudge"
-/// - required is always true (set on save, checked on load)
-pub struct FilterConfig {
+/// The filter commands, all run through one binary: "git-bigstore", or a
+/// full path to it.
+struct FilterConfig {
     binary: String,
+}
+
+/// The bigstore filter config as git holds it.
+enum FilterSetup {
+    /// None of the keys is set.
+    Unconfigured,
+    /// Valid one-shot filters, no process key (written by older versions).
+    Legacy(FilterConfig),
+    /// All four keys.
+    Complete,
+}
+
+/// What [`ensure_filter_config`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ensured {
+    /// Nothing was set: every key has been written.
+    Configured,
+    /// Legacy config gained the process key.
+    AddedProcess,
+    /// Already complete.
+    Unchanged,
+}
+
+/// Make the bigstore filter config complete: write it if absent, add the
+/// process key to legacy config (keeping its binary). Partial or malformed
+/// config is an error with repair guidance, and is left alone.
+pub fn ensure_filter_config() -> Result<Ensured> {
+    Ok(match FilterConfig::load()? {
+        FilterSetup::Unconfigured => {
+            FilterConfig::default_commands().save()?;
+            Ensured::Configured
+        }
+        FilterSetup::Legacy(cfg) => {
+            cfg.save()?;
+            Ensured::AddedProcess
+        }
+        FilterSetup::Complete => Ensured::Unchanged,
+    })
 }
 
 impl FilterConfig {
     /// Default config using bare binary name (requires git-bigstore in PATH).
-    pub fn default_commands() -> Self {
+    fn default_commands() -> Self {
         Self {
             binary: "git-bigstore".to_string(),
         }
     }
 
-    /// Read the current filter config from git.
-    ///
-    /// Returns:
-    /// - `Ok(None)` — not configured (all three keys absent)
-    /// - `Ok(Some(config))` — valid, complete config
-    /// - `Err` — partial, malformed, or inconsistent config
-    pub fn load() -> Result<Option<Self>> {
+    fn load() -> Result<FilterSetup> {
         let clean = config_get("filter.bigstore.clean");
         let smudge = config_get("filter.bigstore.smudge");
         let required = config_get("filter.bigstore.required");
+        let process = config_get("filter.bigstore.process");
 
-        // All absent = unconfigured
         if clean.is_none() && smudge.is_none() && required.is_none() {
-            return Ok(None);
+            anyhow::ensure!(
+                process.is_none(),
+                "filter.bigstore.process is set but the one-shot filters are missing.\n\
+                 Fix: git config filter.bigstore.clean \"git-bigstore filter-clean %f\"\n\
+                 Fix: git config filter.bigstore.smudge \"git-bigstore filter-smudge\"\n\
+                 Fix: git config filter.bigstore.required true"
+            );
+            return Ok(FilterSetup::Unconfigured);
         }
 
         // Partial presence
         let clean = clean.ok_or_else(|| {
             anyhow::anyhow!(
                 "filter.bigstore.smudge is set but filter.bigstore.clean is missing.\n\
-             Fix: git config filter.bigstore.clean \"git-bigstore filter-clean\""
+             Fix: git config filter.bigstore.clean \"git-bigstore filter-clean %f\""
             )
         })?;
         let smudge = smudge.ok_or_else(|| {
@@ -285,14 +324,18 @@ impl FilterConfig {
             ),
         }
 
-        // Command shape: must end with "filter-clean" / "filter-smudge"
-        let clean_bin = clean.strip_suffix(" filter-clean").ok_or_else(|| {
-            anyhow::anyhow!(
-                "filter.bigstore.clean has unexpected format: {clean:?}\n\
-             Expected: \"<binary> filter-clean\"\n\
-             Fix: git config filter.bigstore.clean \"git-bigstore filter-clean\""
-            )
-        })?;
+        // Command shape: must end with "filter-clean [%f]" / "filter-smudge".
+        // `%f` hands clean the path, so it can keep an md5 pointer.
+        let clean_bin = clean
+            .strip_suffix(" filter-clean %f")
+            .or_else(|| clean.strip_suffix(" filter-clean"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "filter.bigstore.clean has unexpected format: {clean:?}\n\
+             Expected: \"<binary> filter-clean %f\"\n\
+             Fix: git config filter.bigstore.clean \"git-bigstore filter-clean %f\""
+                )
+            })?;
         let smudge_bin = smudge.strip_suffix(" filter-smudge").ok_or_else(|| {
             anyhow::anyhow!(
                 "filter.bigstore.smudge has unexpected format: {smudge:?}\n\
@@ -310,39 +353,37 @@ impl FilterConfig {
              Both must use the same binary prefix."
         );
 
-        Ok(Some(Self {
-            binary: clean_bin.to_string(),
-        }))
+        let Some(process) = process else {
+            return Ok(FilterSetup::Legacy(Self {
+                binary: clean_bin.to_string(),
+            }));
+        };
+        let expected = format!("{clean_bin} filter-process");
+        anyhow::ensure!(
+            process == expected,
+            "filter.bigstore.process is {process:?}, expected {expected:?} \
+             (the binary of filter.bigstore.clean).\n\
+             Fix: git config filter.bigstore.process \"{expected}\""
+        );
+        Ok(FilterSetup::Complete)
     }
 
-    /// Write this filter config to git.
-    pub fn save(&self) -> Result<()> {
+    /// Write every key. The process key goes last, so a write cut short
+    /// never leaves it set without the one-shot filters it falls back to.
+    fn save(&self) -> Result<()> {
         config_set(
             "filter.bigstore.clean",
-            &format!("{} filter-clean", self.binary),
+            &format!("{} filter-clean %f", self.binary),
         )?;
         config_set(
             "filter.bigstore.smudge",
             &format!("{} filter-smudge", self.binary),
         )?;
         config_set("filter.bigstore.required", "true")?;
+        config_set(
+            "filter.bigstore.process",
+            &format!("{} filter-process", self.binary),
+        )?;
         Ok(())
-    }
-
-    /// The binary path/name used by this config.
-    #[cfg(test)]
-    pub fn binary(&self) -> &str {
-        &self.binary
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_commands_roundtrip() {
-        let cfg = FilterConfig::default_commands();
-        assert_eq!(cfg.binary(), "git-bigstore");
     }
 }
