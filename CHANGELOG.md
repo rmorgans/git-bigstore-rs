@@ -76,7 +76,8 @@
   follows it. If it records an older version, the push is `StaleBase`.
 - **Breaking (library):** `HistoryRecord::id()` is gone: `id` is now the
   record id, and `Selector::Id` (`--at <hex>`) matches record ids as
-  `folder log` prints them, not content ids. `Selector::AtOrBefore` uses
+  `folder log` prints them. Content ids still select 0.2 records (from the
+  md5 in their names), but not 0.3 ones. `Selector::AtOrBefore` uses
   each record's own time and fetches every record. `SyncState::Diverged {
   latest }` (changed locally and remotely) is now `Stale { base, head }`.
   `PushOptions::cancel` stops a push before its record is published (it

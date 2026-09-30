@@ -598,8 +598,11 @@ leaves a stale base; the next push finds the output equal to the head and
 adopts it, publishing nothing.
 
 `Selector::Id` (`--at <hex>`) matches a record id prefix as `folder log`
-prints it; `Selector::AtOrBefore` (`--at <time>`) picks the newest version
-by the time each record holds, fetching every record.
+prints it, or the content id (md5) in a 0.2 record's name, which 0.2's log
+printed; a prefix matching more than one version, of either kind, is
+refused with every candidate listed. `Selector::AtOrBefore` (`--at
+<time>`) picks the newest version by the time each record holds, fetching
+every record.
 
 **Upgrading from 0.2 is a hard cutover per key.** 0.2 named records
 `<time>-<content id>.dvc` directly under the key. 0.3 reads them as a

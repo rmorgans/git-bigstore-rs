@@ -87,8 +87,9 @@ fn output_id(output: &DvcOutput) -> &Hexdigest {
 pub enum Selector {
     /// The head. A forked history has several: [`Error::Diverged`].
     Latest,
-    /// A record id prefix of at least 8 hex characters; must match one
-    /// version.
+    /// An id prefix of at least 8 hex characters: of a record id, or of a
+    /// 0.2 record's content id (the md5 in its name, which 0.2 listed as
+    /// its id). Must match one version.
     Id(String),
     /// The newest version pushed at or before this time (RFC 3339), by the
     /// time each record holds. Every record is fetched.
@@ -435,7 +436,12 @@ pub(super) async fn select(
         Pick::Id(prefix) => {
             let matches: Vec<&Listed> = listed
                 .iter()
-                .filter(|l| l.id.as_str().starts_with(&prefix))
+                .filter(|l| {
+                    l.id.as_str().starts_with(&prefix)
+                        || l.legacy
+                            .as_ref()
+                            .is_some_and(|(_, content)| content.starts_with(&prefix))
+                })
                 .collect();
             match matches[..] {
                 [] => None,

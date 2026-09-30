@@ -279,8 +279,9 @@ enum FolderCommand {
         /// Restore a version of this history key instead of a .dvc file
         #[arg(long, conflicts_with = "pointer", requires = "into")]
         history: Option<String>,
-        /// Version: latest, an id prefix as `folder log` prints it (8+ hex),
-        /// or a time (RFC 3339). A .dvc naming it is written beside --into
+        /// Version: latest, an id prefix as `folder log` prints it (8+ hex;
+        /// a 0.2 version's content id too), or a time (RFC 3339). A .dvc
+        /// naming it is written beside --into
         #[arg(long, default_value = "latest", requires = "history")]
         at: String,
         /// Where to restore (default: beside the .dvc file)

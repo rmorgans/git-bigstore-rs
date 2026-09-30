@@ -3095,6 +3095,45 @@ fn an_output_0_2_pushed_as_the_head_follows_it_when_changed() {
 }
 
 #[test]
+fn a_02_version_is_still_selected_by_its_content_id() {
+    let e = env();
+    let md5 = |c: &[u8]| {
+        hash_reader(&mut &c[..], HashFunction::Md5)
+            .unwrap()
+            .to_string()
+    };
+    let t1 = "20260901T000000.000000000Z";
+    let v1 = legacy_version(&e, "k", t1, b"v1");
+    legacy_version(&e, "k", "20260902T000000.000000000Z", b"v2");
+    let f = e.data.join("f");
+    let by_content = Selector::Id(md5(b"v1")[..8].to_uppercase());
+    folder::pull(
+        &e.remote,
+        &history("k", by_content),
+        &pull_opts(Some(f.clone())),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), b"v1");
+    assert_eq!(base_of(&e.data.join("f.dvc")), Some(v1.clone()));
+
+    // A prefix that is one version's record id and another's content id
+    // matches both.
+    let time = "20260903T000000.000000000Z";
+    write_record(&e, "k", time, v1.as_str());
+    let err = folder::pull(
+        &e.remote,
+        &history("k", by_id(&v1)),
+        &pull_opts(Some(e.data.join("g"))),
+    )
+    .unwrap_err();
+    let FolderError::AmbiguousId { candidates, .. } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    let ids: Vec<String> = candidates.iter().map(|r| r.id.to_string()).collect();
+    assert_eq!(ids, [v1.to_string(), legacy_id(time, v1.as_str())]);
+}
+
+#[test]
 fn a_record_whose_name_disagrees_with_its_content_is_refused() {
     let e = env();
     let f = e.data.join("f");
