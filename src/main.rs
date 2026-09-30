@@ -79,7 +79,7 @@ enum Commands {
         #[arg(value_parser = RepoPath::new)]
         source: RepoPath,
         /// Destination path (relative to the repository root)
-        #[arg(value_parser = RepoPath::new)]
+        #[arg(value_parser = RepoPath::new_to_create)]
         dest: RepoPath,
     },
 
@@ -99,7 +99,7 @@ enum Commands {
         source: RepoPath,
 
         /// Destination root directory (relative to the repository root)
-        #[arg(value_parser = RepoPath::new)]
+        #[arg(value_parser = RepoPath::new_to_create)]
         dest_root: RepoPath,
 
         /// Only import files matching these glob patterns (default: all)

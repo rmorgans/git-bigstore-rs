@@ -93,6 +93,10 @@
   `CONIN$`), a trailing `.` or space, `* ? " < > |` and control characters.
   Before, such a name from a manifest made on Unix failed at the final
   rename. Folder push's portability check refuses the same device names.
+  Only paths about to be created are checked (manifest entries, `ref`'s
+  destination, `import-dvc-dir`'s destination root): paths git reports
+  are read as before, so `log` of a history that once held `docs/aux.md`
+  works on Windows.
 - On Windows, `folder pull` into a path past the 260-character `MAX_PATH`,
   and `folder push` of an output whose `.dvc` lands past it, failed at the
   final rename unless both the machine (`LongPathsEnabled`) and the program

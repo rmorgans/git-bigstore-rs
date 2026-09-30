@@ -170,10 +170,16 @@ impl PathSyntax {
 }
 
 impl RepoPath {
-    /// Validate and normalise. Empty and `.` components are dropped, so
-    /// `./a//b/` becomes `a/b`.
+    /// Validate and normalise a path to read, e.g. one git reports. Empty
+    /// and `.` components are dropped, so `./a//b/` becomes `a/b`.
     pub fn new(s: &str) -> Result<Self> {
         Self::new_for(s, PathSyntax::HOST)
+    }
+
+    /// [`Self::new`] for a path bigstore is about to create: on Windows,
+    /// every component must also be a name Windows can create.
+    pub fn new_to_create(s: &str) -> Result<Self> {
+        Self::new_to_create_for(s, PathSyntax::HOST)
     }
 
     fn new_for(s: &str, syntax: PathSyntax) -> Result<Self> {
@@ -195,18 +201,24 @@ impl RepoPath {
             match part {
                 "" | "." => {}
                 ".." => anyhow::bail!("path must not contain '..': {s:?}"),
-                p => {
-                    // Refuse up front, naming the path, what Windows would
-                    // only fail to create at the final rename.
-                    if let PathSyntax::Windows = syntax {
-                        check_windows_component(p).with_context(|| format!("path {s:?}"))?;
-                    }
-                    parts.push(p);
-                }
+                p => parts.push(p),
             }
         }
         anyhow::ensure!(!parts.is_empty(), "path is empty: {s:?}");
         Ok(Self(parts.join("/")))
+    }
+
+    /// Refuse up front, naming the path, what Windows would only fail to
+    /// create at the final rename. Reading such a path (it may be in git's
+    /// history) is fine, so only paths about to be created are checked.
+    fn new_to_create_for(s: &str, syntax: PathSyntax) -> Result<Self> {
+        let path = Self::new_for(s, syntax)?;
+        if let PathSyntax::Windows = syntax {
+            for c in path.0.split('/') {
+                check_windows_component(c).with_context(|| format!("path {s:?}"))?;
+            }
+        }
+        Ok(path)
     }
 
     /// Parse a path as git prints it with `-z` (raw bytes, root-relative).
@@ -271,7 +283,7 @@ impl ManifestPath {
     }
 
     pub(crate) fn to_repo_path_for(&self, syntax: PathSyntax) -> Result<RepoPath> {
-        RepoPath::new_for(&self.0, syntax)
+        RepoPath::new_to_create_for(&self.0, syntax)
             .with_context(|| format!("cannot write {:?} on this OS", self.0))
     }
 }
@@ -678,6 +690,8 @@ mod tests {
     /// Names Windows cannot create (device names, trailing `.`/space,
     /// `*?"<>|`, control characters) are valid on Unix but refused before
     /// writing on Windows, naming the path, instead of failing at rename.
+    /// Parsing one (a path git reports, e.g. `docs/aux.md` in `log`) still
+    /// works: only creating it is refused.
     #[test]
     fn windows_refuses_names_it_cannot_create_and_names_the_path() {
         for name in [
@@ -697,6 +711,7 @@ mod tests {
             "star*",
             "q\"uote.txt",
             "tab\there.txt",
+            "docs/aux.md",
         ] {
             let p = ManifestPath::new(name).unwrap();
             assert_eq!(
@@ -705,10 +720,14 @@ mod tests {
             );
             let err = p.to_repo_path_for(PathSyntax::Windows).unwrap_err();
             assert!(format!("{err:#}").contains(&format!("{name:?}")), "{err:#}");
-            assert!(
-                RepoPath::new_for(name, PathSyntax::Windows).is_err(),
-                "{name:?}"
+            assert_eq!(
+                RepoPath::new_for(name, PathSyntax::Windows)
+                    .unwrap()
+                    .as_str(),
+                name
             );
+            let err = RepoPath::new_to_create_for(name, PathSyntax::Windows).unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("{name:?}")), "{err:#}");
         }
         for ok in [
             "console.txt",
@@ -720,7 +739,7 @@ mod tests {
             "a/./b",
             "caf\u{e9}.txt",
         ] {
-            RepoPath::new_for(ok, PathSyntax::Windows).unwrap();
+            RepoPath::new_to_create_for(ok, PathSyntax::Windows).unwrap();
         }
     }
 
