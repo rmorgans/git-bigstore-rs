@@ -41,6 +41,27 @@
 - Which files bigstore handles is now decided by git (`git check-attr`), so
   files tracked through nested `.gitattributes` or `.git/info/attributes` are
   pushed and pulled instead of being silently skipped.
+- A DVC manifest with `\` or `:` in a file name (valid DVC data made on
+  Unix) failed to parse on Windows, so even read-only commands such as
+  `dvc-ls` refused it. Parsing now checks content only (relative,
+  `/`-separated, no empty, `.` or `..` components); `import-dvc-dir` and
+  `folder pull` refuse, naming the file, only the names this OS would misread
+  (`\` and `:` on Windows), before writing anything.
+- `folder pull` restores any name this OS can create, e.g. non-ASCII or `\`
+  names from a manifest `dvc push` wrote on Linux. `folder push` still
+  refuses names that are not portable, so what it writes can be pulled
+  everywhere.
+- `folder pull --at <id>` with a prefix that matches several versions lists
+  each candidate's id and push time instead of only saying it is ambiguous.
+- `folder pull <x.dvc>` restored to `<dir>/<path>` with `path` taken as
+  written, so a hostile `.dvc` with `path: ../x` or an absolute path wrote
+  outside the pointer's directory. `path` must now be one name this OS can
+  write (as push writes); anything else is refused, naming the value and the
+  `.dvc` file, before anything is written.
+- `folder pull` of a directory output followed a symlink at the output root
+  (`out -> elsewhere` committed beside `out.dvc`) and wrote there. A
+  symlinked output root is now refused, like any symlinked directory below
+  it and like `folder push` already did.
 - One blob that is not a pointer (e.g. committed before its `filter=bigstore`
   rule) no longer aborts the whole push or pull; `status` reports it as
   `not a pointer in git (git add --renormalize)`.

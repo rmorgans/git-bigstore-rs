@@ -23,7 +23,7 @@ pub use crate::backend::store::Credentials;
 use crate::backend::{self, Backend};
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
-use crate::types::{check_portable_component, Hexdigest, Layout, PortableRelPath};
+use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath, PortableRelPath};
 
 use snapshot::{Snapshot, SnapshotError};
 use walk::WalkError;
@@ -229,15 +229,23 @@ fn select<'a>(records: &'a [HistoryRecord], at: &Selector) -> Result<&'a History
                 "version id prefix must be at least 8 hex characters"
             );
             let prefix = prefix.to_ascii_lowercase();
-            let mut matches = records
+            let matches: Vec<&HistoryRecord> = records
                 .iter()
-                .filter(|r| r.id().to_string().starts_with(&prefix));
-            let first = matches.next();
-            anyhow::ensure!(
-                matches.next().is_none(),
-                "version id prefix {prefix} is ambiguous"
-            );
-            first
+                .filter(|r| r.id().to_string().starts_with(&prefix))
+                .collect();
+            match matches.as_slice() {
+                [] => None,
+                [one] => Some(*one),
+                many => {
+                    let candidates: String = many
+                        .iter()
+                        .map(|r| format!("\n  {}  pushed {}", r.id(), r.time.to_rfc3339()))
+                        .collect();
+                    anyhow::bail!(
+                        "version id prefix {prefix} is ambiguous; it matches:{candidates}"
+                    )
+                }
+            }
         }
         Selector::AtOrBefore(when) => {
             let when = chrono::DateTime::parse_from_rfc3339(when)
@@ -375,7 +383,7 @@ fn snapshot_dir(dir: &Path, tmp: &Path) -> std::result::Result<Staged, Retry> {
         warn_unterminated(f.relpath.as_str(), &s, &mut warnings);
         size += s.size();
         entries.push(ManifestEntry {
-            relpath: f.relpath.as_repo_path().clone(),
+            relpath: f.relpath.to_manifest_path(),
             md5: s.md5().clone(),
         });
         snapshots.entry(s.md5().clone()).or_insert(s);
@@ -690,10 +698,7 @@ async fn pull_async(
     let (pointer, default_into) = match source {
         PointerSource::File(path) => {
             let pointer = DvcPointer::load(path)?;
-            let into = path
-                .parent()
-                .context("pointer has no parent directory")?
-                .join(&pointer.path);
+            let into = pointer_output(path, &pointer)?;
             (pointer, Some(into))
         }
         PointerSource::History { key, at } => {
@@ -709,6 +714,15 @@ async fn pull_async(
 
     let targets: Vec<(PathBuf, Hexdigest)> = match &pointer.output {
         DvcOutput::Dir { manifest, .. } => {
+            // The output root itself, like every directory below it, must
+            // not redirect writes (a committed `out -> elsewhere` beside
+            // `out.dvc`). A file output's symlink is refused per target.
+            if std::fs::symlink_metadata(&into).is_ok_and(|m| m.file_type().is_symlink()) {
+                anyhow::bail!(
+                    "{} is a symlink; refusing to write through it",
+                    into.display()
+                );
+            }
             let raw = backend::get_bytes(
                 &remote.backend,
                 &remote.manifest_key(manifest),
@@ -722,11 +736,11 @@ async fn pull_async(
                 .entries()
                 .iter()
                 .map(|e| {
-                    for c in e.relpath.as_str().split('/') {
-                        check_portable_component(c)
-                            .with_context(|| format!("cannot restore {}", e.relpath))?;
-                    }
-                    Ok((e.relpath.to_fs_path(&into), e.md5.clone()))
+                    let path = e
+                        .relpath
+                        .to_repo_path()
+                        .with_context(|| format!("cannot restore {:?}", e.relpath.as_str()))?;
+                    Ok((path.to_fs_path(&into), e.md5.clone()))
                 })
                 .collect::<Result<_>>()?
         }
@@ -768,6 +782,24 @@ async fn pull_async(
         unchanged,
         extra_local,
     })
+}
+
+/// Where a `.dvc` file's output lives: `pointer.path` beside it. That must
+/// be one name this OS can write, as push writes, so a pointer cannot
+/// restore outside its own directory (`..`, an absolute path, `a/b`).
+fn pointer_output(dvc: &Path, pointer: &DvcPointer) -> Result<PathBuf> {
+    let name = pointer.path.as_str();
+    let single = ManifestPath::new(name)
+        .and_then(|p| p.to_repo_path())
+        .is_ok_and(|p| !p.as_str().contains('/'));
+    anyhow::ensure!(
+        single,
+        "{} names its output {name:?}, which is not a single file or directory \
+         name on this OS; refusing to restore it",
+        dvc.display()
+    );
+    let dir = dvc.parent().context("pointer has no parent directory")?;
+    Ok(dir.join(name))
 }
 
 enum Target {

@@ -403,10 +403,16 @@ What it guarantees:
   differs unless forced, never deletes files missing from the version, never
   writes through a symlink, and writes via temp file plus rename (never a
   link).
-- **Refuses ambiguity instead of guessing.** It refuses directory and broken
-  symlinks, nested `.git`/`.dvc`, `*.dvc` inside an output, and names that
-  aren't portable (non-ASCII, or not allowed on Windows). Empty directories
-  are reported; DVC cannot record them.
+- **Refuses ambiguity instead of guessing.** Push refuses directory and
+  broken symlinks, nested `.git`/`.dvc`, `*.dvc` inside an output, and names
+  that aren't portable (non-ASCII, or not allowed on Windows), so anything
+  it pushes can be pulled on every OS. Empty directories are reported; DVC
+  cannot record them.
+- **Pull restores what this OS can create.** A manifest `dvc push` wrote may
+  hold names push would refuse (`back\slash.txt`, non-ASCII). Pull restores
+  them where the OS allows it; on Windows it refuses `\` and `:` by name,
+  before writing anything, since they would change the path. Names that
+  differ only by case are refused everywhere.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
 

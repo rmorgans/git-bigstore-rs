@@ -152,10 +152,31 @@ impl Pointer {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RepoPath(String);
 
+/// Whose path syntax a [`RepoPath`] is checked against before it is joined
+/// to a directory. Only [`Self::HOST`] is used outside tests; the other
+/// variant lets tests check the Windows rules on any OS.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PathSyntax {
+    Posix,
+    Windows,
+}
+
+impl PathSyntax {
+    pub(crate) const HOST: Self = if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Posix
+    };
+}
+
 impl RepoPath {
     /// Validate and normalise. Empty and `.` components are dropped, so
     /// `./a//b/` becomes `a/b`.
     pub fn new(s: &str) -> Result<Self> {
+        Self::new_for(s, PathSyntax::HOST)
+    }
+
+    fn new_for(s: &str, syntax: PathSyntax) -> Result<Self> {
         anyhow::ensure!(
             !s.starts_with('/') && !Path::new(s).is_absolute(),
             "path must be relative to the repository root: {s:?}"
@@ -163,11 +184,12 @@ impl RepoPath {
         anyhow::ensure!(!s.contains('\0'), "path contains a NUL byte: {s:?}");
         // On Windows `\` is a separator and `C:x` is drive-relative, so either
         // could make `to_fs_path` land outside the root (`a\..\..\x`).
-        #[cfg(windows)]
-        anyhow::ensure!(
-            !s.contains(['\\', ':']),
-            "path contains '\\' or ':', which Windows would misread: {s:?}"
-        );
+        if let PathSyntax::Windows = syntax {
+            anyhow::ensure!(
+                !s.contains(['\\', ':']),
+                "path contains '\\' or ':', which Windows would misread: {s:?}"
+            );
+        }
         let mut parts = Vec::new();
         for part in s.split('/') {
             match part {
@@ -207,6 +229,47 @@ impl RepoPath {
 }
 
 impl fmt::Display for RepoPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A file's path inside a DVC `.dir` manifest, exactly as DVC wrote it:
+/// `/`-separated, relative, no empty, `.` or `..` components, no NUL. Only
+/// content is checked, so a manifest made on any OS parses on every OS;
+/// [`Self::to_repo_path`] decides whether this OS can write it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ManifestPath(String);
+
+impl ManifestPath {
+    pub fn new(s: &str) -> Result<Self> {
+        anyhow::ensure!(!s.contains('\0'), "path contains a NUL byte: {s:?}");
+        for part in s.split('/') {
+            anyhow::ensure!(
+                !matches!(part, "" | "." | ".."),
+                "path must be relative, `/`-separated, with no empty, '.' or '..' \
+                 components: {s:?}"
+            );
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The path to write, if this OS reads it as the same relative path.
+    pub fn to_repo_path(&self) -> Result<RepoPath> {
+        self.to_repo_path_for(PathSyntax::HOST)
+    }
+
+    pub(crate) fn to_repo_path_for(&self, syntax: PathSyntax) -> Result<RepoPath> {
+        RepoPath::new_for(&self.0, syntax)
+            .with_context(|| format!("cannot write {:?} on this OS", self.0))
+    }
+}
+
+impl fmt::Display for ManifestPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -261,8 +324,9 @@ impl PortableRelPath {
         self.0.as_str()
     }
 
-    pub fn as_repo_path(&self) -> &RepoPath {
-        &self.0
+    /// Its manifest form; portable components are always valid there.
+    pub fn to_manifest_path(&self) -> ManifestPath {
+        ManifestPath(self.as_str().to_string())
     }
 }
 
@@ -492,6 +556,37 @@ mod tests {
     fn repo_path_rejects_non_utf8_git_bytes() {
         let err = RepoPath::from_git_bytes(b"caf\xe9.bin").unwrap_err();
         assert!(format!("{err:#}").contains("caf"), "{err:#}");
+    }
+
+    #[test]
+    fn manifest_path_is_exact_and_rejects_non_canonical_content() {
+        for ok in ["back\\slash.txt", "c:d", "sub/.hidden", "café/x y"] {
+            assert_eq!(ManifestPath::new(ok).unwrap().as_str(), ok);
+        }
+        for bad in [
+            "", "/a", "a//b", "a/", "./a", "a/./b", "..", "../x", "a/..", "a\0b",
+        ] {
+            assert!(ManifestPath::new(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn windows_refuses_to_write_what_it_would_misread_and_names_the_path() {
+        // `a\..\..\x` is one file name on Unix but escapes the root on Windows.
+        for name in ["back\\slash.txt", "a\\..\\..\\x", "C:/x", "d/e:f"] {
+            let p = ManifestPath::new(name).unwrap();
+            assert_eq!(
+                p.to_repo_path_for(PathSyntax::Posix).unwrap().as_str(),
+                name
+            );
+            let err = p.to_repo_path_for(PathSyntax::Windows).unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("{name:?}")), "{err:#}");
+        }
+        let ok = ManifestPath::new("sub/.hidden").unwrap();
+        assert_eq!(
+            ok.to_repo_path_for(PathSyntax::Windows).unwrap().as_str(),
+            "sub/.hidden"
+        );
     }
 
     #[test]

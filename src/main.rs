@@ -537,11 +537,16 @@ fn cmd_import_dvc_dir(
         return Ok(());
     }
 
+    // Refuse names this OS cannot write before writing anything.
+    let dests: Vec<RepoPath> = entries
+        .iter()
+        .map(|e| Ok(dest_root.join(&e.relpath.to_repo_path()?)))
+        .collect::<Result<_>>()?;
+
     // Pre-check: fail if any destination exists (unless --force)
     if !force {
-        let conflicts: Vec<RepoPath> = entries
+        let conflicts: Vec<&RepoPath> = dests
             .iter()
-            .map(|e| dest_root.join(&e.relpath))
             .filter(|dest| dest.to_fs_path(&repo_root).exists())
             .collect();
         if !conflicts.is_empty() {
@@ -555,9 +560,9 @@ fn cmd_import_dvc_dir(
 
     let mut imported = 0u64;
     let mut cached = 0u64;
-    let mut failed: Vec<(&RepoPath, String)> = Vec::new();
+    let mut failed: Vec<(&types::ManifestPath, String)> = Vec::new();
 
-    for entry in &entries {
+    for (entry, dest) in entries.iter().zip(&dests) {
         match cache::import_from_dvc_cache(&dvc_cache_root, &git_dir, &entry.md5) {
             Ok(DvcImportResult::Imported) => imported += 1,
             Ok(DvcImportResult::AlreadyCached) => cached += 1,
@@ -578,7 +583,7 @@ fn cmd_import_dvc_dir(
         }
 
         // Write the real content; the clean filter turns it into a pointer on `git add`.
-        let dest = dest_root.join(&entry.relpath).to_fs_path(&repo_root);
+        let dest = dest.to_fs_path(&repo_root);
         cache::copy_to_worktree(&cache::object_path(&git_dir, &entry.md5), &dest)?;
     }
 
