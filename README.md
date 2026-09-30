@@ -548,17 +548,20 @@ message if the layout doesn't support the hash function.
 
 ## Downgrading
 
-`init` and `pull` set `filter.bigstore.process`, which versions before the
-filter process do not understand: with such a binary every checkout, `git add`
-and `git status` of a tracked file fails (`smudge filter bigstore failed`,
-`clean filter 'bigstore' failed`). Nothing is corrupted. Before running an
-older binary, remove the key in each clone:
+`init` and `pull` set `filter.bigstore.process` and add `%f` to
+`filter.bigstore.clean`; versions before the filter process understand
+neither. With such a binary every checkout, `git add` and `git status` of a
+tracked file fails (`smudge filter bigstore failed`, `clean filter 'bigstore'
+failed`, `unexpected argument`). Nothing is corrupted. Before running an
+older binary, undo both in each clone, using the same binary path as
+`filter.bigstore.smudge`:
 
 ```bash
 git config --unset filter.bigstore.process
+git config filter.bigstore.clean "git-bigstore filter-clean"
 ```
 
-git then uses the one-shot clean/smudge filters again.
+git then uses the older one-shot clean/smudge filters again.
 
 ## Troubleshooting
 

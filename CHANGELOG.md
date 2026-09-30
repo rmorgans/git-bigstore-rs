@@ -35,10 +35,12 @@
   (local backend, macOS arm64): `pull` 11 s → 0.4 s, `pull` with a warm cache
   9.7 s → 0.3 s, `git add` 13.7 s → 0.4 s. A `process` key with another
   binary or subcommand, or without the one-shot keys, is rejected with a fix.
-- **Downgrading** to a version without `filter-process` needs
-  `git config --unset filter.bigstore.process` in each clone first; otherwise
-  every checkout, `git add` and `git status` of a tracked file fails with
-  `smudge filter bigstore failed` (nothing is corrupted).
+- **Downgrading** to a version without `filter-process` needs, in each clone
+  first, `git config --unset filter.bigstore.process` and
+  `git config filter.bigstore.clean "git-bigstore filter-clean"` (older
+  versions reject the `%f` now on the clean command); otherwise every
+  checkout, `git add` and `git status` of a tracked file fails (nothing is
+  corrupted).
 
 ### Fixed
 
