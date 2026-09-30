@@ -896,7 +896,7 @@ async fn pull_async(
         .into
         .clone()
         .or(default_into)
-        .context("pulling from history needs a destination (`into`)")?;
+        .ok_or(Error::DestinationRequired)?;
     opts.cancel.check()?;
 
     let targets: Vec<(PathBuf, Hexdigest)> = match &pointer.output {

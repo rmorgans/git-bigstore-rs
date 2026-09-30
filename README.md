@@ -636,6 +636,8 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `EndpointRequired` | an `s3://` remote without an endpoint |
 | `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
 | `InvalidExclude { pattern }` | an exclude pattern that does not compile (or uses `!`) |
+| `InvalidHistoryKey { key }` | `HistoryKey::new` of a key that is not a relative `/`-separated path of portable names |
+| `DestinationRequired` | a pull from history without `PullOptions::into` |
 | `Cancelled` | the caller's `CancelToken` was cancelled; a push published no `.dvc` or history record, a pull wrote no partial file |
 
 | `folder::Refusal` | Refused by | `path` is |

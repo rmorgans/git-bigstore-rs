@@ -24,9 +24,11 @@ pub struct HistoryKey(PortableRelPath);
 
 impl HistoryKey {
     pub fn new(key: &str) -> Result<Self> {
-        Ok(Self(
-            PortableRelPath::new(key).context("invalid history key")?,
-        ))
+        Ok(Self(PortableRelPath::new(key).with_context(|| {
+            Error::InvalidHistoryKey {
+                key: key.to_string(),
+            }
+        })?))
     }
 
     pub fn as_str(&self) -> &str {

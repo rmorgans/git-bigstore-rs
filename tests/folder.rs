@@ -1903,3 +1903,25 @@ fn pull_restores_from_a_dvc_file_with_stage_fields_and_types_unreadable_ones() {
         );
     }
 }
+
+#[test]
+fn an_invalid_history_key_and_a_history_pull_without_a_destination_are_typed() {
+    for key in ["", "/abs", "a/../b", "a/nul", "a:b"] {
+        let err = HistoryKey::new(key).unwrap_err();
+        assert!(
+            matches!(folder_error(&err), FolderError::InvalidHistoryKey { key: k } if k == key),
+            "{key:?}: {err:#}"
+        );
+    }
+
+    let e = env();
+    let w = writer_dir(&e);
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let err =
+        folder::pull(&e.remote, &history(KEY, Selector::Latest), &pull_opts(None)).unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::DestinationRequired),
+        "{err:#}"
+    );
+    assert!(format!("{err:#}").contains("into"), "{err:#}");
+}

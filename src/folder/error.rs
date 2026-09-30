@@ -59,6 +59,13 @@ pub enum Error {
     /// A remote URL folder mode does not support (only `s3://`, `local://`
     /// and `rclone://`).
     UnsupportedRemote { url: String },
+    /// A [`HistoryKey`](super::HistoryKey) that is not a relative,
+    /// `/`-separated path of portable names. The reason is the next error in
+    /// the chain.
+    InvalidHistoryKey { key: String },
+    /// A pull from history without [`PullOptions::into`](super::PullOptions::into):
+    /// there is no `.dvc` to restore beside.
+    DestinationRequired,
     /// The caller's [`CancelToken`](super::CancelToken) was cancelled. A
     /// push published no `.dvc` and no history record (objects already
     /// uploaded stay: they are content-addressed); a pull left every file
@@ -182,6 +189,10 @@ impl fmt::Display for Error {
                 f,
                 "folder mode supports s3://, local:// and rclone:// remotes, not {url}"
             ),
+            Self::InvalidHistoryKey { key } => write!(f, "invalid history key {key:?}"),
+            Self::DestinationRequired => {
+                f.write_str("pulling from history needs a destination (`into`)")
+            }
             Self::Cancelled => f.write_str("cancelled"),
         }
     }

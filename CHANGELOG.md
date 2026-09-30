@@ -127,6 +127,9 @@
   them ("has fields bigstore does not write"). A `.dvc` with nothing to
   restore (`cache: false`, etag-only, several outputs, `wdir:`) is now the
   typed `Refusal::UnrestorablePointer`, the parse error below it.
+- An invalid `HistoryKey` is `folder::Error::InvalidHistoryKey { key }` and
+  a history pull without `into` is `folder::Error::DestinationRequired`;
+  both were untyped. Messages are unchanged apart from naming the key.
 
 ### Fixed
 
