@@ -149,6 +149,11 @@
   unusable. Content over 8 MiB now goes to an unnamed file in
   `.git/bigstore/tmp`, on the cache's filesystem; files a crashed filter left
   there are removed when the next one starts.
+- A failed index lookup during clean (or a failed blob read in `log`,
+  `status`, `push`, `pull`) could hang the filter or command for good:
+  closing the `git cat-file` helper waited for it to exit while it was still
+  blocked writing the rest of a blob over 64 KiB. Its output pipe is now closed
+  first, so it exits.
 
 ### Changed
 

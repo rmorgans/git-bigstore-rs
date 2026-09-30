@@ -10,9 +10,22 @@ use crate::types::{Pointer, MAX_POINTER_BYTES};
 /// Protocol: write `<object>\n`, read `<oid> <type> <size>\n<content>\n`, or
 /// `<object> missing\n` / `<object> ambiguous\n`.
 pub struct CatFileBatch {
-    child: Child,
-    stdin: Option<ChildStdin>,
+    // Fields drop in declaration order: both pipes close before the child is
+    // reaped. Closing stdin ends cat-file's input; closing stdout ends an
+    // object a failed read left unread, which cat-file would otherwise block
+    // writing forever while we waited for it.
+    stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    _child: Reaped,
+}
+
+/// A child that is waited for when dropped, so it never lingers as a zombie.
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.wait();
+    }
 }
 
 impl CatFileBatch {
@@ -28,9 +41,9 @@ impl CatFileBatch {
         let stdin = child.stdin.take().context("cat-file stdin not piped")?;
         let stdout = BufReader::new(child.stdout.take().context("cat-file stdout not piped")?);
         Ok(Self {
-            child,
-            stdin: Some(stdin),
+            stdin,
             stdout,
+            _child: Reaped(child),
         })
     }
 
@@ -45,10 +58,9 @@ impl CatFileBatch {
             !object.contains('\n'),
             "object name contains a newline: {object:?}"
         );
-        let stdin = self.stdin.as_mut().context("cat-file already closed")?;
-        stdin.write_all(object.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
+        self.stdin.write_all(object.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
 
         let mut header = String::new();
         self.stdout.read_line(&mut header)?;
@@ -82,10 +94,46 @@ impl CatFileBatch {
     }
 }
 
-impl Drop for CatFileBatch {
-    fn drop(&mut self) {
-        // Closing stdin lets cat-file see EOF and exit.
-        self.stdin.take();
-        let _ = self.child.wait();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A request abandoned after its header, as when `read_pointer` fails
+    /// mid-object: cat-file is still writing a blob bigger than the pipe
+    /// buffer. Dropping must not wait for it forever.
+    #[test]
+    fn drop_returns_with_a_blob_left_unread() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        let blob = tmp.path().join("blob");
+        std::fs::write(&blob, vec![b'x'; 1 << 20]).unwrap();
+        let oid = git(tmp.path(), &["hash-object", "-w", "blob"]);
+
+        let mut batch = CatFileBatch::start(tmp.path()).unwrap();
+        writeln!(batch.stdin, "{oid}").unwrap();
+        batch.stdin.flush().unwrap();
+        let mut header = String::new();
+        batch.stdout.read_line(&mut header).unwrap();
+        assert!(header.ends_with(" blob 1048576\n"), "{header:?}");
+
+        let (done, dropped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(batch);
+            done.send(()).unwrap();
+        });
+        dropped
+            .recv_timeout(Duration::from_secs(10))
+            .expect("dropping CatFileBatch hung on an undrained blob");
     }
 }
