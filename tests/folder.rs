@@ -1819,3 +1819,33 @@ fn a_pull_cancelled_mid_download_leaves_only_whole_files() {
         );
     }
 }
+
+#[test]
+fn names_differing_only_by_normalization_or_unicode_case_are_refused() {
+    // APFS and HFS+ treat each pair as one name (NFC vs NFD `é`; `Ä` vs
+    // `ä`), so restoring both would leave one file holding either content.
+    let nfd = "cafe\u{301}.txt";
+    let nfc = "caf\u{e9}.txt";
+    for (first, second) in [(nfd, nfc), ("\u{c4}rger.txt", "\u{e4}rger.txt")] {
+        let e = env();
+        let pointer = dvc_pushed_dir(&e, &[(first, b"1"), (second, b"2")]);
+        let err =
+            folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap_err();
+        let (path, reason) = refused(&err);
+        let names = [first, second];
+        let Refusal::CaseCollision { other } = reason else {
+            panic!("{err:#}")
+        };
+        assert!(
+            names.contains(&path.to_str().unwrap()) && names.contains(&other.as_str()),
+            "{err:#}"
+        );
+        assert_ne!(path.to_str().unwrap(), other, "{err:#}");
+        assert!(!e.data.join("out").exists());
+    }
+
+    // Different letters are different names.
+    let e = env();
+    let pointer = dvc_pushed_dir(&e, &[(nfc, b"1"), ("cafe.txt", b"2")]);
+    folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap();
+}

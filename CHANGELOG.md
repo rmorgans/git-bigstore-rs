@@ -74,6 +74,12 @@
   usable from sync callers, and free when unset; the library needs no
   `indicatif`. `git bigstore folder push|status|pull` draw a bar per phase
   on a terminal.
+- `folder pull` refuses, as `Refusal::CaseCollision`, manifest names that
+  differ only by Unicode normalization (NFC `é` vs NFD `e` + accent) or by
+  non-ASCII case (`Ä`/`ä`), on every OS, before writing anything. Only ASCII
+  case was folded before, so on macOS such a pair restored one file and then
+  failed with "appeared while pulling". New dependency:
+  `unicode-normalization` (std has no NFC).
 
 ### Security
 

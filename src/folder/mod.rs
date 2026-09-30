@@ -1055,11 +1055,17 @@ fn classify_target(root: &Path, path: &Path, md5: &Hexdigest) -> Result<Target> 
     }
 }
 
-/// Entries that differ only by ASCII case would collide on macOS and Windows.
+/// Entries that differ only by case (Unicode, not just ASCII) or by Unicode
+/// normalization (`é` as one code point or as `e` + accent) would be one
+/// file on macOS (APFS, HFS+) and Windows. Refused on every OS, so a version
+/// restores the same everywhere.
 fn check_case_collisions(manifest: &Manifest) -> Result<()> {
+    use unicode_normalization::UnicodeNormalization;
     let mut seen = std::collections::HashMap::new();
     for e in manifest.entries() {
-        let folded = e.relpath.as_str().to_ascii_lowercase();
+        // Lowercasing can decompose (`İ` → `i` + dot), so normalize again.
+        let lower = e.relpath.as_str().nfc().collect::<String>().to_lowercase();
+        let folded: String = lower.nfc().collect();
         if let Some(other) = seen.insert(folded, e.relpath.as_str()) {
             return Err(Error::Refused {
                 path: PathBuf::from(e.relpath.as_str()),

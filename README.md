@@ -478,7 +478,10 @@ What it guarantees:
   them where the OS allows it; on Windows it refuses by name, before writing
   anything, `\` and `:` (they would change the path) and names Windows
   cannot create (`nul.txt`, `com1`, a trailing `.` or space, `*?"<>|`).
-  Names that differ only by case are refused everywhere.
+  Names that differ only by case (`Ä`/`ä` as well as `A`/`a`) or by Unicode
+  normalization (`é` as one code point or as `e` plus an accent, as macOS
+  and Linux may each write it) are refused everywhere, before anything is
+  written: macOS and Windows would store them as one file.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
 - **Skips OS junk.** `.DS_Store` (Finder writes one just by showing a

@@ -125,8 +125,9 @@ pub enum Refusal {
     /// A manifest name this OS would read as a different path (`\` or `:`
     /// on Windows). The next error in the chain says why.
     UnwritableName,
-    /// Two manifest names differ only by ASCII case and would collide on
-    /// macOS and Windows.
+    /// Two manifest names differ only by case (any script, not just ASCII)
+    /// or by Unicode normalization (NFC vs NFD), and would be one file on
+    /// macOS and Windows. Refused on every OS.
     CaseCollision {
         /// The other name.
         other: String,
@@ -230,7 +231,8 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
         Refusal::UnwritableName => write!(f, "cannot restore {:?}", path.to_string_lossy()),
         Refusal::CaseCollision { other } => write!(
             f,
-            "{other:?} and {:?} differ only by case and would collide on this filesystem",
+            "{other:?} and {:?} differ only by case or Unicode normalization and would be \
+             one file on macOS and Windows",
             path.to_string_lossy()
         ),
         Refusal::AppearedWhilePulling => write!(f, "{p} appeared while pulling; left untouched"),
