@@ -147,6 +147,17 @@ impl From<WalkError> for anyhow::Error {
     }
 }
 
+#[cfg(test)]
+type Hook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: called with each directory right after the walk has
+    /// listed it, so a test can change the tree at an exact point mid-walk.
+    static AFTER_LISTING: std::cell::RefCell<Option<Hook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Walk `root`.
 ///
 /// - regular file → entry; symlink to a file → entry with the target's
@@ -250,6 +261,12 @@ pub fn walk(root: &Path, excludes: &Excludes) -> Result<Walk, WalkError> {
             })?;
             files.push(WalkedFile { relpath, path });
         }
+        #[cfg(test)]
+        AFTER_LISTING.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(&dir)
+            }
+        });
         if !any && !rel.is_empty() {
             empty_dirs += 1;
         }
@@ -366,5 +383,114 @@ mod tests {
             walk(&d.path().join("gone")),
             Err(WalkError::Changed(_))
         ));
+    }
+
+    /// Push `out` (holding `site/labels.jsonl` and `site/gt_geometry/{a,b}`)
+    /// while `site/gt_geometry` is renamed to `site/gt_geometry_v2` once,
+    /// right after the walk lists the directory ending in `after`. Returns
+    /// how many walks push started and the files a pull of the pushed
+    /// version restores.
+    fn push_renaming_mid_walk(after: &'static str) -> (usize, Vec<(String, Vec<u8>)>) {
+        use crate::folder::{
+            self, Credentials, HistoryKey, Overwrite, PointerSource, PullOptions, PushOptions,
+            Remote, RemoteConfig,
+        };
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let site = out.join("site");
+        std::fs::create_dir_all(site.join("gt_geometry")).unwrap();
+        std::fs::write(site.join("labels.jsonl"), b"{}\n").unwrap();
+        std::fs::write(site.join("gt_geometry/a.parquet"), b"a").unwrap();
+        std::fs::write(site.join("gt_geometry/b.parquet"), b"b").unwrap();
+
+        let walks = Rc::new(Cell::new(0));
+        let hook = {
+            let (out, walks) = (out.clone(), walks.clone());
+            let mut renamed = false;
+            move |dir: &Path| {
+                if dir == out {
+                    walks.set(walks.get() + 1);
+                }
+                if !renamed && dir.ends_with(after) {
+                    renamed = true;
+                    let site = out.join("site");
+                    std::fs::rename(site.join("gt_geometry"), site.join("gt_geometry_v2")).unwrap();
+                }
+            }
+        };
+        AFTER_LISTING.set(Some(Box::new(hook)));
+        let remote = Remote::open(&RemoteConfig {
+            url: format!("local://{}", tmp.path().join("remote").display()),
+            endpoint: None,
+            region: None,
+            credentials: Credentials::FromEnv,
+        })
+        .unwrap();
+        let pushed = folder::push(
+            &remote,
+            &out,
+            &PushOptions {
+                history: HistoryKey::new("ds/out").unwrap(),
+                jobs: 2,
+                exclude: Excludes::default(),
+            },
+        );
+        AFTER_LISTING.set(None);
+        let report = pushed.unwrap();
+        assert_eq!(report.files, 3);
+
+        let restore = tmp.path().join("restore");
+        folder::pull(
+            &remote,
+            &PointerSource::File(report.pointer_path),
+            &PullOptions {
+                into: Some(restore.clone()),
+                overwrite: Overwrite::Refuse,
+                jobs: 2,
+            },
+        )
+        .unwrap();
+        let mut restored: Vec<_> = walkdir::WalkDir::new(&restore)
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let rel = e.path().strip_prefix(&restore).unwrap();
+                let rel = rel.to_str().unwrap().replace('\\', "/");
+                (rel, std::fs::read(e.path()).unwrap())
+            })
+            .collect();
+        restored.sort();
+        (walks.get(), restored)
+    }
+
+    fn renamed_tree() -> Vec<(String, Vec<u8>)> {
+        [
+            ("site/gt_geometry_v2/a.parquet", &b"a"[..]),
+            ("site/gt_geometry_v2/b.parquet", b"b"),
+            ("site/labels.jsonl", b"{}\n"),
+        ]
+        .map(|(p, c)| (p.to_string(), c.to_vec()))
+        .to_vec()
+    }
+
+    /// Renamed after its parent was listed, before it was: the walk finds
+    /// it gone, push walks again and backs up the tree as renamed.
+    #[test]
+    fn push_retries_when_a_directory_is_renamed_before_the_walk_reaches_it() {
+        let (walks, restored) = push_renaming_mid_walk("site");
+        assert_eq!(walks, 2);
+        assert_eq!(restored, renamed_tree());
+    }
+
+    /// Renamed after its files were listed: the walk succeeds with stale
+    /// paths, the snapshot finds them gone, and push walks again.
+    #[test]
+    fn push_retries_when_a_directory_is_renamed_after_its_files_were_listed() {
+        let (walks, restored) = push_renaming_mid_walk("gt_geometry");
+        assert_eq!(walks, 2);
+        assert_eq!(restored, renamed_tree());
     }
 }
