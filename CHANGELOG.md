@@ -196,6 +196,20 @@
   upload can't poison the bucket) — writes downloads to a private per-run temp
   dir (no predictable shared path), and cleans up on failure.
 - Push/pull progress bar now advances for skipped and not-found objects.
+- The filter process no longer spools checkouts of large non-pointer files
+  (committed before their `filter=bigstore` rule) to the system temp dir,
+  which could fill a small `/tmp` or tmpfs, or fail when `TMPDIR` is
+  unusable. Content over 8 MiB now goes to an unnamed file in
+  `.git/bigstore/tmp`, on the cache's filesystem; files a crashed filter left
+  there are removed when the next one starts.
+- A failed index lookup during clean (or a failed blob read in `log`,
+  `status`, `push`, `pull`) could hang the filter or command for good:
+  closing the `git cat-file` helper waited for it to exit while it was still
+  blocked writing the rest of a blob over 64 KiB. Its output pipe is now closed
+  first, so it exits.
+- A malformed packet inside a file's content no longer lets the filter
+  process answer `status=error` and carry on, reading payload bytes as packet
+  headers. It now exits with the error, and git starts a fresh filter.
 
 ### Changed
 
