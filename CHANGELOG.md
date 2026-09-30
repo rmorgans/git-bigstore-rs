@@ -13,7 +13,8 @@
   with no AWS/IMDS fallback, and a blocking API for sync callers.
 - `cli` cargo feature (default). `default-features = false` builds only the
   library.
-- Windows CI job that builds and uploads `git-bigstore.exe`.
+- Windows CI job that builds and uploads `git-bigstore.exe`, and runs the
+  folder-mode tests, including the round trip through an rclone remote.
 - `bigstore::folder::Error` (with `folder::Refusal`): every folder-mode
   refusal is typed, so library callers can `downcast_ref` and match instead
   of parsing messages: `Refused { path, reason }` (symlinks, special files,

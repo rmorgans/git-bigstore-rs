@@ -100,6 +100,16 @@ jobs:
           # A native path: the tests spawn it without a POSIX shell.
           echo "BIGSTORE_TEST_DVC=$(cygpath -w "$(command -v dvc.exe || command -v dvc)")" >> "$GITHUB_ENV"
 
+      - name: Install rclone
+        # The official zip: one download, no package manager.
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://downloads.rclone.org/rclone-current-windows-amd64.zip -OutFile rclone.zip
+          Expand-Archive rclone.zip -DestinationPath "$env:RUNNER_TEMP\rclone"
+          $dir = (Get-ChildItem "$env:RUNNER_TEMP\rclone" -Directory | Select-Object -First 1).FullName
+          Add-Content $env:GITHUB_PATH $dir
+          & "$dir\rclone.exe" version
+
       - name: Build release
         run: cargo build --release --locked
 
@@ -111,6 +121,10 @@ jobs:
           cargo test --lib -- folder dvc types
           cargo test --test folder
           cargo test --test dvc_compat -- --ignored
+
+      - name: rclone round trip
+        # rclone gets a verbatim (\\?\) temp directory for each download.
+        run: cargo test --test folder -- --ignored --exact round_trips_through_an_rclone_remote
 
       - name: Long paths without the OS opt-in
         # With LongPathsEnabled off, Win32 gives no process paths past
