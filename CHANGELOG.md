@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Breaking (library): `bigstore::backend::Store`** replaces the `Backend`
+  enum and the free functions `from_config`, `exists`, `put_bytes`,
+  `get_bytes`, `list`, `upload`, `download` and `download_verified`. Build
+  one with `Store::open(&cfg)` or `Store::from_object_store(client)`; its
+  methods are `head(key)` (size and modification time, `None` if absent;
+  replaces `exists`), `get(key, limit)`, `put(key, bytes)`,
+  `put_file(key, path)` (streamed, multipart above 10 MiB, aborted on a
+  failed read), `list(prefix)` (sorted `Listed { key, size, modified }`)
+  and `download_verified(key, expected, dir)`. The unverified `download` is
+  gone: the LFS adapter and `git bigstore pull` both download through
+  `download_verified`. `transfer::Remote::store` is now a `&Store`.
+- rclone remotes are listed with `rclone lsjson` instead of `rclone lsf`,
+  for object sizes and times; the keys listed are unchanged.
+
 ## 0.2.1 — 2026-09-30
 
 ### Added

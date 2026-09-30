@@ -93,10 +93,12 @@ fn history_prefix(remote: &Remote, key: &HistoryKey) -> String {
 /// listing; nothing is fetched.
 async fn list(remote: &Remote, key: &HistoryKey) -> Result<Vec<Listed>> {
     let prefix = history_prefix(remote, key);
-    let mut records: Vec<Listed> = backend::list(&remote.backend, &prefix)
+    let mut records: Vec<Listed> = remote
+        .store
+        .list(&prefix)
         .await?
         .into_iter()
-        .filter_map(|object| {
+        .filter_map(|backend::Listed { key: object, .. }| {
             let name = object.strip_prefix(&prefix)?;
             // Records sit directly under the prefix; deeper keys are other
             // outputs.
@@ -119,7 +121,9 @@ async fn list(remote: &Remote, key: &HistoryKey) -> Result<Vec<Listed>> {
 /// versions are selected by name.
 async fn fetch(remote: &Remote, listed: &Listed) -> Result<HistoryRecord> {
     let object = &listed.key;
-    let bytes = backend::get_bytes(&remote.backend, object, MAX_RECORD_BYTES)
+    let bytes = remote
+        .store
+        .get(object, MAX_RECORD_BYTES)
         .await?
         .with_context(|| format!("history record {object} vanished"))?;
     let text = String::from_utf8(bytes).with_context(|| format!("{object} is not UTF-8"))?;
@@ -209,11 +213,13 @@ pub async fn keys_async(remote: &Remote, under: Option<&HistoryKey>) -> Result<V
         Some(key) => history_prefix(remote, key),
         None => root.clone(),
     };
-    let mut keys: Vec<HistoryKey> = backend::list(&remote.backend, &prefix)
+    let mut keys: Vec<HistoryKey> = remote
+        .store
+        .list(&prefix)
         .await?
         .iter()
         .filter_map(|object| {
-            let (key, name) = object.strip_prefix(&root)?.rsplit_once('/')?;
+            let (key, name) = object.key.strip_prefix(&root)?.rsplit_once('/')?;
             parse_record_name(name)?;
             HistoryKey::new(key).ok()
         })
@@ -316,7 +322,10 @@ pub(super) async fn append(
         time.format(RECORD_TIME),
         output_id(&pointer.output)
     );
-    backend::put_bytes(&remote.backend, &record, pointer.to_yaml().into_bytes()).await?;
+    remote
+        .store
+        .put(&record, pointer.to_yaml().into_bytes())
+        .await?;
     Ok(Some(record))
 }
 
@@ -331,7 +340,7 @@ pub(super) async fn latest(remote: &Remote, key: &HistoryKey) -> Result<Option<H
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use crate::backend::{self, Backend};
+    use crate::backend::Store;
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
     use object_store::path::Path as StorePath;
@@ -464,7 +473,7 @@ mod tests {
     fn remote_with_history(n: usize) -> (Remote, Arc<CountingStore>) {
         let store = Arc::new(CountingStore::default());
         let remote = Remote {
-            backend: Backend::ObjectStore(store.clone()),
+            store: Store::from_object_store(store.clone()),
             prefix: String::new(),
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -479,7 +488,9 @@ mod tests {
                     path: "f".into(),
                 };
                 let key = format!("bigstore-history/k/20260901T0000{i:02}.000000000Z-{md5}.dvc");
-                backend::put_bytes(&remote.backend, &key, pointer.to_yaml().into_bytes())
+                remote
+                    .store
+                    .put(&key, pointer.to_yaml().into_bytes())
                     .await
                     .unwrap();
             }

@@ -1,115 +1,227 @@
+//! Remote storage: [`Store`], one bucket or remote behind object_store or
+//! the rclone binary, with the operations bigstore needs of it.
+
 pub(crate) mod rclone;
 pub mod store;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::{BackendConfig, BigstoreConfig};
+use crate::types::Hexdigest;
 
-pub enum Backend {
+/// A remote object store. Keys are `/`-separated object names, used as
+/// given: callers add any prefix of their own.
+pub struct Store {
+    transport: Transport,
+}
+
+enum Transport {
     ObjectStore(Arc<dyn ObjectStore>),
     Rclone(rclone::RcloneBackend),
 }
 
-pub fn from_config(cfg: &BigstoreConfig) -> Result<Backend> {
-    match &cfg.backend {
-        BackendConfig::S3 { .. } | BackendConfig::Gcs { .. } | BackendConfig::Azure { .. } => {
-            let s = store::build_object_store(&cfg.backend)?;
-            Ok(Backend::ObjectStore(Arc::from(s)))
-        }
-        BackendConfig::Rclone { remote } => {
-            Ok(Backend::Rclone(rclone::RcloneBackend::new(remote.clone())))
-        }
-        BackendConfig::Local { path } => {
-            let s = store::build_local_store(path)?;
-            Ok(Backend::ObjectStore(Arc::from(s)))
-        }
-    }
+/// What [`Store::head`] knows of an object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ObjectMeta {
+    pub size: u64,
+    pub modified: DateTime<Utc>,
 }
 
-pub async fn exists(backend: &Backend, key: &str) -> Result<bool> {
-    match backend {
-        Backend::ObjectStore(store) => {
-            let path = object_store::path::Path::from(key);
-            match store.head(&path).await {
-                Ok(_) => Ok(true),
-                Err(object_store::Error::NotFound { .. }) => Ok(false),
-                Err(e) => Err(e.into()),
+/// An object as [`Store::list`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Listed {
+    pub key: String,
+    pub size: u64,
+    pub modified: DateTime<Utc>,
+}
+
+impl Store {
+    /// The store `cfg` names.
+    pub fn open(cfg: &BigstoreConfig) -> Result<Self> {
+        let transport = match &cfg.backend {
+            BackendConfig::S3 { .. } | BackendConfig::Gcs { .. } | BackendConfig::Azure { .. } => {
+                Transport::ObjectStore(store::build_object_store(&cfg.backend)?.into())
+            }
+            BackendConfig::Rclone { remote } => {
+                Transport::Rclone(rclone::RcloneBackend::new(remote.clone()))
+            }
+            BackendConfig::Local { path } => {
+                Transport::ObjectStore(store::build_local_store(path)?.into())
+            }
+        };
+        Ok(Self { transport })
+    }
+
+    /// A store on an object_store client the caller built.
+    pub fn from_object_store(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            transport: Transport::ObjectStore(store),
+        }
+    }
+
+    /// The size and modification time of the object at `key`; `Ok(None)` if
+    /// there is none. A failure to reach the store is an error, never `None`.
+    pub async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        match &self.transport {
+            Transport::ObjectStore(store) => {
+                match store.head(&object_store::path::Path::from(key)).await {
+                    Ok(meta) => Ok(Some(ObjectMeta {
+                        size: meta.size,
+                        modified: meta.last_modified,
+                    })),
+                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Transport::Rclone(r) => r.stat(key).await,
+        }
+    }
+
+    /// Read a whole object into memory, refusing anything over `limit` bytes.
+    /// `Ok(None)` if the object does not exist.
+    pub async fn get(&self, key: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        match &self.transport {
+            Transport::ObjectStore(store) => {
+                let result = match store.get(&object_store::path::Path::from(key)).await {
+                    Ok(r) => r,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                };
+                check_limit(key, result.meta.size, limit)?;
+                Ok(Some(result.bytes().await?.to_vec()))
+            }
+            Transport::Rclone(r) => {
+                let Some(meta) = r.stat(key).await? else {
+                    return Ok(None);
+                };
+                check_limit(key, meta.size, limit)?;
+                // No handle open while rclone writes: see `rclone_into`.
+                let path = tempfile::NamedTempFile::new()?.into_temp_path();
+                r.download(key, &path).await?;
+                check_limit(key, tokio::fs::metadata(&path).await?.len(), limit)?;
+                Ok(Some(tokio::fs::read(&path).await?))
             }
         }
-        Backend::Rclone(r) => r.exists(key).await,
     }
-}
 
-/// Store `bytes` at `key` (small objects: manifests, pointers).
-pub async fn put_bytes(backend: &Backend, key: &str, bytes: Vec<u8>) -> Result<()> {
-    match backend {
-        Backend::ObjectStore(store) => {
-            store
-                .put(&object_store::path::Path::from(key), bytes.into())
-                .await?;
-            Ok(())
-        }
-        Backend::Rclone(r) => {
-            let tmp = tempfile::NamedTempFile::new()?;
-            tokio::fs::write(tmp.path(), &bytes).await?;
-            r.upload(tmp.path(), key).await
-        }
-    }
-}
-
-/// Read a whole object into memory, refusing anything over `limit` bytes.
-/// `Ok(None)` if the object does not exist.
-pub async fn get_bytes(backend: &Backend, key: &str, limit: u64) -> Result<Option<Vec<u8>>> {
-    match backend {
-        Backend::ObjectStore(store) => {
-            let result = match store.get(&object_store::path::Path::from(key)).await {
-                Ok(r) => r,
-                Err(object_store::Error::NotFound { .. }) => return Ok(None),
-                Err(e) => return Err(e.into()),
-            };
-            anyhow::ensure!(
-                result.meta.size <= limit,
-                "{key} is {} bytes, over the {limit}-byte limit",
-                result.meta.size
-            );
-            Ok(Some(result.bytes().await?.to_vec()))
-        }
-        Backend::Rclone(r) => {
-            if !r.exists(key).await? {
-                return Ok(None);
+    /// Store `bytes` at `key` (small objects: manifests, pointers).
+    pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        match &self.transport {
+            Transport::ObjectStore(store) => {
+                store
+                    .put(&object_store::path::Path::from(key), bytes.into())
+                    .await?;
+                Ok(())
             }
-            // No handle open while rclone writes: see `rclone_into`.
-            let path = tempfile::NamedTempFile::new()?.into_temp_path();
-            r.download(key, &path).await?;
-            let len = tokio::fs::metadata(&path).await?.len();
-            anyhow::ensure!(
-                len <= limit,
-                "{key} is {len} bytes, over the {limit}-byte limit"
-            );
-            Ok(Some(tokio::fs::read(&path).await?))
+            Transport::Rclone(r) => {
+                let tmp = tempfile::NamedTempFile::new()?;
+                tokio::fs::write(tmp.path(), &bytes).await?;
+                r.upload(tmp.path(), key).await
+            }
         }
     }
-}
 
-/// Keys of all objects under `prefix` (a key prefix ending at a `/`), sorted.
-pub async fn list(backend: &Backend, prefix: &str) -> Result<Vec<String>> {
-    let mut keys = match backend {
-        Backend::ObjectStore(store) => {
-            use futures::TryStreamExt;
-            let prefix = object_store::path::Path::from(prefix);
-            store
-                .list(Some(&prefix))
-                .map_ok(|meta| meta.location.to_string())
-                .try_collect::<Vec<_>>()
+    /// Store the file at `path` at `key`, streaming it: large files go up
+    /// in parts, and a failed read aborts the upload (see `put_streaming`).
+    pub async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
+        match &self.transport {
+            Transport::ObjectStore(store) => {
+                let file = tokio::fs::File::open(path).await?;
+                put_streaming(Arc::clone(store), object_store::path::Path::from(key), file).await
+            }
+            Transport::Rclone(r) => r.upload(path, key).await,
+        }
+    }
+
+    /// Every object whose key starts with `prefix` (a key prefix ending at a
+    /// `/`), sorted by key.
+    pub async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        let mut listed = match &self.transport {
+            Transport::ObjectStore(store) => {
+                use futures::TryStreamExt;
+                let prefix = object_store::path::Path::from(prefix);
+                store
+                    .list(Some(&prefix))
+                    .map_ok(|meta| Listed {
+                        key: meta.location.to_string(),
+                        size: meta.size,
+                        modified: meta.last_modified,
+                    })
+                    .try_collect::<Vec<_>>()
+                    .await?
+            }
+            Transport::Rclone(r) => r.list(prefix).await?,
+        };
+        listed.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(listed)
+    }
+
+    /// Download `key` into a new temp file in `dir`, hashing while it
+    /// streams, and return the file only if its content is `expected`. The
+    /// file is created, written and hashed on the blocking pool.
+    pub async fn download_verified(
+        &self,
+        key: &str,
+        expected: &Hexdigest,
+        dir: &Path,
+    ) -> Result<tempfile::NamedTempFile> {
+        use crate::hash::Hasher;
+
+        let dir = dir.to_path_buf();
+        let tmp = blocking(move || Ok(tempfile::NamedTempFile::new_in(dir)?)).await?;
+        let hash_fn = expected.hash_fn();
+        let (tmp, actual) = match &self.transport {
+            Transport::ObjectStore(store) => {
+                use futures::StreamExt;
+                use std::io::Write;
+                let mut stream = store
+                    .get(&object_store::path::Path::from(key))
+                    .await?
+                    .into_stream();
+                // The file and hasher go to the blocking pool with each chunk.
+                let mut state = (tmp, Hasher::new(hash_fn));
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    state = blocking(move || {
+                        let (mut tmp, mut hasher) = state;
+                        hasher.update(&chunk);
+                        tmp.write_all(&chunk)?;
+                        Ok((tmp, hasher))
+                    })
+                    .await?;
+                }
+                let (tmp, hasher) = state;
+                (tmp, hasher.finalize())
+            }
+            Transport::Rclone(r) => {
+                let tmp = rclone_into(r, key, tmp).await?;
+                blocking(move || {
+                    let actual = crate::hash::hash_file(tmp.path(), hash_fn)?;
+                    Ok((tmp, actual))
+                })
                 .await?
-        }
-        Backend::Rclone(r) => r.list(prefix).await?,
-    };
-    keys.sort();
-    Ok(keys)
+            }
+        };
+        anyhow::ensure!(
+            actual == *expected,
+            "integrity check failed for {key}: expected {expected}, got {actual}"
+        );
+        Ok(tmp)
+    }
+}
+
+fn check_limit(key: &str, size: u64, limit: u64) -> Result<()> {
+    anyhow::ensure!(
+        size <= limit,
+        "{key} is {size} bytes, over the {limit}-byte limit"
+    );
+    Ok(())
 }
 
 /// Run blocking filesystem or CPU work on tokio's blocking pool, so it never
@@ -129,64 +241,11 @@ where
     }
 }
 
-/// Download `key` into a new temp file in `dir`, hashing while it streams,
-/// and return the file only if its content is `expected`. The file is
-/// created, written and hashed on the blocking pool.
-pub async fn download_verified(
-    backend: &Backend,
-    key: &str,
-    expected: &crate::types::Hexdigest,
-    dir: &Path,
-) -> Result<tempfile::NamedTempFile> {
-    use crate::hash::Hasher;
-
-    let dir = dir.to_path_buf();
-    let tmp = blocking(move || Ok(tempfile::NamedTempFile::new_in(dir)?)).await?;
-    let hash_fn = expected.hash_fn();
-    let (tmp, actual) = match backend {
-        Backend::ObjectStore(store) => {
-            use futures::StreamExt;
-            use std::io::Write;
-            let mut stream = store
-                .get(&object_store::path::Path::from(key))
-                .await?
-                .into_stream();
-            // The file and hasher go to the blocking pool with each chunk.
-            let mut state = (tmp, Hasher::new(hash_fn));
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                state = blocking(move || {
-                    let (mut tmp, mut hasher) = state;
-                    hasher.update(&chunk);
-                    tmp.write_all(&chunk)?;
-                    Ok((tmp, hasher))
-                })
-                .await?;
-            }
-            let (tmp, hasher) = state;
-            (tmp, hasher.finalize())
-        }
-        Backend::Rclone(r) => {
-            let tmp = rclone_into(r, key, tmp).await?;
-            blocking(move || {
-                let actual = crate::hash::hash_file(tmp.path(), hash_fn)?;
-                Ok((tmp, actual))
-            })
-            .await?
-        }
-    };
-    anyhow::ensure!(
-        actual == *expected,
-        "integrity check failed for {key}: expected {expected}, got {actual}"
-    );
-    Ok(tmp)
-}
-
 /// Have rclone write `key` to `tmp`'s path. rclone replaces the file by
 /// renaming its own partial download over it, which Windows refuses while any
 /// handle to the file is open ("Access is denied"), so ours is closed for the
 /// download and the file reopened afterwards (on the blocking pool).
-pub(crate) async fn rclone_into(
+async fn rclone_into(
     r: &rclone::RcloneBackend,
     key: &str,
     tmp: tempfile::NamedTempFile,
@@ -201,17 +260,6 @@ pub(crate) async fn rclone_into(
         Ok(tempfile::NamedTempFile::from_parts(file, path))
     })
     .await
-}
-
-/// Upload a local file to the remote. Streams — does not buffer the entire file.
-pub async fn upload(backend: &Backend, local_path: &Path, key: &str) -> Result<()> {
-    match backend {
-        Backend::ObjectStore(store) => {
-            let file = tokio::fs::File::open(local_path).await?;
-            put_streaming(Arc::clone(store), object_store::path::Path::from(key), file).await
-        }
-        Backend::Rclone(r) => r.upload(local_path, key).await,
-    }
 }
 
 /// Stream `reader` into `path`. A failed read aborts any multipart upload
@@ -250,35 +298,6 @@ async fn put_streaming(
     }
     writer.shutdown().await?;
     Ok(())
-}
-
-/// Download a remote object to a local file. Streams — does not buffer entire file.
-pub async fn download(backend: &Backend, key: &str, local_path: &Path) -> Result<()> {
-    match backend {
-        Backend::ObjectStore(store) => {
-            use futures::StreamExt;
-            use tokio::io::AsyncWriteExt;
-
-            let path = object_store::path::Path::from(key);
-            let result = store.get(&path).await?;
-
-            if let Some(parent) = local_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-
-            let mut file = tokio::fs::File::create(local_path).await?;
-            let mut stream = result.into_stream();
-
-            while let Some(chunk) = stream.next().await {
-                let bytes = chunk?;
-                file.write_all(&bytes).await?;
-            }
-            file.flush().await?;
-
-            Ok(())
-        }
-        Backend::Rclone(r) => r.download(key, local_path).await,
-    }
 }
 
 #[cfg(test)]

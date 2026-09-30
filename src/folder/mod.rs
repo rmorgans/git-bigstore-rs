@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub use crate::backend::store::Credentials;
-use crate::backend::{self, Backend};
+use crate::backend::{self, Store};
 use crate::cache::WorktreeMode;
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
@@ -85,7 +85,7 @@ pub struct RemoteConfig {
 /// An opened remote. Only built by [`Remote::open`], which enforces the
 /// endpoint and credential policy.
 pub struct Remote {
-    backend: Backend,
+    store: Store,
     prefix: String,
 }
 
@@ -103,7 +103,7 @@ impl Remote {
             }
             _ => return Err(unsupported().into()),
         };
-        let (backend, prefix) = match &cfg.backend {
+        let (store, prefix) = match &cfg.backend {
             BackendConfig::S3 { bucket, prefix, .. } => {
                 let endpoint = config.endpoint.as_deref().ok_or(Error::EndpointRequired)?;
                 let store = backend::store::build_strict_s3(
@@ -112,14 +112,14 @@ impl Remote {
                     config.region.as_deref(),
                     &config.credentials,
                 )?;
-                (Backend::ObjectStore(store.into()), prefix.clone())
+                (Store::from_object_store(store.into()), prefix.clone())
             }
             BackendConfig::Local { .. } | BackendConfig::Rclone { .. } => {
-                (backend::from_config(&cfg)?, String::new())
+                (Store::open(&cfg)?, String::new())
             }
             _ => return Err(unsupported().into()),
         };
-        Ok(Self { backend, prefix })
+        Ok(Self { store, prefix })
     }
 
     fn key(&self, rel: &str) -> String {
@@ -487,7 +487,7 @@ async fn publish(
             .manifest
             .take()
             .expect("planned only for a staged manifest");
-        backend::put_bytes(&remote.backend, &key, manifest).await?;
+        remote.store.put(&key, manifest).await?;
     }
     // The last point to stop: past it, the .dvc and history must agree.
     opts.cancel.check()?;
@@ -869,7 +869,11 @@ async fn plan<'a, C: Content + Sync>(
     // A manifest already on the remote means all its objects are (DVC's own
     // invariant, and ours: it is uploaded last).
     if staged.manifest.is_some()
-        && backend::exists(&remote.backend, &remote.manifest_key(staged.id())).await?
+        && remote
+            .store
+            .head(&remote.manifest_key(staged.id()))
+            .await?
+            .is_some()
     {
         return Ok(Plan {
             upload: Vec::new(),
@@ -878,7 +882,11 @@ async fn plan<'a, C: Content + Sync>(
         });
     }
     let there: Vec<bool> = each_in_order(&staged.contents, jobs, |c| async move {
-        backend::exists(&remote.backend, &remote.object_key(c.md5())).await
+        Ok(remote
+            .store
+            .head(&remote.object_key(c.md5()))
+            .await?
+            .is_some())
     })
     .await?;
     let (present, upload): (Vec<_>, Vec<_>) = staged
@@ -907,7 +915,9 @@ async fn upload_all(remote: &Remote, snaps: &[&Snapshot], opts: &PushOptions) ->
         if cancel.is_cancelled() {
             return Ok(());
         }
-        backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
+        remote
+            .store
+            .put_file(&remote.object_key(s.md5()), s.path())
             .await
             .with_context(|| format!("upload of {} failed", s.md5()))?;
         opts.progress.emit(|| ProgressEvent::Advanced {
@@ -1132,13 +1142,11 @@ pub async fn pull_async(
                 }
                 .into());
             }
-            let raw = backend::get_bytes(
-                &remote.backend,
-                &remote.manifest_key(manifest),
-                MAX_MANIFEST_BYTES,
-            )
-            .await?
-            .with_context(|| format!("manifest {manifest}.dir is not on the remote"))?;
+            let raw = remote
+                .store
+                .get(&remote.manifest_key(manifest), MAX_MANIFEST_BYTES)
+                .await?
+                .with_context(|| format!("manifest {manifest}.dir is not on the remote"))?;
             let (root, id) = (into.clone(), manifest.clone());
             backend::blocking(move || manifest_targets(&root, &raw, &id)).await?
         }
@@ -1423,13 +1431,10 @@ async fn fetch_and_place(
         }
         let dir = places[0].0.parent().context("target has no parent")?;
         tokio::fs::create_dir_all(dir).await?;
-        let tmp = backend::download_verified(
-            &remote.backend,
-            &remote.object_key(&md5),
-            &md5,
-            &long_path(dir)?,
-        )
-        .await?;
+        let tmp = remote
+            .store
+            .download_verified(&remote.object_key(&md5), &md5, &long_path(dir)?)
+            .await?;
         let progress = opts.progress.clone();
         backend::blocking(move || place_all(tmp, &places, mode, &progress)).await
     })

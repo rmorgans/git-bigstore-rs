@@ -378,7 +378,7 @@ fn cmd_push(patterns: &[String], jobs: Option<NonZeroUsize>) -> Result<()> {
     let cfg = BigstoreConfig::find_and_load(&repo_root)?;
     let entries = git::bigstore_entries(&repo_root, patterns)?;
     let objects = transfer::objects(&entries);
-    let store = backend::from_config(&cfg)?;
+    let store = backend::Store::open(&cfg)?;
     let remote = Remote {
         store: &store,
         cfg: &cfg,
@@ -417,7 +417,7 @@ fn cmd_pull(patterns: &[String], jobs: Option<NonZeroUsize>) -> Result<()> {
         Some(dvc_root) => cache::resolve_dvc_cache_root(&dvc_root)?,
         None => repo_root.join(".dvc/cache"),
     };
-    let store = backend::from_config(&cfg)?;
+    let store = backend::Store::open(&cfg)?;
     let remote = Remote {
         store: &store,
         cfg: &cfg,

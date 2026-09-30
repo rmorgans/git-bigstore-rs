@@ -133,7 +133,7 @@ const TRANSFER_ERROR: i32 = 2;
 struct Adapter {
     operation: Operation,
     config: config::BigstoreConfig,
-    backend: backend::Backend,
+    store: backend::Store,
 }
 
 impl Adapter {
@@ -146,11 +146,11 @@ impl Adapter {
             .remote_object_key(&probe)
             .context("bigstore layout does not support SHA-256 — incompatible with LFS")?;
 
-        let backend = backend::from_config(&config)?;
+        let store = backend::Store::open(&config)?;
         Ok(Self {
             operation,
             config,
-            backend,
+            store,
         })
     }
 
@@ -166,18 +166,12 @@ impl Adapter {
         // private per-run directory.
         let tmp_path = work_dir.join(oid.to_string());
 
-        let result = rt
-            .block_on(backend::download(&self.backend, &key, &tmp_path))
-            .with_context(|| format!("download failed for oid {oid}"))
-            .and_then(|()| verify_oid(&tmp_path, oid));
-
-        match result {
-            Ok(()) => Ok(tmp_path),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                Err(e)
-            }
-        }
+        let tmp = rt
+            .block_on(self.store.download_verified(&key, oid, work_dir))
+            .with_context(|| format!("download failed for oid {oid}"))?;
+        tmp.persist(&tmp_path)
+            .with_context(|| format!("failed to save oid {oid}"))?;
+        Ok(tmp_path)
     }
 
     /// Upload the file at `path` as `oid` unless storage already has it.
@@ -189,10 +183,10 @@ impl Adapter {
     ) -> Result<()> {
         let key = self.config.remote_object_key(oid)?;
 
-        let already_exists = rt
-            .block_on(backend::exists(&self.backend, &key))
+        let existing = rt
+            .block_on(self.store.head(&key))
             .with_context(|| format!("failed to check storage for oid {oid}"))?;
-        if already_exists {
+        if existing.is_some() {
             return Ok(());
         }
 
@@ -200,7 +194,7 @@ impl Adapter {
         // storage under that key — a mismatched upload would poison the bucket
         // for every consumer (bigstore and LFS alike).
         verify_oid(path, oid)?;
-        rt.block_on(backend::upload(&self.backend, path, &key))
+        rt.block_on(self.store.put_file(&key, path))
             .with_context(|| format!("upload failed for oid {oid}"))
     }
 }
@@ -234,10 +228,12 @@ fn ready(adapter: Option<&Adapter>, operation: Operation) -> Result<&Adapter> {
     Ok(adapter)
 }
 
-/// Verify a file's contents against an LFS OID (a SHA-256 digest). Used on both
-/// sides: a corrupt download is never reported `complete`, and a mismatched
-/// upload is never written to content-addressed storage under the wrong key.
-/// Git LFS also verifies, but bigstore checks every transfer itself.
+/// Verify a file's contents against an LFS OID (a SHA-256 digest) before
+/// upload, so a mismatched upload is never written to content-addressed
+/// storage under the wrong key. Downloads are verified as they stream
+/// ([`backend::Store::download_verified`]), so a corrupt one is never
+/// reported `complete`. Git LFS also verifies, but bigstore checks every
+/// transfer itself.
 fn verify_oid(path: &Path, oid: &types::Hexdigest) -> Result<()> {
     let actual = hash::hash_file(path, oid.hash_fn())
         .with_context(|| format!("failed to hash oid {oid}"))?;
