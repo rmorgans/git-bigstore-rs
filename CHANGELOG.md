@@ -86,6 +86,10 @@
 - On Windows, `RepoPath` rejects `\` and `:`. Before this, a hostile DVC
   manifest could make `import-dvc-dir` write outside the repository via
   `a\..\..\x` or a drive-relative `C:x`.
+- `folder push` and `folder status` create their snapshot temp directory
+  mode 0700 on unix; it was 0755 under the usual umask. The copies inside
+  were already 0600; now other users cannot list or enter the directory
+  either.
 
 ### Changed
 

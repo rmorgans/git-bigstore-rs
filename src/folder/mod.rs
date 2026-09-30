@@ -299,7 +299,7 @@ pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushRe
 
 async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
     let (name, pointer_path, _) = locate(output)?;
-    let tmp = tempfile::tempdir().context("failed to create a temp dir")?;
+    let tmp = snapshot_tmpdir()?;
     let staged = stage(output, &name, tmp.path(), opts, |s| s)?;
     let jobs = opts.jobs.max(1);
     let plan = plan(remote, &staged, jobs).await?;
@@ -381,7 +381,7 @@ pub fn status(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<Stat
 
 async fn status_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
     let (name, _, local) = locate(output)?;
-    let tmp = tempfile::tempdir().context("failed to create a temp dir")?;
+    let tmp = snapshot_tmpdir()?;
     let staged = stage(output, &name, tmp.path(), opts, |s| Hashed {
         md5: s.md5().clone(),
         size: s.size(),
@@ -409,6 +409,22 @@ async fn status_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Res
         warnings: staged.warnings,
         sync,
     })
+}
+
+/// A private temp directory for snapshots: on unix only the owner may enter
+/// it (the copies hold whatever the output holds); elsewhere the per-user
+/// temp directory already is private.
+fn snapshot_tmpdir() -> Result<tempfile::TempDir> {
+    #[cfg(unix)]
+    let dir = {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    };
+    #[cfg(not(unix))]
+    let dir = tempfile::tempdir();
+    dir.context("failed to create a temp dir")
 }
 
 /// The output's name, its `.dvc` path, and the pointer already there (push
@@ -1169,4 +1185,19 @@ fn place(tmp: tempfile::NamedTempFile, path: &Path, replace: bool) -> Result<()>
         })?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn snapshots_go_to_a_directory_only_the_owner_can_enter() {
+        // Snapshots hold whatever the output holds; other users on the host
+        // must not read them while a push or status runs.
+        let dir = snapshot_tmpdir().unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
 }
