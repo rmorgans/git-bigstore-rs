@@ -1,0 +1,5 @@
+outs:
+- etag: 0x8DAC7C2F0E7A2F6
+  version_id: 3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY
+  size: 1
+  path: etag_only.bin

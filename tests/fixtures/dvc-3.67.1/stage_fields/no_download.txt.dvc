@@ -1,0 +1,10 @@
+md5: f8806c4ab8bc8b49e49429834b4ad7ef
+frozen: true
+deps:
+- md5: b1946ac92492d2347c6235b4d2611184
+  size: 6
+  hash: md5
+  path: ../src/f.txt
+outs:
+- hash: md5
+  path: no_download.txt

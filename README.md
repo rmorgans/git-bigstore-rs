@@ -289,6 +289,15 @@ shared/global caches (`dvc cache dir --global ~/.dvc/cache`) work automatically.
 If `dvc` is not installed, bigstore falls back to `.dvc/cache` in the DVC
 project directory.
 
+### Which `.dvc` files
+
+`ref`, `dvc-ls` and `import-dvc-dir` read any single-output DVC 3 `.dvc`
+(`hash: md5`), including stage fields (`dvc import-url`'s `md5:`, `frozen:`,
+`deps:`) and annotations (`meta:`, `desc:`, `labels:`...), which they
+ignore. They refuse, saying why, what has no object in the DVC cache:
+`cache: false`, outputs not yet downloaded (`--no-download`), cloud outputs
+tracked only by etag/version_id, and DVC 2 pointers (no `hash:` field).
+
 ### Single-file migration
 
 ```bash
@@ -424,9 +433,10 @@ What it guarantees:
   cannot record them.
 - **Pull restores what this OS can create.** A manifest `dvc push` wrote may
   hold names push would refuse (`back\slash.txt`, non-ASCII). Pull restores
-  them where the OS allows it; on Windows it refuses `\` and `:` by name,
-  before writing anything, since they would change the path. Names that
-  differ only by case are refused everywhere.
+  them where the OS allows it; on Windows it refuses by name, before writing
+  anything, `\` and `:` (they would change the path) and names Windows
+  cannot create (`nul.txt`, `com1`, a trailing `.` or space, `*?"<>|`).
+  Names that differ only by case are refused everywhere.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
 - **Skips OS junk.** `.DS_Store` (Finder writes one just by showing a

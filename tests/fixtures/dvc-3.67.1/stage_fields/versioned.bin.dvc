@@ -1,0 +1,9 @@
+outs:
+- md5: 9e3669d19b675bd57058fd4664205d2a
+  size: 1
+  hash: md5
+  path: versioned.bin
+  cloud:
+    myremote:
+      etag: 0x8DAC7C2F0E7A2F6
+      version_id: 3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY
