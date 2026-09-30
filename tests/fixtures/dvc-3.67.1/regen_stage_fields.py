@@ -2,7 +2,7 @@
 fields beyond `outs:` that real projects contain.
 
 usage: python3 regen_stage_fields.py <dvc-binary> <outdir>
-  e.g. python3 regen_stage_fields.py /tmp/FolderModePlan/venv/bin/dvc .
+  e.g. python3 regen_stage_fields.py "$(command -v dvc)" .   # dvc==3.67.1
 
 Isolated from ~/.config/dvc and ~/.dvc via DVC_*_CONFIG_DIR/DVC_SITE_CACHE_DIR.
 Files DVC writes itself (`dvc add`, `dvc import-url`) are copied verbatim.

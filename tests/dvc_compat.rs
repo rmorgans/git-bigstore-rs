@@ -1,7 +1,9 @@
-//! Round trips against a real, pinned DVC. Ignored by default; CI's
-//! `dvc-compat` job runs them with `BIGSTORE_TEST_DVC=<path to dvc>`:
+//! Round trips against a real, pinned DVC. Ignored by default; both CI jobs
+//! install it (`uv tool install dvc==3.67.1`) and run them with
+//! `BIGSTORE_TEST_DVC=<path to dvc>`. Locally, the same:
 //!
-//!   cargo test --test dvc_compat -- --ignored
+//!   uv tool install dvc==3.67.1
+//!   BIGSTORE_TEST_DVC=$(command -v dvc) cargo test --test dvc_compat -- --ignored
 //!
 //! DVC runs with its global/system/site config redirected into the test's
 //! temp dir, so it never reads or writes the user's DVC cache or config.

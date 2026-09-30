@@ -9,7 +9,15 @@
 //!
 //! Per-file failures are answered with `status=error` and the stream stays in
 //! sync. I/O and protocol errors end the process; git then fails the file
-//! (`required`) and starts a fresh filter for the next one.
+//! (`required`) and starts a fresh filter for the next one. `status=abort` is
+//! never sent: with `required`, git stops at the first failed file either way.
+//!
+//! Why a process: a one-shot clean/smudge costs about 19 ms per file (git's
+//! `sh -c`, our start-up, a `git rev-parse`), this about 0.4 ms. `delay` is not
+//! offered: `git checkout-index`, which pull uses so it never overwrites a file
+//! and leaves stat data fresh, never enables delayed checkout; and a filter
+//! that downloads would need the backend and credentials inside every git
+//! command. git also excludes process-filtered entries from parallel checkout.
 //!
 //! Nothing but the [`PktWriter`] may write to stdout.
 

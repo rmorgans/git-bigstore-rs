@@ -467,7 +467,10 @@ What it guarantees:
   nothing adds nothing. Versions are ordered by push time; each record is a
   valid `.dvc` file, named `<time>-<id>.dvc`, so push and pull pick a
   version from one listing and fetch only that record, however long the
-  history.
+  history. It is a log rather than S3 bucket versioning because object_store
+  cannot list object versions, a bucket's versioning setting can't be checked
+  cheaply or tested on `local://`, and a lifecycle rule or delete marker would
+  drop history silently.
 - **Pull never destroys local work.** It refuses to replace a file that
   differs unless forced, never deletes files missing from the version, never
   writes through a symlink, and writes via temp file plus rename (never a
