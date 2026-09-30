@@ -1021,10 +1021,9 @@ fn a_refused_pull_lists_every_differing_file_and_writes_nothing() {
     assert_eq!(paths, &[a.clone(), b.clone()]);
     let shown = err.to_string();
     assert!(shown.starts_with("2 local file(s) differ"), "{shown}");
-    assert!(
-        shown.contains(&a.display().to_string()) && shown.contains(&b.display().to_string()),
-        "{shown}"
-    );
+    for p in paths {
+        assert!(shown.contains(&p.display().to_string()), "{shown}");
+    }
     // Refusal is all or nothing: the missing file was not restored either.
     assert!(!w
         .join("site=s1/date=2026-09-01/src_01/regions.jsonl")
@@ -2042,7 +2041,9 @@ fn outputs_and_files_beyond_max_path_push_and_pull() {
     assert_eq!(tree(&restore), tree(&output));
 
     // A conflict names the file in the caller's form, then force replaces.
-    let target = restore.join(&rel);
+    // Caller's root as given, then the relative path with native separators.
+    let mut target = restore.clone();
+    target.extend(rel.split('/'));
     std::fs::write(&target, b"local edit").unwrap();
     let err = folder::pull(
         &e.remote,
