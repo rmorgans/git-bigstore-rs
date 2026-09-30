@@ -77,6 +77,10 @@
   (`out -> elsewhere` committed beside `out.dvc`) and wrote there. A
   symlinked output root is now refused, like any symlinked directory below
   it and like `folder push` already did.
+- `folder push` kept one file open per unique file until the upload, so a
+  folder of a few hundred files failed with `Too many open files` under a
+  256-descriptor limit (the macOS launchd default). Snapshots are now closed
+  once hashed; open files are bounded by `--jobs`.
 - One blob that is not a pointer (e.g. committed before its `filter=bigstore`
   rule) no longer aborts the whole push or pull; `status` reports it as
   `not a pointer in git (git add --renormalize)`.

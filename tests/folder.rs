@@ -557,6 +557,43 @@ fn cli_works_without_git_on_path() {
     assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1);
 }
 
+/// Open files must be bounded by `--jobs`, not by the number of files: a
+/// launchd service gets 256 descriptors by default. The limit is lowered
+/// for the child process only.
+#[cfg(unix)]
+#[test]
+fn a_push_of_many_files_fits_a_low_open_file_limit() {
+    let e = env();
+    let w = e.data.join("many");
+    for i in 0..400 {
+        write(
+            &w.join(format!("f{i:03}.jsonl")),
+            format!("{{\"i\":{i}}}\n").as_bytes(),
+        );
+    }
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"ulimit -n 256 && exec "$0" "$@""#])
+        .arg(env!("CARGO_BIN_EXE_git-bigstore"))
+        .args(["folder", "push"])
+        .arg(&w)
+        .args(["--history", "ds/many", "--jobs", "8", "--remote"])
+        .arg(format!("local://{}", e.store.display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pointer = DvcPointer::load(&e.data.join("many.dvc")).unwrap();
+    assert!(
+        matches!(pointer.output, DvcOutput::Dir { nfiles: 400, .. }),
+        "{pointer:?}"
+    );
+    // 400 objects, the manifest and the history record.
+    assert_eq!(remote_keys(&e.store).len(), 402);
+}
+
 #[test]
 fn an_equivalent_crlf_pointer_is_left_untouched() {
     // DVC on Windows writes `.dvc` files with CRLF; re-pushing the same
