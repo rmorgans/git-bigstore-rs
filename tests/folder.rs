@@ -11,7 +11,9 @@ use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The typed refusal in `err`'s chain.
 #[track_caller]
@@ -2388,4 +2390,145 @@ async fn cancel_and_progress_work_through_the_async_api() {
         .await
         .unwrap_err();
     assert_cancelled(&err);
+}
+
+/// A progress callback that, at the first `Advanced` event of `phase`, asks
+/// a task on the caller's runtime to answer and waits up to 10 s for it;
+/// the flag says whether it did. A callback called from the runtime's own
+/// thread (the work beside it running there too) blocks that thread, so on
+/// a `current_thread` runtime nothing can answer.
+fn runtime_probe(phase: Phase) -> (Progress, tokio::task::JoinHandle<()>, Arc<AtomicBool>) {
+    let (ask, asked) = tokio::sync::oneshot::channel::<()>();
+    let (answer, answered) = std::sync::mpsc::channel::<()>();
+    let flag = Arc::new(AtomicBool::new(false));
+    let set = Arc::clone(&flag);
+    let channels = Mutex::new(Some((ask, answered)));
+    let progress = Progress::new(move |e| {
+        let ProgressEvent::Advanced { phase: p, .. } = e else {
+            return;
+        };
+        let first = if p == phase {
+            channels.lock().unwrap().take()
+        } else {
+            None
+        };
+        if let Some((ask, answered)) = first {
+            ask.send(()).unwrap();
+            let ok = answered.recv_timeout(Duration::from_secs(10)).is_ok();
+            set.store(ok, Ordering::SeqCst);
+        }
+    });
+    let responder = tokio::spawn(async move {
+        if asked.await.is_ok() {
+            let _ = answer.send(());
+        }
+    });
+    (progress, responder, flag)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn file_work_runs_off_the_callers_runtime() {
+    // Walking, snapshotting, hashing, classifying and placing files block;
+    // on the caller's runtime thread they would stall every other task on
+    // it. On a current_thread runtime another task gets to run only if they
+    // happen elsewhere.
+    let e = env();
+    let w = writer_dir(&e);
+    let (progress, responder, answered) = runtime_probe(Phase::Hashing);
+    let o = PushOptions {
+        progress,
+        ..opts(KEY)
+    };
+    folder::push_async(&e.remote, &w, &o).await.unwrap();
+    responder.await.unwrap();
+    assert!(
+        answered.load(Ordering::SeqCst),
+        "push hashed on the runtime"
+    );
+
+    write(&w.join("new.jsonl"), b"{}\n");
+    let (progress, responder, answered) = runtime_probe(Phase::Hashing);
+    let o = PushOptions {
+        progress,
+        ..opts(KEY)
+    };
+    folder::status_async(&e.remote, &w, &o).await.unwrap();
+    responder.await.unwrap();
+    assert!(
+        answered.load(Ordering::SeqCst),
+        "status hashed on the runtime"
+    );
+
+    for phase in [Phase::Hashing, Phase::Downloading] {
+        let into = e.data.parent().unwrap().join(format!("{phase:?}"));
+        let (progress, responder, answered) = runtime_probe(phase);
+        let o = PullOptions {
+            progress,
+            ..pull_opts(Some(into))
+        };
+        folder::pull_async(&e.remote, &history(KEY, Selector::Latest), &o)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert!(
+            answered.load(Ordering::SeqCst),
+            "pull {phase:?} ran on the runtime"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_an_async_push_stops_its_hashing() {
+    // Dropping the future (an aborted task, a lost `select!`, a timeout) is
+    // how async callers cancel. The hashing it started must stop at the next
+    // file, as with a CancelToken, not run on unseen through the rest.
+    let e = env();
+    let out = e.data.join("out");
+    many_files(&out, 20);
+    let (started, hashing) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let hashed = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&hashed);
+    let gate = Mutex::new(Some((started, released)));
+    let o = PushOptions {
+        jobs: 1,
+        progress: Progress::new(move |e| {
+            if let ProgressEvent::Advanced {
+                phase: Phase::Hashing,
+                ..
+            } = e
+            {
+                count.fetch_add(1, Ordering::SeqCst);
+                let first = gate.lock().unwrap().take();
+                if let Some((started, released)) = first {
+                    started.send(()).unwrap();
+                    let _ = released.recv_timeout(Duration::from_secs(10));
+                }
+            }
+        }),
+        ..opts("ds/out")
+    };
+    let remote = Arc::new(e.remote);
+    let push = {
+        let (remote, out) = (Arc::clone(&remote), out.clone());
+        tokio::spawn(async move { folder::push_async(&remote, &out, &o).await })
+    };
+    hashing.await.unwrap();
+    push.abort();
+    assert!(push.await.unwrap_err().is_cancelled());
+    let _ = release.send(());
+
+    // Whatever still runs holds the callback, and with it `hashed`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&hashed) > 1 {
+        assert!(std::time::Instant::now() < deadline, "work never stopped");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        hashed.load(Ordering::SeqCst),
+        1,
+        "hashing went on after the push was dropped"
+    );
+    assert!(!e.data.join("out.dvc").exists());
+    assert!(remote_keys(&e.store).is_empty(), "something was published");
 }
