@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use object_store::aws::AmazonS3Builder;
-use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
@@ -31,20 +30,32 @@ pub fn build_object_store(backend: &BackendConfig) -> Result<Box<dyn ObjectStore
             Ok(Box::new(store))
         }
 
+        #[cfg(feature = "gcp")]
         BackendConfig::Gcs { bucket, .. } => {
-            let store = GoogleCloudStorageBuilder::from_env()
+            let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
                 .with_bucket_name(bucket)
                 .build()
                 .context("failed to build GCS client")?;
             Ok(Box::new(store))
         }
+        #[cfg(not(feature = "gcp"))]
+        BackendConfig::Gcs { .. } => {
+            anyhow::bail!("gs:// needs the `gcp` feature of bigstore, which this build leaves out")
+        }
 
+        #[cfg(feature = "azure")]
         BackendConfig::Azure { container, .. } => {
             let store = object_store::azure::MicrosoftAzureBuilder::from_env()
                 .with_container_name(container)
                 .build()
                 .context("failed to build Azure client")?;
             Ok(Box::new(store))
+        }
+        #[cfg(not(feature = "azure"))]
+        BackendConfig::Azure { .. } => {
+            anyhow::bail!(
+                "az:// needs the `azure` feature of bigstore, which this build leaves out"
+            )
         }
 
         _ => anyhow::bail!("backend type not supported by object_store"),
@@ -137,4 +148,29 @@ pub fn env_s3_endpoint() -> Option<String> {
     env.get_config_value(&Key::S3Endpoint)
         .or_else(|| env.get_config_value(&Key::Endpoint))
         .filter(|e| !e.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(feature = "gcp"))]
+    #[test]
+    fn gs_urls_name_the_missing_gcp_feature() {
+        let err = super::build_object_store(&super::BackendConfig::Gcs {
+            bucket: "bucket".into(),
+            prefix: String::new(),
+        })
+        .expect_err("gs:// must be refused without the gcp feature");
+        assert!(format!("{err:#}").contains("`gcp` feature"), "{err:#}");
+    }
+
+    #[cfg(not(feature = "azure"))]
+    #[test]
+    fn az_urls_name_the_missing_azure_feature() {
+        let err = super::build_object_store(&super::BackendConfig::Azure {
+            container: "container".into(),
+            prefix: String::new(),
+        })
+        .expect_err("az:// must be refused without the azure feature");
+        assert!(format!("{err:#}").contains("`azure` feature"), "{err:#}");
+    }
 }

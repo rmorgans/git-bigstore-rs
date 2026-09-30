@@ -16,6 +16,10 @@
 - Windows CI job that builds and uploads `git-bigstore.exe`.
 - `progress` cargo feature (enabled by `cli`). Without it the library does
   not depend on `indicatif` and `bigstore::transfer` draws no progress bars.
+- `gcp` and `azure` cargo features (enabled by `cli`). Library users with
+  `default-features = false` no longer build object_store's GCS and Azure
+  clients; a `gs://` or `az://` URL then fails with an error naming the
+  missing feature.
 
 ### Security
 

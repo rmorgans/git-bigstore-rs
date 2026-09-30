@@ -40,6 +40,11 @@ needs:
 |---------|---------|---------|
 | `cli` | yes | The `git-bigstore` binary (clap, tracing-subscriber) and everything below |
 | `progress` | via `cli` | Progress bars on stderr during `bigstore::transfer` push and pull |
+| `gcp` | via `cli` | `gs://` remotes (Google Cloud Storage) |
+| `azure` | via `cli` | `az://` remotes (Azure Blob Storage) |
+
+`s3://` (and R2, Tigris), `local://` and `rclone://` are always built in. A
+URL whose backend is left out fails with an error naming the feature.
 
 ## Quick start
 
