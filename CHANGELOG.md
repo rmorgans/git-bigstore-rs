@@ -93,6 +93,14 @@
   `CONIN$`), a trailing `.` or space, `* ? " < > |` and control characters.
   Before, such a name from a manifest made on Unix failed at the final
   rename. Folder push's portability check refuses the same device names.
+- On Windows, `folder pull` into a path past the 260-character `MAX_PATH`,
+  and `folder push` of an output whose `.dvc` lands past it, failed at the
+  final rename unless both the machine (`LongPathsEnabled`) and the program
+  (its manifest) opted into long paths: std lifts the limit for its own
+  calls, but tempfile's `persist` hands paths to `MoveFileExW` as they are.
+  Those renames and their temp files now use verbatim `\\?\` paths, so any
+  depth works on any machine; paths in reports and errors stay as given. CI
+  checks it on Windows with `LongPathsEnabled` off.
 - `pull` no longer overwrites uncommitted edits. It fills the cache, then
   replaces only files that are still the index's pointer, via
   `git checkout-index`: restored files keep their committed mode (executables

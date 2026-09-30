@@ -468,6 +468,11 @@ What it guarantees:
   anything, `\` and `:` (they would change the path) and names Windows
   cannot create (`nul.txt`, `com1`, a trailing `.` or space, `*?"<>|`).
   Names that differ only by case are refused everywhere.
+- **Any path length, Windows included.** Push and pull work with paths
+  longer than Windows' 260-character `MAX_PATH` whether or not the machine
+  enables long paths (`LongPathsEnabled`): the renames that bypass std's own
+  long-path handling are given verbatim `\\?\` paths. Paths in reports and
+  errors stay in the form you passed.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
 - **Skips OS junk.** `.DS_Store` (Finder writes one just by showing a

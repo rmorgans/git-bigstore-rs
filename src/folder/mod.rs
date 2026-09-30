@@ -24,7 +24,9 @@ pub use crate::backend::store::Credentials;
 use crate::backend::{self, Backend};
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
-use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath, PortableRelPath};
+use crate::types::{
+    check_portable_component, long_path, Hexdigest, Layout, ManifestPath, PortableRelPath,
+};
 pub use error::{Error, Refusal};
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
@@ -608,7 +610,7 @@ fn write_pointer_file(path: &Path, pointer: &DvcPointer) -> Result<()> {
         return Ok(());
     }
     let dir = path.parent().context("pointer path has no parent")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(long_path(dir)?)?;
     tmp.write_all(yaml.as_bytes())?;
     tmp.as_file().sync_all()?;
     persist_with_normal_mode(tmp, path)
@@ -622,7 +624,7 @@ fn persist_with_normal_mode(tmp: tempfile::NamedTempFile, dest: &Path) -> Result
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(umask_masked))?;
     }
-    tmp.persist(dest)
+    tmp.persist(long_path(dest)?)
         .with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
 }
@@ -896,14 +898,18 @@ async fn fetch_and_place(
             let (first, _) = places[0];
             let dir = first.parent().context("target has no parent")?;
             std::fs::create_dir_all(dir)?;
-            let tmp =
-                backend::download_verified(&remote.backend, &remote.object_key(md5), md5, dir)
-                    .await?;
+            let tmp = backend::download_verified(
+                &remote.backend,
+                &remote.object_key(md5),
+                md5,
+                &long_path(dir)?,
+            )
+            .await?;
             // Extra copies first (from the verified temp), then move the temp.
             for (path, replace) in &places[1..] {
                 let parent = path.parent().context("target has no parent")?;
                 std::fs::create_dir_all(parent)?;
-                let mut copy = tempfile::NamedTempFile::new_in(parent)?;
+                let mut copy = tempfile::NamedTempFile::new_in(long_path(parent)?)?;
                 std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut copy)?;
                 place(copy, path, *replace)?;
             }
@@ -926,10 +932,10 @@ fn place(tmp: tempfile::NamedTempFile, path: &Path, replace: bool) -> Result<()>
             .set_permissions(std::fs::Permissions::from_mode(0o666 & !current_umask()))?;
     }
     if replace {
-        tmp.persist(path)
+        tmp.persist(long_path(path)?)
             .with_context(|| format!("failed to write {}", path.display()))?;
     } else {
-        tmp.persist_noclobber(path).map_err(|e| {
+        tmp.persist_noclobber(long_path(path)?).map_err(|e| {
             let appeared = e.error.kind() == std::io::ErrorKind::AlreadyExists;
             let e = anyhow::Error::from(e.error);
             if appeared {

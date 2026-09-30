@@ -359,6 +359,48 @@ impl fmt::Display for PortableRelPath {
     }
 }
 
+/// `path` in the form to hand to code that calls Win32 directly: on
+/// Windows, absolute and verbatim (`\\?\C:\…`, `\\?\UNC\server\share\…`),
+/// which the OS opens without the 260-character `MAX_PATH` limit whether or
+/// not the process opted into long paths. Elsewhere `path` itself.
+///
+/// `std::fs` needs none of this (it makes every path it is given verbatim
+/// once it is long), but tempfile's `persist` passes both the temp file's
+/// path and the destination to `MoveFileExW` as they are. So a temp file
+/// that will be persisted must be created in a `long_path` directory and
+/// persisted to a `long_path` destination. Only for I/O: paths shown to
+/// users or returned to callers stay in the caller's form.
+pub(crate) fn long_path(path: &Path) -> std::io::Result<std::borrow::Cow<'_, Path>> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let absolute = std::path::absolute(path)?;
+        let mut components = absolute.components();
+        let mut verbatim = std::ffi::OsString::from(r"\\?\");
+        match components.next() {
+            Some(Component::Prefix(p)) => match p.kind() {
+                Prefix::Disk(_) => verbatim.push(p.as_os_str()),
+                Prefix::UNC(server, share) => {
+                    verbatim.push(r"UNC\");
+                    verbatim.push(server);
+                    verbatim.push(r"\");
+                    verbatim.push(share);
+                }
+                // Already verbatim, or a device path.
+                _ => return Ok(absolute.into()),
+            },
+            _ => return Ok(absolute.into()),
+        }
+        // Pushing onto a verbatim path joins with `\` (a `/` would be
+        // taken literally) and drops `.`/`..`, which `absolute` resolved.
+        let mut long = PathBuf::from(verbatim);
+        long.extend(components);
+        Ok(long.into())
+    }
+    #[cfg(not(windows))]
+    Ok(path.into())
+}
+
 /// A validated storage layout template. Guarantees:
 /// - Contains `{prefix}` and `{rest}` placeholders
 /// - Produces deterministic, safe object keys
@@ -432,6 +474,27 @@ impl<'de> Deserialize<'de> for Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every form a root can take comes out absolute, verbatim and with `\`
+    /// only (a verbatim path takes `/` literally), naming the same place.
+    #[cfg(windows)]
+    #[test]
+    fn long_path_is_absolute_verbatim_and_backslashed() {
+        let long = |p: &str| {
+            long_path(Path::new(p))
+                .unwrap()
+                .into_owned()
+                .into_os_string()
+        };
+        assert_eq!(long(r"C:/data/./x/../y/z"), r"\\?\C:\data\y\z");
+        assert_eq!(long(r"\\srv\share/a/b"), r"\\?\UNC\srv\share\a\b");
+        assert_eq!(long(r"\\?\C:\a\b"), r"\\?\C:\a\b");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            long("rel/dir"),
+            format!(r"\\?\{}\rel\dir", cwd.display()).as_str()
+        );
+    }
 
     #[test]
     fn hexdigest_valid_sha256() {
