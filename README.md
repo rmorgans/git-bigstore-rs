@@ -688,8 +688,39 @@ match s.sync {
 `InSync` says push would record no new version. It may still rewrite the
 `.dvc` beside the output, if that is missing or records another version.
 
-The functions block and run their own tokio runtime. Calling them from inside
-a runtime returns an error; use `spawn_blocking`.
+Each function above blocks and runs its own tokio runtime; called from inside
+a runtime it returns an error naming its async twin. The twins,
+`push_async`, `status_async`, `pull_async`, `log_async` and `keys_async`,
+take the same arguments and return the same results on the caller's tokio
+runtime, which needs the I/O and time drivers (`#[tokio::main]` and
+`Builder::enable_all` enable both); `current_thread` and `multi_thread` both
+work. Their futures are `Send`, so they can be spawned with owned arguments,
+and their file and hashing work runs on the runtime's blocking pool, never
+on the thread polling them. `Remote::open` has no twin: it makes no request.
+
+```rust
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let remote = std::sync::Arc::new(Remote::open(&config)?);
+    let key = HistoryKey::new("ST032/Beatons/store.toml")?;
+    let push = tokio::spawn({
+        let (remote, key) = (remote.clone(), key.clone());
+        async move { folder::push_async(&remote, Path::new("ds/store.toml"), &PushOptions::new(key)).await }
+    });
+    let report = push.await??;
+    let versions = folder::log_async(&remote, &key, &folder::LogOptions::default()).await?;
+    let source = PointerSource::File(report.pointer_path);
+    folder::pull_async(&remote, &source, &PullOptions::default()).await?;
+    Ok(())
+}
+```
+
+Dropping an async call's future stops it like a crash at that point, never
+leaving a partial file or object: hashing stops at the next file, a file
+already downloaded is placed whole, and transfers under way are abandoned
+(an S3 multipart upload may be left for the bucket's lifecycle rule). A push
+dropped after writing its `.dvc` may lack its history record, as when the
+append fails. A `CancelToken` stops more gently: transfers under way finish.
 
 Errors are `anyhow::Error`. Every refusal, and every other outcome a caller
 may want to act on, carries a `bigstore::folder::Error` in its chain, found

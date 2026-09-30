@@ -7,8 +7,30 @@
 //! pointer or from history. Real DVC can `dvc pull` what this writes, and
 //! this can pull what `dvc push` wrote.
 //!
-//! The API is blocking: each call runs its own tokio runtime, so it must not
-//! be called from inside one (that returns an error rather than panicking).
+//! Every call comes in two forms with the same arguments and results.
+//! [`push`], [`status`], [`pull`], [`log`] and [`keys`] block: each runs its
+//! own tokio runtime, so it must not be called from inside one (that
+//! returns an error naming the async form, rather than panicking).
+//! [`push_async`], [`status_async`], [`pull_async`], [`log_async`] and
+//! [`keys_async`] run on the caller's tokio runtime instead, which must have
+//! the I/O and time drivers enabled (`Builder::enable_all`, as
+//! `#[tokio::main]` and `#[tokio::test]` do): the remote's HTTP client needs
+//! both. A `current_thread` runtime works as well as a `multi_thread` one.
+//! Their futures are `Send`, so they can be `tokio::spawn`ed with owned
+//! arguments moved in. Filesystem and hashing work (walking, snapshotting,
+//! classifying, writing and placing files) runs on the runtime's blocking
+//! pool, never on the thread polling the future.
+//!
+//! Dropping a future stops the call like a crash at that point, never
+//! leaving a partial file or object: hashing it started stops at the next
+//! file, a downloaded file already being placed is placed whole, and
+//! uploads and downloads under way are abandoned (an S3 multipart upload
+//! may be left for the bucket's lifecycle rule to expire). A push dropped
+//! after writing its `.dvc` may lack its history record, as when the append
+//! fails. A [`CancelToken`] stops more gently: transfers under way finish
+//! first. [`Remote::open`] makes no request (for `local://` it only creates
+//! the directory) and has one form.
+//!
 //! Nothing here calls git.
 
 mod error;
@@ -18,6 +40,7 @@ mod walk;
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +53,9 @@ use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use crate::types::{check_portable_component, long_path, Hexdigest, Layout, ManifestPath};
 pub use error::{Error, Refusal};
-pub use history::{keys, log, HistoryKey, HistoryRecord, LogOptions, Selector};
+pub use history::{
+    keys, keys_async, log, log_async, HistoryKey, HistoryRecord, LogOptions, Selector,
+};
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
 use snapshot::{Snapshot, SnapshotError};
@@ -116,19 +141,67 @@ impl Remote {
     }
 }
 
-/// Run `fut` on a private runtime. Refuses (instead of panicking) when the
+/// Run `fut`, the future of `bigstore::folder::{name}_async`, on a private
+/// runtime for the blocking `name`. Refuses (instead of panicking) when the
 /// caller is already inside a tokio runtime.
-fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output> {
+fn block_on<F: Future>(name: &str, fut: F) -> Result<F::Output> {
     anyhow::ensure!(
         tokio::runtime::Handle::try_current().is_err(),
-        "bigstore::folder functions are blocking and cannot run inside a tokio runtime; \
-         call them from a plain thread or tokio::task::spawn_blocking"
+        "bigstore::folder::{name} blocks, so it cannot run inside a tokio runtime; \
+         await bigstore::folder::{name}_async instead"
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to start async runtime")?;
     Ok(rt.block_on(fut))
+}
+
+// Concurrent work made by a closure (`stream::iter(..).map(|x| async ..)`) is
+// built by these plain fns, never inline in an async fn: held across an
+// `.await` there, rustc cannot prove the closure's future `Send` for every
+// lifetime ("implementation of `FnOnce` is not general enough"), and the
+// public futures could not be spawned. The opaque return types declare
+// `Send` instead.
+
+/// `f` over `items`, at most `jobs` at a time; results in `items`' order.
+fn each_in_order<'a, I, F, Fut, T>(
+    items: I,
+    jobs: usize,
+    f: F,
+) -> impl Future<Output = Result<Vec<T>>> + Send + 'a
+where
+    I: IntoIterator,
+    I::IntoIter: Send + 'a,
+    F: FnMut(I::Item) -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T>> + Send + 'a,
+    T: Send + 'a,
+{
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    stream::iter(items)
+        .map(f)
+        .buffered(jobs.max(1))
+        .try_collect()
+}
+
+/// `f` over `items`, at most `jobs` at a time; results as they finish.
+fn each_unordered<'a, I, F, Fut, T>(
+    items: I,
+    jobs: usize,
+    f: F,
+) -> impl Future<Output = Result<Vec<T>>> + Send + 'a
+where
+    I: IntoIterator,
+    I::IntoIter: Send + 'a,
+    F: FnMut(I::Item) -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T>> + Send + 'a,
+    T: Send + 'a,
+{
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    stream::iter(items)
+        .map(f)
+        .buffer_unordered(jobs.max(1))
+        .try_collect()
 }
 
 // ──────────────────────────────────────────────────
@@ -139,9 +212,15 @@ fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output> {
 /// flag; the default token is never cancelled (nobody else holds it).
 /// Checked between files, objects and history records: a file being
 /// hashed, uploaded or downloaded when it is cancelled is finished first. A
-/// cancelled call returns [`Error::Cancelled`].
+/// cancelled call returns [`Error::Cancelled`]. Dropping an async call's
+/// future stops it less gently ([the module docs](self) say how).
 #[derive(Debug, Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+    /// The token this one is a [`child`](Self::child) of: cancelling that
+    /// cancels this one.
+    parent: Option<Box<CancelToken>>,
+}
 
 impl CancelToken {
     pub fn new() -> Self {
@@ -150,11 +229,20 @@ impl CancelToken {
 
     /// Cancel every call holding a clone of this token. Idempotent.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.flag.store(true, Ordering::Relaxed);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.flag.load(Ordering::Relaxed) || self.parent.as_ref().is_some_and(|p| p.is_cancelled())
+    }
+
+    /// A token cancelled with this one, or on its own without cancelling
+    /// this one.
+    fn child(&self) -> Self {
+        Self {
+            flag: Arc::default(),
+            parent: Some(Box::new(self.clone())),
+        }
     }
 
     fn check(&self) -> Result<()> {
@@ -162,6 +250,67 @@ impl CancelToken {
             return Err(Error::Cancelled.into());
         }
         Ok(())
+    }
+}
+
+/// Run blocking work that checks a cancel token between files on the
+/// blocking pool. `work` gets a child of `cancel` that is also cancelled
+/// when the future awaiting it is dropped, so it stops at its next check
+/// instead of running on unobserved.
+async fn unblock<T, F>(cancel: &CancelToken, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&CancelToken) -> Result<T> + Send + 'static,
+{
+    struct CancelOnDrop(CancelToken);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let guard = CancelOnDrop(cancel.child());
+    let token = guard.0.clone();
+    let result = backend::blocking(move || work(&token)).await;
+    drop(guard);
+    result
+}
+
+/// Something whose drop deletes files (snapshot copies and their temp
+/// directory), held so that the deleting happens on the blocking pool:
+/// awaited in [`Self::delete`], or handed to the pool by `Drop` if the
+/// future holding it is dropped first.
+struct Scratch<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> Scratch<T> {
+    fn get(&self) -> &T {
+        self.0.as_ref().expect("present until deleted")
+    }
+
+    fn get_mut(&mut self) -> &mut T {
+        self.0.as_mut().expect("present until deleted")
+    }
+
+    async fn delete(mut self) {
+        if let Some(files) = self.0.take() {
+            // Dropping never fails; an error here only means the runtime is
+            // shutting down, which drops (so deletes) them anyway.
+            let _ = backend::blocking(move || {
+                drop(files);
+                Ok(())
+            })
+            .await;
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for Scratch<T> {
+    fn drop(&mut self) {
+        if let Some(files) = self.0.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => drop(rt.spawn_blocking(move || drop(files))),
+                Err(_) => drop(files),
+            }
+        }
     }
 }
 
@@ -295,37 +444,56 @@ pub struct PushReport {
 /// anything is published; an output that keeps changing through every retry
 /// is [`Error::OutputChanged`].
 pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
-    block_on(push_async(remote, output, opts))?
+    block_on("push", push_async(remote, output, opts))?
 }
 
-async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
-    let (name, pointer_path, _) = locate(output)?;
-    let tmp = snapshot_tmpdir()?;
-    let staged = stage(output, &name, tmp.path(), opts, |s| s)?;
-    let jobs = opts.jobs.max(1);
-    let plan = plan(remote, &staged, jobs).await?;
+/// [`push`] on the caller's tokio runtime (see [the module docs](self)).
+pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
+    let (name, pointer_path, _) = locate(output).await?;
+    let mut scratch = stage(output, name, opts, |s| s).await?;
+    let published = publish(remote, &mut scratch.get_mut().0, &pointer_path, opts).await;
+    let staged = &scratch.get().0;
+    let report = published.map(|(uploaded, already_present, history_record)| PushReport {
+        pointer: staged.pointer.clone(),
+        pointer_path,
+        files: staged.files,
+        uploaded,
+        already_present,
+        empty_dirs: staged.empty_dirs,
+        warnings: staged.warnings.clone(),
+        history_record,
+    });
+    scratch.delete().await;
+    report
+}
 
+/// Publish a staged output in push's order: objects, manifest, `.dvc`,
+/// history record. Returns the contents uploaded, those already present,
+/// and the history record written.
+async fn publish(
+    remote: &Remote,
+    staged: &mut Staged<Snapshot>,
+    pointer_path: &Path,
+    opts: &PushOptions,
+) -> Result<(usize, usize, Option<String>)> {
+    let plan = plan(remote, staged, opts.jobs.max(1)).await?;
     upload_all(remote, &plan.upload, opts).await?;
-    if let Some(manifest) = plan.manifest {
+    let (uploaded, present, upload_manifest) =
+        (plan.upload.len(), plan.present.len(), plan.manifest);
+    if upload_manifest {
         opts.cancel.check()?;
         let key = remote.manifest_key(staged.id());
-        backend::put_bytes(&remote.backend, &key, manifest.to_bytes()).await?;
+        let manifest = staged
+            .manifest
+            .take()
+            .expect("planned only for a staged manifest");
+        backend::put_bytes(&remote.backend, &key, manifest).await?;
     }
     // The last point to stop: past it, the .dvc and history must agree.
     opts.cancel.check()?;
-    write_pointer_file(&pointer_path, &staged.pointer)?;
+    write_pointer_file(pointer_path, &staged.pointer).await?;
     let history_record = history::append(remote, &opts.history, &staged.pointer).await?;
-
-    Ok(PushReport {
-        uploaded: plan.upload.len(),
-        already_present: plan.present.len(),
-        pointer: staged.pointer,
-        pointer_path,
-        files: staged.files,
-        empty_dirs: staged.empty_dirs,
-        warnings: staged.warnings,
-        history_record,
-    })
+    Ok((uploaded, present, history_record))
 }
 
 /// What [`status`] found: what [`push`] would do with the same arguments.
@@ -379,39 +547,53 @@ pub enum SyncState {
 /// private temp directory, one file at a time. Refuses whatever push
 /// refuses.
 pub fn status(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
-    block_on(status_async(remote, output, opts))?
+    block_on("status", status_async(remote, output, opts))?
 }
 
-async fn status_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
-    let (name, _, local) = locate(output)?;
-    let tmp = snapshot_tmpdir()?;
-    let staged = stage(output, &name, tmp.path(), opts, |s| Hashed {
+/// [`status`] on the caller's tokio runtime (see [the module docs](self)).
+pub async fn status_async(
+    remote: &Remote,
+    output: &Path,
+    opts: &PushOptions,
+) -> Result<StatusReport> {
+    let (name, _, local) = locate(output).await?;
+    let scratch = stage(output, name, opts, |s| Hashed {
         md5: s.md5().clone(),
         size: s.size(),
-    })?;
-    let plan = plan(remote, &staged, opts.jobs.max(1)).await?;
-    let output = &staged.pointer.output;
-    let sync = match history::latest(remote, &opts.history).await? {
-        None => SyncState::NoHistory,
-        Some(latest) if latest.pointer.output == *output => SyncState::InSync,
-        Some(latest) => match local {
-            Some(p) if p.output == latest.pointer.output => SyncState::LocalAhead,
-            Some(p) if p.output == *output => SyncState::RemoteAhead { latest },
-            _ => SyncState::Diverged { latest },
-        },
-    };
-    let bytes = |cs: &[&Hashed]| cs.iter().map(|c| c.size).sum();
-    Ok(StatusReport {
-        to_upload: plan.upload.len(),
-        to_upload_bytes: bytes(&plan.upload),
-        already_present: plan.present.len(),
-        already_present_bytes: bytes(&plan.present),
-        pointer: staged.pointer,
-        files: staged.files,
-        empty_dirs: staged.empty_dirs,
-        warnings: staged.warnings,
-        sync,
     })
+    .await?;
+    let staged = &scratch.get().0;
+    let checked = async {
+        let plan = plan(remote, staged, opts.jobs.max(1)).await?;
+        Ok::<_, anyhow::Error>((plan, history::latest(remote, &opts.history).await?))
+    }
+    .await;
+    let report = checked.map(|(plan, latest)| {
+        let output = &staged.pointer.output;
+        let sync = match latest {
+            None => SyncState::NoHistory,
+            Some(latest) if latest.pointer.output == *output => SyncState::InSync,
+            Some(latest) => match local {
+                Some(p) if p.output == latest.pointer.output => SyncState::LocalAhead,
+                Some(p) if p.output == *output => SyncState::RemoteAhead { latest },
+                _ => SyncState::Diverged { latest },
+            },
+        };
+        let bytes = |cs: &[&Hashed]| cs.iter().map(|c| c.size).sum();
+        StatusReport {
+            to_upload: plan.upload.len(),
+            to_upload_bytes: bytes(&plan.upload),
+            already_present: plan.present.len(),
+            already_present_bytes: bytes(&plan.present),
+            pointer: staged.pointer.clone(),
+            files: staged.files,
+            empty_dirs: staged.empty_dirs,
+            warnings: staged.warnings.clone(),
+            sync,
+        }
+    });
+    scratch.delete().await;
+    report
 }
 
 /// A private temp directory for snapshots: on unix only the owner may enter
@@ -432,11 +614,14 @@ fn snapshot_tmpdir() -> Result<tempfile::TempDir> {
 
 /// The output's name, its `.dvc` path, and the pointer already there (push
 /// refuses to replace anything else).
-fn locate(output: &Path) -> Result<(String, PathBuf, Option<DvcPointer>)> {
+async fn locate(output: &Path) -> Result<(String, PathBuf, Option<DvcPointer>)> {
     let name = output_name(output)?;
     let pointer_path = pointer_path_for(output)?;
-    let existing = check_existing_pointer(&pointer_path, &name)?;
-    Ok((name, pointer_path, existing))
+    backend::blocking(move || {
+        let existing = check_existing_pointer(&pointer_path, &name)?;
+        Ok((name, pointer_path, existing))
+    })
+    .await
 }
 
 enum Retry {
@@ -480,8 +665,9 @@ impl Content for Hashed {
 /// An output fully snapshotted and hashed: what push publishes.
 struct Staged<C> {
     pointer: DvcPointer,
-    /// A directory output's manifest.
-    manifest: Option<Manifest>,
+    /// A directory output's `.dir` manifest, serialized: the bytes its id is
+    /// the md5 of.
+    manifest: Option<Vec<u8>>,
     /// Distinct contents, by md5.
     contents: Vec<C>,
     files: usize,
@@ -499,9 +685,32 @@ impl<C> Staged<C> {
     }
 }
 
+/// Snapshot `output` (named `name`) into a private temp directory, on the
+/// blocking pool; see [`stage_in`]. The snapshots and their directory are
+/// deleted with the [`Scratch`].
+async fn stage<C: Send + 'static>(
+    output: &Path,
+    name: String,
+    opts: &PushOptions,
+    keep: fn(Snapshot) -> C,
+) -> Result<Scratch<(Staged<C>, tempfile::TempDir)>> {
+    let (output, owned) = (output.to_path_buf(), opts.clone());
+    unblock(&opts.cancel, move |cancel| {
+        let opts = PushOptions {
+            cancel: cancel.clone(),
+            ..owned
+        };
+        let tmp = snapshot_tmpdir()?;
+        let staged = stage_in(&output, &name, tmp.path(), &opts, keep)?;
+        Ok(Scratch(Some((staged, tmp))))
+    })
+    .await
+}
+
 /// Snapshot `output` (named `name`) into `tmp`, restarting while files
 /// change under it; `keep` turns each snapshot into what the caller holds.
-fn stage<C>(
+/// Blocks.
+fn stage_in<C>(
     output: &Path,
     name: &str,
     tmp: &Path,
@@ -602,7 +811,7 @@ fn snapshot_dir<C>(
             },
             path: name.to_string(),
         },
-        manifest: Some(manifest),
+        manifest: Some(manifest.to_bytes()),
         contents: contents.into_values().collect(),
         files,
         warnings,
@@ -647,9 +856,9 @@ fn snapshot_file<C>(
 struct Plan<'a, C> {
     upload: Vec<&'a C>,
     present: Vec<&'a C>,
-    /// The manifest to upload after the objects; `None` for a file output
-    /// or a manifest already on the remote.
-    manifest: Option<&'a Manifest>,
+    /// Whether to upload the manifest after the objects: not for a file
+    /// output or a manifest already on the remote.
+    manifest: bool,
 }
 
 async fn plan<'a, C: Content + Sync>(
@@ -657,7 +866,6 @@ async fn plan<'a, C: Content + Sync>(
     staged: &'a Staged<C>,
     jobs: usize,
 ) -> Result<Plan<'a, C>> {
-    use futures::stream::{self, StreamExt, TryStreamExt};
     // A manifest already on the remote means all its objects are (DVC's own
     // invariant, and ours: it is uploaded last).
     if staged.manifest.is_some()
@@ -666,14 +874,13 @@ async fn plan<'a, C: Content + Sync>(
         return Ok(Plan {
             upload: Vec::new(),
             present: staged.contents.iter().collect(),
-            manifest: None,
+            manifest: false,
         });
     }
-    let there: Vec<bool> = stream::iter(&staged.contents)
-        .map(|c| async move { backend::exists(&remote.backend, &remote.object_key(c.md5())).await })
-        .buffered(jobs)
-        .try_collect()
-        .await?;
+    let there: Vec<bool> = each_in_order(&staged.contents, jobs, |c| async move {
+        backend::exists(&remote.backend, &remote.object_key(c.md5())).await
+    })
+    .await?;
     let (present, upload): (Vec<_>, Vec<_>) = staged
         .contents
         .iter()
@@ -682,7 +889,7 @@ async fn plan<'a, C: Content + Sync>(
     Ok(Plan {
         upload: upload.into_iter().map(|(c, _)| c).collect(),
         present: present.into_iter().map(|(c, _)| c).collect(),
-        manifest: staged.manifest.as_ref(),
+        manifest: staged.manifest.is_some(),
     })
 }
 
@@ -690,31 +897,27 @@ async fn plan<'a, C: Content + Sync>(
 /// starts; those under way finish (dropping one could orphan a multipart
 /// upload) and the push stops.
 async fn upload_all(remote: &Remote, snaps: &[&Snapshot], opts: &PushOptions) -> Result<()> {
-    use futures::stream::{self, StreamExt, TryStreamExt};
     let cancel = &opts.cancel;
     opts.progress.emit(|| ProgressEvent::Started {
         phase: Phase::Uploading,
         files: snaps.len() as u64,
         bytes: Some(snaps.iter().map(|s| s.size()).sum()),
     });
-    stream::iter(snaps)
-        .map(|s| async move {
-            if cancel.is_cancelled() {
-                return Ok(());
-            }
-            backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
-                .await
-                .with_context(|| format!("upload of {} failed", s.md5()))?;
-            opts.progress.emit(|| ProgressEvent::Advanced {
-                phase: Phase::Uploading,
-                files: 1,
-                bytes: s.size(),
-            });
-            Ok::<_, anyhow::Error>(())
-        })
-        .buffer_unordered(opts.jobs.max(1))
-        .try_collect::<()>()
-        .await?;
+    each_unordered(snaps, opts.jobs, |s| async move {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
+            .await
+            .with_context(|| format!("upload of {} failed", s.md5()))?;
+        opts.progress.emit(|| ProgressEvent::Advanced {
+            phase: Phase::Uploading,
+            files: 1,
+            bytes: s.size(),
+        });
+        Ok(())
+    })
+    .await?;
     cancel.check()
 }
 
@@ -774,19 +977,22 @@ fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<Option<DvcP
     Ok(Some(existing))
 }
 
-/// Write the pointer atomically. A file that already says the same thing is
-/// left untouched, whatever its formatting (DVC on Windows writes CRLF), so a
-/// no-op push never churns a committed `.dvc`.
-fn write_pointer_file(path: &Path, pointer: &DvcPointer) -> Result<()> {
-    let yaml = pointer.to_yaml();
-    if DvcPointer::load(path).is_ok_and(|existing| existing == *pointer) {
-        return Ok(());
-    }
-    let dir = path.parent().context("pointer path has no parent")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(long_path(dir)?)?;
-    tmp.write_all(yaml.as_bytes())?;
-    tmp.as_file().sync_all()?;
-    persist_with_normal_mode(tmp, path)
+/// Write the pointer atomically, on the blocking pool. A file that already
+/// says the same thing is left untouched, whatever its formatting (DVC on
+/// Windows writes CRLF), so a no-op push never churns a committed `.dvc`.
+async fn write_pointer_file(path: &Path, pointer: &DvcPointer) -> Result<()> {
+    let (path, pointer) = (path.to_path_buf(), pointer.clone());
+    backend::blocking(move || {
+        if DvcPointer::load(&path).is_ok_and(|existing| existing == pointer) {
+            return Ok(());
+        }
+        let dir = path.parent().context("pointer path has no parent")?;
+        let mut tmp = tempfile::NamedTempFile::new_in(long_path(dir)?)?;
+        tmp.write_all(pointer.to_yaml().as_bytes())?;
+        tmp.as_file().sync_all()?;
+        persist_with_normal_mode(tmp, &path)
+    })
+    .await
 }
 
 fn persist_with_normal_mode(tmp: tempfile::NamedTempFile, dest: &Path) -> Result<()> {
@@ -884,10 +1090,11 @@ pub struct PullReport {
 /// left alone. A history selector that matches nothing is
 /// [`Error::NoSuchVersion`].
 pub fn pull(remote: &Remote, source: &PointerSource, opts: &PullOptions) -> Result<PullReport> {
-    block_on(pull_async(remote, source, opts))?
+    block_on("pull", pull_async(remote, source, opts))?
 }
 
-async fn pull_async(
+/// [`pull`] on the caller's tokio runtime (see [the module docs](self)).
+pub async fn pull_async(
     remote: &Remote,
     source: &PointerSource,
     opts: &PullOptions,
@@ -896,28 +1103,9 @@ async fn pull_async(
     // (`isexec`); push records none, so history never does.
     let (pointer, mode, default_into) = match source {
         PointerSource::File(path) => {
-            // Pull never rewrites the .dvc, so stage fields and annotations
-            // (`dvc import-url`, `dvc add --desc`) do not matter. A missing
-            // file is an I/O error, not a refusal.
-            std::fs::metadata(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            let read = DvcPointer::load_lenient(path).with_context(|| Error::Refused {
-                path: path.clone(),
-                reason: Refusal::UnrestorablePointer,
-            })?;
-            let mode = match (&read.pointer.output, read.isexec) {
-                (_, false) => WorktreeMode::Regular,
-                (DvcOutput::File { .. }, true) => WorktreeMode::Executable,
-                (DvcOutput::Dir { .. }, true) => {
-                    return Err(Error::Refused {
-                        path: path.clone(),
-                        reason: Refusal::ExecutableInDirectory,
-                    }
-                    .into())
-                }
-            };
-            let into = pointer_output(path, &read.pointer)?;
-            (read.pointer, mode, Some(into))
+            let path = path.clone();
+            let (pointer, mode, into) = backend::blocking(move || read_pointer_file(&path)).await?;
+            (pointer, mode, Some(into))
         }
         PointerSource::History { key, at } => {
             let record = history::select(remote, key, at, opts.jobs.max(1)).await?;
@@ -936,7 +1124,8 @@ async fn pull_async(
             // The output root itself, like every directory below it, must
             // not redirect writes (a committed `out -> elsewhere` beside
             // `out.dvc`). A file output's symlink is refused per target.
-            if std::fs::symlink_metadata(&into).is_ok_and(|m| m.file_type().is_symlink()) {
+            let root = tokio::fs::symlink_metadata(&into).await;
+            if root.is_ok_and(|m| m.file_type().is_symlink()) {
                 return Err(Error::Refused {
                     path: into,
                     reason: Refusal::SymlinkedOutput,
@@ -950,33 +1139,115 @@ async fn pull_async(
             )
             .await?
             .with_context(|| format!("manifest {manifest}.dir is not on the remote"))?;
-            let manifest = Manifest::parse(&raw, manifest).map_err(|e| {
-                match e.downcast::<crate::dvc::ExecutableEntry>() {
-                    Ok(entry) => Error::Refused {
-                        path: PathBuf::from(entry.0.as_str()),
-                        reason: Refusal::ExecutableInDirectory,
-                    }
-                    .into(),
-                    Err(e) => e,
-                }
-            })?;
-            check_case_collisions(&manifest)?;
-            manifest
-                .entries()
-                .iter()
-                .map(|e| {
-                    let path = e.relpath.to_repo_path().with_context(|| Error::Refused {
-                        path: PathBuf::from(e.relpath.as_str()),
-                        reason: Refusal::UnwritableName,
-                    })?;
-                    Ok((path.to_fs_path(&into), e.md5.clone()))
-                })
-                .collect::<Result<_>>()?
+            let (root, id) = (into.clone(), manifest.clone());
+            backend::blocking(move || manifest_targets(&root, &raw, &id)).await?
         }
         DvcOutput::File { md5, .. } => vec![(into.clone(), md5.clone())],
     };
 
-    let mut plan = Vec::new();
+    let dir = matches!(pointer.output, DvcOutput::Dir { .. });
+    let owned = opts.clone();
+    let checked = unblock(&opts.cancel, move |cancel| {
+        let opts = PullOptions {
+            cancel: cancel.clone(),
+            ..owned
+        };
+        check_targets(&into, targets, dir, mode, &opts)
+    })
+    .await?;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Downloading,
+        files: checked.by_object.values().map(|p| p.len() as u64).sum(),
+        bytes: match &pointer.output {
+            DvcOutput::File { size, .. } => Some(*size),
+            DvcOutput::Dir { .. } => None,
+        },
+    });
+    let written = fetch_and_place(remote, checked.by_object, opts, mode).await?;
+
+    Ok(PullReport {
+        pointer,
+        written,
+        unchanged: checked.unchanged,
+        extra_local: checked.extra_local,
+    })
+}
+
+/// A `.dvc` file's pointer, the mode its output is restored with, and where
+/// that output lives. Pull never rewrites the .dvc, so stage fields and
+/// annotations (`dvc import-url`, `dvc add --desc`) do not matter. A missing
+/// file is an I/O error, not a refusal. Blocks.
+fn read_pointer_file(path: &Path) -> Result<(DvcPointer, WorktreeMode, PathBuf)> {
+    std::fs::metadata(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let read = DvcPointer::load_lenient(path).with_context(|| Error::Refused {
+        path: path.to_path_buf(),
+        reason: Refusal::UnrestorablePointer,
+    })?;
+    let mode = match (&read.pointer.output, read.isexec) {
+        (_, false) => WorktreeMode::Regular,
+        (DvcOutput::File { .. }, true) => WorktreeMode::Executable,
+        (DvcOutput::Dir { .. }, true) => {
+            return Err(Error::Refused {
+                path: path.to_path_buf(),
+                reason: Refusal::ExecutableInDirectory,
+            }
+            .into())
+        }
+    };
+    let into = pointer_output(path, &read.pointer)?;
+    Ok((read.pointer, mode, into))
+}
+
+/// Every file of the `.dir` manifest `raw` (whose id is `id`) as its path
+/// under `into` and its md5. Refuses names this OS cannot write and names
+/// that would collide. Blocks (a manifest may be 64 MiB).
+fn manifest_targets(into: &Path, raw: &[u8], id: &Hexdigest) -> Result<Vec<(PathBuf, Hexdigest)>> {
+    let manifest = Manifest::parse(raw, id).map_err(|e| {
+        match e.downcast::<crate::dvc::ExecutableEntry>() {
+            Ok(entry) => Error::Refused {
+                path: PathBuf::from(entry.0.as_str()),
+                reason: Refusal::ExecutableInDirectory,
+            }
+            .into(),
+            Err(e) => e,
+        }
+    })?;
+    check_case_collisions(&manifest)?;
+    manifest
+        .entries()
+        .iter()
+        .map(|e| {
+            let path = e.relpath.to_repo_path().with_context(|| Error::Refused {
+                path: PathBuf::from(e.relpath.as_str()),
+                reason: Refusal::UnwritableName,
+            })?;
+            Ok((path.to_fs_path(into), e.md5.clone()))
+        })
+        .collect()
+}
+
+/// What pull found locally, before downloading anything.
+struct Checked {
+    /// Each object to download, with every path to place it at and whether
+    /// the file there is replaced.
+    by_object: BTreeMap<Hexdigest, Vec<(PathBuf, bool)>>,
+    unchanged: usize,
+    extra_local: usize,
+}
+
+/// Classify every target under `into`, hashing the local files a pull may
+/// replace, and refuse (or report every conflict) before anything is
+/// written; `dir` says `into` is a directory output, whose extra files are
+/// counted. Blocks.
+fn check_targets(
+    into: &Path,
+    targets: Vec<(PathBuf, Hexdigest)>,
+    dir: bool,
+    mode: WorktreeMode,
+    opts: &PullOptions,
+) -> Result<Checked> {
+    // Per target: `None` if it is already right, else whether to replace it.
+    let mut fetch = Vec::with_capacity(targets.len());
     let mut conflicts = Vec::new();
     let mut unchanged = 0;
     opts.progress.emit(|| ProgressEvent::Started {
@@ -986,7 +1257,7 @@ async fn pull_async(
     });
     for (path, md5) in &targets {
         opts.cancel.check()?;
-        let target = classify_target(&into, path, md5)?;
+        let target = classify_target(into, path, md5)?;
         opts.progress.emit(|| ProgressEvent::Advanced {
             phase: Phase::Hashing,
             files: 1,
@@ -995,47 +1266,38 @@ async fn pull_async(
                 Target::Same | Target::Differs => std::fs::metadata(path).map_or(0, |m| m.len()),
             },
         });
-        match target {
+        fetch.push(match target {
             Target::Same => {
                 unchanged += 1;
                 if mode == WorktreeMode::Executable {
                     make_executable(path)?;
                 }
+                None
             }
-            Target::Missing => plan.push((path, md5, false)),
+            Target::Missing => Some(false),
             Target::Differs => match opts.overwrite {
-                Overwrite::Refuse => conflicts.push(path.clone()),
-                Overwrite::Force => plan.push((path, md5, true)),
+                Overwrite::Refuse => {
+                    conflicts.push(path.clone());
+                    None
+                }
+                Overwrite::Force => Some(true),
             },
-        }
+        });
     }
     if !conflicts.is_empty() {
         return Err(Error::PullConflict { paths: conflicts }.into());
     }
-
-    let extra_local = match &pointer.output {
-        DvcOutput::Dir { .. } => count_extra(&into, &targets),
-        DvcOutput::File { .. } => 0,
-    };
+    let extra_local = if dir { count_extra(into, &targets) } else { 0 };
 
     // Fetch each object once, then place it at every path that needs it.
-    let mut by_object: BTreeMap<&Hexdigest, Vec<(&PathBuf, bool)>> = BTreeMap::new();
-    for (path, md5, replace) in plan {
-        by_object.entry(md5).or_default().push((path, replace));
+    let mut by_object: BTreeMap<Hexdigest, Vec<(PathBuf, bool)>> = BTreeMap::new();
+    for ((path, md5), replace) in targets.into_iter().zip(fetch) {
+        if let Some(replace) = replace {
+            by_object.entry(md5).or_default().push((path, replace));
+        }
     }
-    opts.progress.emit(|| ProgressEvent::Started {
-        phase: Phase::Downloading,
-        files: by_object.values().map(|places| places.len() as u64).sum(),
-        bytes: match &pointer.output {
-            DvcOutput::File { size, .. } => Some(*size),
-            DvcOutput::Dir { .. } => None,
-        },
-    });
-    let written = fetch_and_place(remote, by_object, opts, mode).await?;
-
-    Ok(PullReport {
-        pointer,
-        written,
+    Ok(Checked {
+        by_object,
         unchanged,
         extra_local,
     })
@@ -1146,51 +1408,60 @@ fn count_extra(root: &Path, targets: &[(PathBuf, Hexdigest)]) -> usize {
 /// Download each object once and place it at every path that needs it,
 /// with `mode`, `opts.jobs` objects at a time. Once cancelled no download
 /// starts; those under way finish and are placed whole, and the pull stops.
+/// A downloaded object is placed on the blocking pool, and placed whole
+/// even if the future is dropped meanwhile.
 async fn fetch_and_place(
     remote: &Remote,
-    by_object: BTreeMap<&Hexdigest, Vec<(&PathBuf, bool)>>,
+    by_object: BTreeMap<Hexdigest, Vec<(PathBuf, bool)>>,
     opts: &PullOptions,
     mode: WorktreeMode,
 ) -> Result<usize> {
-    use futures::stream::{self, StreamExt, TryStreamExt};
     let cancel = &opts.cancel;
-    let counts: Vec<usize> = stream::iter(by_object)
-        .map(|(md5, places)| async move {
-            if cancel.is_cancelled() {
-                return Ok(0);
-            }
-            let (first, _) = places[0];
-            let dir = first.parent().context("target has no parent")?;
-            std::fs::create_dir_all(dir)?;
-            let tmp = backend::download_verified(
-                &remote.backend,
-                &remote.object_key(md5),
-                md5,
-                &long_path(dir)?,
-            )
-            .await?;
-            let bytes = tmp.as_file().metadata()?.len();
-            // Extra copies first (from the verified temp), then move the temp.
-            for (path, replace) in &places[1..] {
-                let parent = path.parent().context("target has no parent")?;
-                std::fs::create_dir_all(parent)?;
-                let mut copy = tempfile::NamedTempFile::new_in(long_path(parent)?)?;
-                std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut copy)?;
-                place(copy, path, *replace, mode)?;
-            }
-            place(tmp, first, places[0].1, mode)?;
-            opts.progress.emit(|| ProgressEvent::Advanced {
-                phase: Phase::Downloading,
-                files: places.len() as u64,
-                bytes,
-            });
-            Ok::<_, anyhow::Error>(places.len())
-        })
-        .buffer_unordered(opts.jobs.max(1))
-        .try_collect()
+    let counts: Vec<usize> = each_unordered(by_object, opts.jobs, |(md5, places)| async move {
+        if cancel.is_cancelled() {
+            return Ok(0);
+        }
+        let dir = places[0].0.parent().context("target has no parent")?;
+        tokio::fs::create_dir_all(dir).await?;
+        let tmp = backend::download_verified(
+            &remote.backend,
+            &remote.object_key(&md5),
+            &md5,
+            &long_path(dir)?,
+        )
         .await?;
+        let progress = opts.progress.clone();
+        backend::blocking(move || place_all(tmp, &places, mode, &progress)).await
+    })
+    .await?;
     cancel.check()?;
     Ok(counts.into_iter().sum())
+}
+
+/// Place a verified download at every path in `places`: copies from it
+/// first, then the temp file itself. Blocks.
+fn place_all(
+    tmp: tempfile::NamedTempFile,
+    places: &[(PathBuf, bool)],
+    mode: WorktreeMode,
+    progress: &Progress,
+) -> Result<usize> {
+    let bytes = tmp.as_file().metadata()?.len();
+    for (path, replace) in &places[1..] {
+        let parent = path.parent().context("target has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let mut copy = tempfile::NamedTempFile::new_in(long_path(parent)?)?;
+        std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut copy)?;
+        place(copy, path, *replace, mode)?;
+    }
+    let (first, replace) = &places[0];
+    place(tmp, first, *replace, mode)?;
+    progress.emit(|| ProgressEvent::Advanced {
+        phase: Phase::Downloading,
+        files: places.len() as u64,
+        bytes,
+    });
+    Ok(places.len())
 }
 
 /// Move a verified temp file into place with `mode`'s permissions (the

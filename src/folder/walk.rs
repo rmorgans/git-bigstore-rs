@@ -150,15 +150,14 @@ impl From<WalkError> for anyhow::Error {
 }
 
 #[cfg(test)]
-type Hook = Box<dyn FnMut(&Path)>;
+type Hook = Box<dyn FnMut(&Path) + Send>;
 
+/// Test seam: each hook is called with every directory of a walk of its
+/// root right after the walk has listed it, so a test can change the tree at
+/// an exact point mid-walk. Keyed by root rather than thread-local: push
+/// walks on tokio's blocking pool, and tests run in parallel.
 #[cfg(test)]
-thread_local! {
-    /// Test seam: called with each directory right after the walk has
-    /// listed it, so a test can change the tree at an exact point mid-walk.
-    static AFTER_LISTING: std::cell::RefCell<Option<Hook>> =
-        const { std::cell::RefCell::new(None) };
-}
+static AFTER_LISTING: std::sync::Mutex<Vec<(PathBuf, Hook)>> = std::sync::Mutex::new(Vec::new());
 
 /// Walk `root`.
 ///
@@ -266,11 +265,11 @@ pub fn walk(root: &Path, excludes: &Excludes) -> Result<Walk, WalkError> {
             files.push(WalkedFile { relpath, path });
         }
         #[cfg(test)]
-        AFTER_LISTING.with_borrow_mut(|hook| {
-            if let Some(hook) = hook {
-                hook(&dir)
+        for (hooked, hook) in AFTER_LISTING.lock().unwrap().iter_mut() {
+            if hooked == root {
+                hook(&dir);
             }
-        });
+        }
         if !any && !rel.is_empty() {
             empty_dirs += 1;
         }
@@ -421,8 +420,8 @@ mod tests {
             self, Credentials, HistoryKey, PointerSource, PullOptions, PushOptions, Remote,
             RemoteConfig,
         };
-        use std::cell::Cell;
-        use std::rc::Rc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("out");
         let site = out.join("site");
@@ -431,13 +430,13 @@ mod tests {
         std::fs::write(site.join("gt_geometry/a.parquet"), b"a").unwrap();
         std::fs::write(site.join("gt_geometry/b.parquet"), b"b").unwrap();
 
-        let walks = Rc::new(Cell::new(0));
+        let walks = Arc::new(AtomicUsize::new(0));
         let hook = {
             let (out, walks) = (out.clone(), walks.clone());
             let mut renamed = false;
             move |dir: &Path| {
                 if dir == out {
-                    walks.set(walks.get() + 1);
+                    walks.fetch_add(1, Ordering::SeqCst);
                 }
                 if !renamed && dir.ends_with(after) {
                     renamed = true;
@@ -446,7 +445,10 @@ mod tests {
                 }
             }
         };
-        AFTER_LISTING.set(Some(Box::new(hook)));
+        AFTER_LISTING
+            .lock()
+            .unwrap()
+            .push((out.clone(), Box::new(hook)));
         let remote = Remote::open(&RemoteConfig {
             url: format!("local://{}", tmp.path().join("remote").display()),
             endpoint: None,
@@ -462,7 +464,10 @@ mod tests {
                 ..PushOptions::new(HistoryKey::new("ds/out").unwrap())
             },
         );
-        AFTER_LISTING.set(None);
+        AFTER_LISTING
+            .lock()
+            .unwrap()
+            .retain(|(root, _)| *root != out);
         let report = pushed.unwrap();
         assert_eq!(report.files, 3);
 
@@ -488,7 +493,7 @@ mod tests {
             })
             .collect();
         restored.sort();
-        (walks.get(), restored)
+        (walks.load(Ordering::SeqCst), restored)
     }
 
     fn renamed_tree() -> Vec<(String, Vec<u8>)> {

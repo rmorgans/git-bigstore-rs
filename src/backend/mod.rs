@@ -112,8 +112,26 @@ pub async fn list(backend: &Backend, prefix: &str) -> Result<Vec<String>> {
     Ok(keys)
 }
 
+/// Run blocking filesystem or CPU work on tokio's blocking pool, so it never
+/// stalls a runtime worker thread (the caller's, for the library's async
+/// API). A panic in `work` resumes in the caller.
+pub(crate) async fn blocking<T, F>(work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(e) => match e.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(e) => Err(e.into()),
+        },
+    }
+}
+
 /// Download `key` into a new temp file in `dir`, hashing while it streams,
-/// and return the file only if its content is `expected`.
+/// and return the file only if its content is `expected`. The file is
+/// created, written and hashed on the blocking pool.
 pub async fn download_verified(
     backend: &Backend,
     key: &str,
@@ -121,33 +139,40 @@ pub async fn download_verified(
     dir: &Path,
 ) -> Result<tempfile::NamedTempFile> {
     use crate::hash::Hasher;
-    use tokio::io::AsyncWriteExt;
 
-    let tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let dir = dir.to_path_buf();
+    let tmp = blocking(move || Ok(tempfile::NamedTempFile::new_in(dir)?)).await?;
+    let hash_fn = expected.hash_fn();
     let (tmp, actual) = match backend {
         Backend::ObjectStore(store) => {
             use futures::StreamExt;
-            let mut file = tokio::fs::File::from_std(tmp.reopen()?);
+            use std::io::Write;
             let mut stream = store
                 .get(&object_store::path::Path::from(key))
                 .await?
                 .into_stream();
-            let mut hasher = Hasher::new(expected.hash_fn());
+            // The file and hasher go to the blocking pool with each chunk.
+            let mut state = (tmp, Hasher::new(hash_fn));
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
-                hasher.update(&chunk);
-                file.write_all(&chunk).await?;
+                state = blocking(move || {
+                    let (mut tmp, mut hasher) = state;
+                    hasher.update(&chunk);
+                    tmp.write_all(&chunk)?;
+                    Ok((tmp, hasher))
+                })
+                .await?;
             }
-            file.flush().await?;
+            let (tmp, hasher) = state;
             (tmp, hasher.finalize())
         }
         Backend::Rclone(r) => {
             let tmp = rclone_into(r, key, tmp).await?;
-            let (path, hash_fn) = (tmp.path().to_path_buf(), expected.hash_fn());
-            let actual =
-                tokio::task::spawn_blocking(move || crate::hash::hash_file(&path, hash_fn))
-                    .await??;
-            (tmp, actual)
+            blocking(move || {
+                let actual = crate::hash::hash_file(tmp.path(), hash_fn)?;
+                Ok((tmp, actual))
+            })
+            .await?
         }
     };
     anyhow::ensure!(
@@ -160,7 +185,7 @@ pub async fn download_verified(
 /// Have rclone write `key` to `tmp`'s path. rclone replaces the file by
 /// renaming its own partial download over it, which Windows refuses while any
 /// handle to the file is open ("Access is denied"), so ours is closed for the
-/// download and the file reopened afterwards.
+/// download and the file reopened afterwards (on the blocking pool).
 pub(crate) async fn rclone_into(
     r: &rclone::RcloneBackend,
     key: &str,
@@ -168,11 +193,14 @@ pub(crate) async fn rclone_into(
 ) -> Result<tempfile::NamedTempFile> {
     let path = tmp.into_temp_path();
     r.download(key, &path).await?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)?;
-    Ok(tempfile::NamedTempFile::from_parts(file, path))
+    blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok(tempfile::NamedTempFile::from_parts(file, path))
+    })
+    .await
 }
 
 /// Upload a local file to the remote. Streams — does not buffer the entire file.

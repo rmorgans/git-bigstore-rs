@@ -5,9 +5,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use futures::stream::{self, StreamExt, TryStreamExt};
 
-use super::{block_on, CancelToken, Error, Remote};
+use super::{block_on, each_in_order, CancelToken, Error, Remote};
 use crate::backend;
 use crate::dvc::{DvcOutput, DvcPointer};
 use crate::types::{Hexdigest, PortableRelPath};
@@ -140,20 +139,21 @@ async fn fetch(remote: &Remote, listed: &Listed) -> Result<HistoryRecord> {
 
 /// Fetch `listed`, `jobs` at a time, in order. Once `cancel` is cancelled
 /// no fetch starts, and the call is [`Error::Cancelled`].
-async fn fetch_all<'a>(
+async fn fetch_all<'a, I>(
     remote: &Remote,
-    listed: impl IntoIterator<Item = &'a Listed>,
+    listed: I,
     jobs: usize,
     cancel: &CancelToken,
-) -> Result<Vec<HistoryRecord>> {
-    stream::iter(listed)
-        .map(|l| async move {
-            cancel.check()?;
-            fetch(remote, l).await
-        })
-        .buffered(jobs.max(1))
-        .try_collect()
-        .await
+) -> Result<Vec<HistoryRecord>>
+where
+    I: IntoIterator<Item = &'a Listed>,
+    I::IntoIter: Send,
+{
+    each_in_order(listed, jobs, |l| async move {
+        cancel.check()?;
+        fetch(remote, l).await
+    })
+    .await
 }
 
 /// How to read a log. `LogOptions::default()` fetches 8 records at a time
@@ -179,10 +179,17 @@ impl Default for LogOptions {
 /// Every pushed version of `key`, oldest first: one listing, then every
 /// record fetched, `opts.jobs` at a time.
 pub fn log(remote: &Remote, key: &HistoryKey, opts: &LogOptions) -> Result<Vec<HistoryRecord>> {
-    block_on(async {
-        let listed = list(remote, key).await?;
-        fetch_all(remote, &listed, opts.jobs, &opts.cancel).await
-    })?
+    block_on("log", log_async(remote, key, opts))?
+}
+
+/// [`log`] on the caller's tokio runtime (see [the module docs](super)).
+pub async fn log_async(
+    remote: &Remote,
+    key: &HistoryKey,
+    opts: &LogOptions,
+) -> Result<Vec<HistoryRecord>> {
+    let listed = list(remote, key).await?;
+    fetch_all(remote, &listed, opts.jobs, &opts.cancel).await
 }
 
 /// Every history key holding at least one version, sorted: all of them, or
@@ -192,12 +199,18 @@ pub fn log(remote: &Remote, key: &HistoryKey, opts: &LogOptions) -> Result<Vec<H
 /// (written by another tool, or by hand, with a non-portable name): such a
 /// key is left out silently, not reported.
 pub fn keys(remote: &Remote, under: Option<&HistoryKey>) -> Result<Vec<HistoryKey>> {
+    block_on("keys", keys_async(remote, under))?
+}
+
+/// [`keys`] on the caller's tokio runtime (see [the module docs](super)).
+pub async fn keys_async(remote: &Remote, under: Option<&HistoryKey>) -> Result<Vec<HistoryKey>> {
     let root = remote.key("bigstore-history/");
     let prefix = match under {
         Some(key) => history_prefix(remote, key),
         None => root.clone(),
     };
-    let mut keys: Vec<HistoryKey> = block_on(backend::list(&remote.backend, &prefix))??
+    let mut keys: Vec<HistoryKey> = backend::list(&remote.backend, &prefix)
+        .await?
         .iter()
         .filter_map(|object| {
             let (key, name) = object.strip_prefix(&root)?.rsplit_once('/')?;
@@ -454,7 +467,8 @@ mod tests {
             backend: Backend::ObjectStore(store.clone()),
             prefix: String::new(),
         };
-        block_on(async {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
             for i in 1..=n {
                 let md5 = id(i);
                 let pointer = DvcPointer {
@@ -469,8 +483,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-        })
-        .unwrap();
+        });
         (remote, store)
     }
 
