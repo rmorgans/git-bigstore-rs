@@ -537,6 +537,11 @@ let report = folder::push(&remote, dir, &PushOptions {
 let pulled = folder::pull(&remote, &PointerSource::File(dvc_file), &PullOptions::default())?;
 ```
 
+Build options from `PushOptions::new(history)` or `PullOptions::default()`
+and override fields with `..`, as above: options added later get their
+defaults there, so a caller pinned to a revision keeps compiling when it
+moves to the next one. A struct literal naming every field does not.
+
 Cancelling from another thread (a request handler, a UI button): every
 clone of a `CancelToken` shares one flag. Push, status and pull check it
 between files and between objects; whatever is being hashed, uploaded or
