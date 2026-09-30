@@ -194,6 +194,8 @@ enum FolderCommand {
         history: String,
         #[command(flatten)]
         remote: RemoteArgs,
+        #[arg(short, long)]
+        jobs: Option<NonZeroUsize>,
     },
 }
 
@@ -773,9 +775,14 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                 r.written, r.unchanged, r.extra_local
             );
         }
-        FolderCommand::Log { history, remote } => {
+        FolderCommand::Log {
+            history,
+            remote,
+            jobs,
+        } => {
             let remote = open_folder_remote(&remote)?;
-            for r in folder::log(&remote, &HistoryKey::new(&history)?)? {
+            let key = HistoryKey::new(&history)?;
+            for r in folder::log(&remote, &key, resolve_jobs(jobs)?.get())? {
                 let (kind, detail) = match &r.pointer.output {
                     dvc::DvcOutput::Dir { size, nfiles, .. } => {
                         ("dir", format!("{nfiles} files, {size} bytes"))

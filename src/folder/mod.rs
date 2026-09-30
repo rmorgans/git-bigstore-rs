@@ -12,6 +12,7 @@
 //! Nothing here calls git.
 
 mod error;
+mod history;
 mod snapshot;
 mod walk;
 
@@ -24,8 +25,9 @@ pub use crate::backend::store::Credentials;
 use crate::backend::{self, Backend};
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
-use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath, PortableRelPath};
+use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath};
 pub use error::{Error, Refusal};
+pub use history::{log, HistoryKey, HistoryRecord, Selector};
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
 use snapshot::{Snapshot, SnapshotError};
@@ -33,8 +35,6 @@ use walk::WalkError;
 
 /// Largest `.dir` manifest pull will fetch into memory.
 const MAX_MANIFEST_BYTES: u64 = 64 << 20;
-/// Largest history record pull will fetch.
-const MAX_RECORD_BYTES: u64 = 64 << 10;
 /// How often push restarts when files change under it.
 const PUSH_ATTEMPTS: usize = 3;
 
@@ -126,143 +126,6 @@ fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output> {
         .build()
         .context("failed to start async runtime")?;
     Ok(rt.block_on(fut))
-}
-
-// ──────────────────────────────────────────────────
-// History
-// ──────────────────────────────────────────────────
-
-/// Identifies an output across hosts and time, e.g.
-/// `ST032_Warrawoona/BeatonsCreek_dataset1_September2026/annotations/reviewer=rick/host=xenoglossicist`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryKey(PortableRelPath);
-
-impl HistoryKey {
-    pub fn new(key: &str) -> Result<Self> {
-        Ok(Self(
-            PortableRelPath::new(key).context("invalid history key")?,
-        ))
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-/// One pushed version of an output.
-#[derive(Debug, Clone)]
-pub struct HistoryRecord {
-    /// Remote key of the record.
-    pub key: String,
-    /// When it was pushed (UTC), as recorded in the key.
-    pub time: chrono::DateTime<chrono::Utc>,
-    pub pointer: DvcPointer,
-}
-
-/// Record key time format: fixed width, so key order is time order.
-const RECORD_TIME: &str = "%Y%m%dT%H%M%S%.9fZ";
-
-impl HistoryRecord {
-    /// The id this version is addressed by: manifest id or file md5.
-    pub fn id(&self) -> &Hexdigest {
-        output_id(&self.pointer.output)
-    }
-}
-
-fn output_id(output: &DvcOutput) -> &Hexdigest {
-    match output {
-        DvcOutput::Dir { manifest, .. } => manifest,
-        DvcOutput::File { md5, .. } => md5,
-    }
-}
-
-/// Which version to restore.
-#[derive(Debug, Clone)]
-pub enum Selector {
-    Latest,
-    /// An id prefix of at least 8 hex characters; must match one version.
-    Id(String),
-    /// The newest version pushed at or before this time (RFC 3339).
-    AtOrBefore(String),
-}
-
-fn history_prefix(remote: &Remote, key: &HistoryKey) -> String {
-    remote.key(&format!("bigstore-history/{}/", key.as_str()))
-}
-
-async fn read_history(remote: &Remote, key: &HistoryKey) -> Result<Vec<HistoryRecord>> {
-    let prefix = history_prefix(remote, key);
-    let mut records = Vec::new();
-    for object in backend::list(&remote.backend, &prefix).await? {
-        let Some(name) = object.strip_prefix(&prefix) else {
-            continue;
-        };
-        // Records sit directly under the prefix; deeper keys are other outputs.
-        if name.contains('/') || !name.ends_with(".dvc") {
-            continue;
-        }
-        let Some(time) = name
-            .split_once('-')
-            .and_then(|(t, _)| chrono::NaiveDateTime::parse_from_str(t, RECORD_TIME).ok())
-        else {
-            continue; // not a record this version wrote
-        };
-        let time = time.and_utc();
-        let bytes = backend::get_bytes(&remote.backend, &object, MAX_RECORD_BYTES)
-            .await?
-            .with_context(|| format!("history record {object} vanished"))?;
-        let text = String::from_utf8(bytes).with_context(|| format!("{object} is not UTF-8"))?;
-        let pointer = DvcPointer::parse(&text).with_context(|| format!("bad record {object}"))?;
-        records.push(HistoryRecord {
-            key: object,
-            time,
-            pointer,
-        });
-    }
-    records.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.key.cmp(&b.key)));
-    Ok(records)
-}
-
-/// Every pushed version of `key`, oldest first.
-pub fn log(remote: &Remote, key: &HistoryKey) -> Result<Vec<HistoryRecord>> {
-    block_on(read_history(remote, key))?
-}
-
-fn select<'a>(records: &'a [HistoryRecord], at: &Selector) -> Result<&'a HistoryRecord> {
-    let found = match at {
-        Selector::Latest => records.last(),
-        Selector::Id(prefix) => {
-            if prefix.len() < 8 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(Error::InvalidVersionId {
-                    prefix: prefix.clone(),
-                }
-                .into());
-            }
-            let prefix = prefix.to_ascii_lowercase();
-            let matches: Vec<&HistoryRecord> = records
-                .iter()
-                .filter(|r| r.id().to_string().starts_with(&prefix))
-                .collect();
-            match matches.as_slice() {
-                [] => None,
-                [one] => Some(*one),
-                many => {
-                    return Err(Error::AmbiguousId {
-                        prefix,
-                        candidates: many.iter().map(|r| (*r).clone()).collect(),
-                    }
-                    .into())
-                }
-            }
-        }
-        Selector::AtOrBefore(when) => {
-            let when = chrono::DateTime::parse_from_rfc3339(when)
-                .with_context(|| Error::InvalidTime { time: when.clone() })?
-                .with_timezone(&chrono::Utc);
-            records.iter().rev().find(|r| r.time <= when)
-        }
-    };
-    found.ok_or_else(|| Error::NoSuchVersion.into())
 }
 
 // ──────────────────────────────────────────────────
@@ -480,7 +343,7 @@ async fn publish(
         backend::put_bytes(&remote.backend, &remote.manifest_key(manifest), bytes).await?;
     }
     write_pointer_file(&pointer_path, &pointer)?;
-    let history_record = append_history(remote, &opts.history, &pointer).await?;
+    let history_record = history::append(remote, &opts.history, &pointer).await?;
 
     Ok(PushReport {
         pointer,
@@ -513,35 +376,6 @@ async fn upload_all(remote: &Remote, snaps: &[Snapshot], jobs: usize) -> Result<
         .await?;
     let uploaded = results.iter().filter(|u| **u).count();
     Ok((uploaded, results.len() - uploaded))
-}
-
-/// Append `pointer` to the output's history unless the latest record is the
-/// same version. Record keys are `<time>-<id>.dvc` with nanosecond time, so
-/// two hosts pushing at once never overwrite each other's record. The time
-/// is never earlier than the latest record's, so the newest push is always
-/// `Latest` even if this host's clock lags.
-async fn append_history(
-    remote: &Remote,
-    key: &HistoryKey,
-    pointer: &DvcPointer,
-) -> Result<Option<String>> {
-    let records = read_history(remote, key).await?;
-    let latest = records.last();
-    if latest.is_some_and(|r| r.pointer.output == pointer.output) {
-        return Ok(None);
-    }
-    let mut time = chrono::Utc::now();
-    if let Some(r) = latest {
-        time = time.max(r.time + chrono::Duration::nanoseconds(1));
-    }
-    let record = format!(
-        "{}{}-{}.dvc",
-        history_prefix(remote, key),
-        time.format(RECORD_TIME),
-        output_id(&pointer.output)
-    );
-    backend::put_bytes(&remote.backend, &record, pointer.to_yaml().into_bytes()).await?;
-    Ok(Some(record))
 }
 
 /// The output's name: one portable path component.
@@ -706,8 +540,8 @@ async fn pull_async(
             (pointer, Some(into))
         }
         PointerSource::History { key, at } => {
-            let records = read_history(remote, key).await?;
-            (select(&records, at)?.pointer.clone(), None)
+            let record = history::select(remote, key, at, opts.jobs.max(1)).await?;
+            (record.pointer, None)
         }
     };
     let into = opts

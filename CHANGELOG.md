@@ -76,6 +76,13 @@
   skips more, with `.gitignore` rules relative to the pushed directory.
   Anyone also running `dvc add` on the folder needs the same patterns in
   `.dvcignore`; the README gives the lines.
+- **Folder history is read by listing.** A record's name holds its time and
+  id, so `folder push` and `folder pull --history` now fetch only the one
+  record they need instead of every record of the key (a push onto 50
+  versions made 50 GETs; now 1). `folder::log` takes a `jobs` argument and
+  fetches records that many at a time (`folder log -j`). A record whose
+  pointer is not the version its name says is refused as a bad record, and
+  a malformed `--at` is refused before the remote is contacted.
 
 ### Fixed
 

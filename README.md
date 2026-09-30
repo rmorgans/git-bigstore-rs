@@ -452,7 +452,9 @@ What it guarantees:
 - **History without git.** Every push that changes an output appends its
   pointer to `bigstore-history/<key>/` on the remote. A push that changes
   nothing adds nothing. Versions are ordered by push time; each record is a
-  valid `.dvc` file.
+  valid `.dvc` file, named `<time>-<id>.dvc`, so push and pull pick a
+  version from one listing and fetch only that record, however long the
+  history.
 - **Pull never destroys local work.** It refuses to replace a file that
   differs unless forced, never deletes files missing from the version, never
   writes through a symlink, and writes via temp file plus rename (never a
