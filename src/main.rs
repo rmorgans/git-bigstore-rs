@@ -931,7 +931,11 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
         } => {
             let remote = open_folder_remote(&remote)?;
             let key = HistoryKey::new(&history)?;
-            for r in folder::log(&remote, &key, resolve_jobs(jobs)?.get())? {
+            let opts = folder::LogOptions {
+                jobs: resolve_jobs(jobs)?.get(),
+                cancel: cancel_on_ctrl_c()?,
+            };
+            for r in folder::log(&remote, &key, &opts)? {
                 let (kind, detail) = match &r.pointer.output {
                     dvc::DvcOutput::Dir { size, nfiles, .. } => {
                         ("dir", format!("{nfiles} files, {size} bytes"))

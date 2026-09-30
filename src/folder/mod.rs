@@ -30,7 +30,7 @@ use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use crate::types::{check_portable_component, long_path, Hexdigest, Layout, ManifestPath};
 pub use error::{Error, Refusal};
-pub use history::{keys, log, HistoryKey, HistoryRecord, Selector};
+pub use history::{keys, log, HistoryKey, HistoryRecord, LogOptions, Selector};
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
 use snapshot::{Snapshot, SnapshotError};
@@ -135,11 +135,11 @@ fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output> {
 // Cancellation
 // ──────────────────────────────────────────────────
 
-/// Stops a push, status or pull from another thread. Clones share one flag;
-/// the default token is never cancelled (nobody else holds it). Checked
-/// between files and between objects: a file being hashed, uploaded or
-/// downloaded when it is cancelled is finished first. A cancelled call
-/// returns [`Error::Cancelled`].
+/// Stops a push, status, pull or log from another thread. Clones share one
+/// flag; the default token is never cancelled (nobody else holds it).
+/// Checked between files, objects and history records: a file being
+/// hashed, uploaded or downloaded when it is cancelled is finished first. A
+/// cancelled call returns [`Error::Cancelled`].
 #[derive(Debug, Clone, Default)]
 pub struct CancelToken(Arc<AtomicBool>);
 

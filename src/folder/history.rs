@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
 
-use super::{block_on, Error, Remote};
+use super::{block_on, CancelToken, Error, Remote};
 use crate::backend;
 use crate::dvc::{DvcOutput, DvcPointer};
 use crate::types::{Hexdigest, PortableRelPath};
@@ -138,23 +138,51 @@ async fn fetch(remote: &Remote, listed: &Listed) -> Result<HistoryRecord> {
     })
 }
 
-/// Fetch `listed`, `jobs` at a time, in order.
+/// Fetch `listed`, `jobs` at a time, in order. Once `cancel` is cancelled
+/// no fetch starts, and the call is [`Error::Cancelled`].
 async fn fetch_all<'a>(
     remote: &Remote,
     listed: impl IntoIterator<Item = &'a Listed>,
     jobs: usize,
+    cancel: &CancelToken,
 ) -> Result<Vec<HistoryRecord>> {
     stream::iter(listed)
-        .map(|l| fetch(remote, l))
+        .map(|l| async move {
+            cancel.check()?;
+            fetch(remote, l).await
+        })
         .buffered(jobs.max(1))
         .try_collect()
         .await
 }
 
+/// How to read a log. `LogOptions::default()` fetches 8 records at a time
+/// and cannot be cancelled.
+#[derive(Debug, Clone)]
+pub struct LogOptions {
+    /// Records fetched at once (at least 1).
+    pub jobs: usize,
+    /// Stops the log between record fetches: no fetch starts once it is
+    /// cancelled, and the call returns [`Error::Cancelled`].
+    pub cancel: CancelToken,
+}
+
+impl Default for LogOptions {
+    fn default() -> Self {
+        Self {
+            jobs: crate::transfer::DEFAULT_CONCURRENCY,
+            cancel: CancelToken::default(),
+        }
+    }
+}
+
 /// Every pushed version of `key`, oldest first: one listing, then every
-/// record fetched, `jobs` at a time.
-pub fn log(remote: &Remote, key: &HistoryKey, jobs: usize) -> Result<Vec<HistoryRecord>> {
-    block_on(async { fetch_all(remote, &list(remote, key).await?, jobs).await })?
+/// record fetched, `opts.jobs` at a time.
+pub fn log(remote: &Remote, key: &HistoryKey, opts: &LogOptions) -> Result<Vec<HistoryRecord>> {
+    block_on(async {
+        let listed = list(remote, key).await?;
+        fetch_all(remote, &listed, opts.jobs, &opts.cancel).await
+    })?
 }
 
 /// Every history key holding at least one version, sorted: all of them, or
@@ -231,7 +259,9 @@ pub(super) async fn select(
                 [] => None,
                 [one] => Some(*one),
                 many => {
-                    let candidates = fetch_all(remote, many.iter().copied(), jobs).await?;
+                    // Pull's cancel is checked between files; this is one step.
+                    let never = CancelToken::default();
+                    let candidates = fetch_all(remote, many.iter().copied(), jobs, &never).await?;
                     return Err(Error::AmbiguousId { prefix, candidates }.into());
                 }
             }
@@ -300,11 +330,13 @@ mod tests {
 
     type BoxFut<'a, T> = Pin<Box<dyn Future<Output = object_store::Result<T>> + Send + 'a>>;
 
-    /// `InMemory` recording every GET (not HEAD) of a history record.
+    /// `InMemory` recording every GET (not HEAD) of a history record, and
+    /// cancelling `cancel_on_get` at each.
     #[derive(Debug, Default)]
     struct CountingStore {
         inner: InMemory,
         record_gets: Mutex<Vec<String>>,
+        cancel_on_get: CancelToken,
     }
 
     impl CountingStore {
@@ -359,6 +391,7 @@ mod tests {
         {
             if !options.head && location.as_ref().starts_with("bigstore-history/") {
                 self.record_gets.lock().unwrap().push(location.to_string());
+                self.cancel_on_get.cancel();
             }
             self.inner.get_opts(location, options)
         }
@@ -497,7 +530,25 @@ mod tests {
         assert_eq!(store.take(), [record]);
 
         let key = HistoryKey::new("k").unwrap();
-        assert_eq!(log(&remote, &key, 4).unwrap().len(), 51);
+        assert_eq!(
+            log(&remote, &key, &LogOptions::default()).unwrap().len(),
+            51
+        );
         assert_eq!(store.take().len(), 51);
+    }
+
+    #[test]
+    fn log_stops_between_record_fetches_when_cancelled() {
+        let (remote, store) = remote_with_history(10);
+        let opts = LogOptions {
+            jobs: 1,
+            cancel: store.cancel_on_get.clone(),
+        };
+        let err = log(&remote, &HistoryKey::new("k").unwrap(), &opts).unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<Error>(), Some(Error::Cancelled)),
+            "{err:#}"
+        );
+        assert_eq!(store.take().len(), 1, "no fetch starts once cancelled");
     }
 }

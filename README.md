@@ -592,22 +592,24 @@ let report = folder::push(&remote, dir, &PushOptions {
 let pulled = folder::pull(&remote, &PointerSource::File(dvc_file), &PullOptions::default())?;
 ```
 
-Build options from `PushOptions::new(history)` or `PullOptions::default()`
-and override fields with `..`, as above: options added later get their
-defaults there, so a caller pinned to a revision keeps compiling when it
-moves to the next one. A struct literal naming every field does not.
+Build options from `PushOptions::new(history)`, `PullOptions::default()` or
+`LogOptions::default()` and override fields with `..`, as above: options
+added later get their defaults there, so a caller pinned to a revision
+keeps compiling when it moves to the next one. A struct literal naming
+every field does not.
 
 Cancelling from another thread (a request handler, a UI button): every
 clone of a `CancelToken` shares one flag. Push, status and pull check it
-between files and between objects; whatever is being hashed, uploaded or
-downloaded at that moment finishes first. The call then returns
+between files and between objects, and log between history records;
+whatever is being hashed, uploaded or downloaded at that moment finishes
+first. The call then returns
 `folder::Error::Cancelled`. A cancelled push has written no `.dvc` and no
 history record (objects already uploaded stay; they are content-addressed,
 and the next push skips them); the check before the `.dvc` is written is
 the last, after which the push completes. A cancelled pull leaves every file
 as it was or fully restored, never partly written, and no temp files.
-`git bigstore folder` cancels this way on the first Ctrl-C (a second one
-exits at once).
+`git bigstore folder` (push, status, pull and log) cancels this way on the
+first Ctrl-C (a second one exits at once).
 
 ```rust
 let cancel = folder::CancelToken::new();
@@ -650,7 +652,7 @@ History, from the library:
 let under = HistoryKey::new("ST032/Beatons/annotations")?;
 for key in folder::keys(&remote, Some(&under))? {
     // Every version of it, oldest first, records fetched 8 at a time.
-    for v in folder::log(&remote, &key, 8)? {
+    for v in folder::log(&remote, &key, &folder::LogOptions::default())? {
         println!("{}  {}  {}", key.as_str(), v.time, v.id());
     }
 }

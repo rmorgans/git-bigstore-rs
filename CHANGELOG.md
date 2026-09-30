@@ -58,14 +58,16 @@
   manifest was there too; a push of an unchanged directory used to report
   `0 uploaded, 0 already on the remote`.
 - Cancellation for folder mode: `folder::CancelToken` (cloneable, shared
-  flag), as `PushOptions::cancel` and `PullOptions::cancel`, checked between
-  files and between objects by push, status and pull; the call returns
+  flag), as `PushOptions::cancel`, `PullOptions::cancel` and
+  `LogOptions::cancel`, checked between files and between objects by push,
+  status and pull, and between record fetches by log; the call returns
   `folder::Error::Cancelled`. A cancelled push writes no `.dvc` and no
   history record; a cancelled pull leaves no partly written file.
-  `git bigstore folder push|status|pull` cancel this way on the first Ctrl-C.
-  `PushOptions::new(history)` and `PullOptions::default()` give the defaults
-  (8 jobs), so new options fields no longer break struct literals written
-  as `PushOptions { jobs: 4, ..PushOptions::new(key) }`.
+  `git bigstore folder push|status|pull|log` cancel this way on the first
+  Ctrl-C. `PushOptions::new(history)`, `PullOptions::default()` and
+  `LogOptions::default()` give the defaults (8 jobs), so new options fields
+  no longer break struct literals written as
+  `PushOptions { jobs: 4, ..PushOptions::new(key) }`.
 - Progress for folder mode: `folder::Progress::new(|event| …)` as
   `PushOptions::progress` and `PullOptions::progress` receives
   `ProgressEvent::Started { phase, files, bytes }` and
@@ -123,8 +125,9 @@
 - **Folder history is read by listing.** A record's name holds its time and
   id, so `folder push` and `folder pull --history` now fetch only the one
   record they need instead of every record of the key (a push onto 50
-  versions made 50 GETs; now 1). `folder::log` takes a `jobs` argument and
-  fetches records that many at a time (`folder log -j`). A record whose
+  versions made 50 GETs; now 1). `folder::log(&remote, &key, &LogOptions)`
+  takes options like push and pull (`jobs`, `cancel`) and fetches records
+  `jobs` at a time (`folder log -j`). A record whose
   pointer is not the version its name says is refused as a bad record, and
   a malformed `--at` is refused before the remote is contacted.
 - **`folder pull` reads any single-output DVC 3 `.dvc`**, ignoring stage

@@ -3,9 +3,9 @@
 
 use bigstore::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use bigstore::folder::{
-    self, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey, Overwrite, Phase,
-    PointerSource, Progress, ProgressEvent, PullOptions, PushOptions, Refusal, Remote,
-    RemoteConfig, Selector, SyncState,
+    self, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey, HistoryRecord,
+    LogOptions, Overwrite, Phase, PointerSource, Progress, ProgressEvent, PullOptions, PushOptions,
+    Refusal, Remote, RemoteConfig, Selector, SyncState,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
@@ -74,6 +74,15 @@ fn pull_opts(into: Option<PathBuf>) -> PullOptions {
         jobs: 4,
         ..PullOptions::default()
     }
+}
+
+/// `key`'s versions on `e`'s remote.
+fn history_log(e: &Env, key: &str) -> anyhow::Result<Vec<HistoryRecord>> {
+    folder::log(
+        &e.remote,
+        &HistoryKey::new(key).unwrap(),
+        &LogOptions::default(),
+    )
 }
 
 /// All regular files under `dir`, relative, with contents.
@@ -220,7 +229,7 @@ fn changing_one_file_uploads_one_object_and_adds_one_version() {
     let second = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     assert_eq!(second.uploaded, 1);
     let key = HistoryKey::new(KEY).unwrap();
-    let versions = folder::log(&e.remote, &key, 4).unwrap();
+    let versions = folder::log(&e.remote, &key, &LogOptions::default()).unwrap();
     assert_eq!(versions.len(), 2);
     // Pushed within the same second: order is push order, not id order.
     assert_eq!(versions[0].pointer.output, first.pointer.output);
@@ -791,7 +800,7 @@ fn at_or_before_restores_the_version_in_force_at_that_time() {
     folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     std::fs::write(&labels, b"{\"t\":4}\n").unwrap();
     folder::push(&e.remote, &w, &opts(KEY)).unwrap();
-    let log = folder::log(&e.remote, &HistoryKey::new(KEY).unwrap(), 4).unwrap();
+    let log = history_log(&e, KEY).unwrap();
     let [v1, v2] = &log[..] else {
         panic!("{log:?}")
     };
@@ -846,7 +855,7 @@ fn history_holds_only_its_own_outputs_records() {
     write(&e.store.join("bigstore-history/k/not-a-time.dvc"), b"x");
 
     let ids = |key: &str| -> Vec<String> {
-        folder::log(&e.remote, &HistoryKey::new(key).unwrap(), 4)
+        history_log(&e, key)
             .unwrap()
             .iter()
             .map(|r| r.id().to_string())
@@ -1127,13 +1136,13 @@ fn a_corrupt_history_record_fails_log_and_names_the_record() {
     let dir = e.store.join("bigstore-history/k");
     let not_utf8 = "20260901T000000.000000000Z-a.dvc";
     write(&dir.join(not_utf8), b"\xff\xfe");
-    let err = folder::log(&e.remote, &HistoryKey::new("k").unwrap(), 4).unwrap_err();
+    let err = history_log(&e, "k").unwrap_err();
     assert!(format!("{err:#}").contains(not_utf8), "{err:#}");
 
     std::fs::remove_file(dir.join(not_utf8)).unwrap();
     let not_a_pointer = "20260901T000000.000000000Z-b.dvc";
     write(&dir.join(not_a_pointer), b"outs: []\n");
-    let err = folder::log(&e.remote, &HistoryKey::new("k").unwrap(), 4).unwrap_err();
+    let err = history_log(&e, "k").unwrap_err();
     assert!(format!("{err:#}").contains(not_a_pointer), "{err:#}");
 }
 
@@ -1144,7 +1153,7 @@ fn records_pushed_in_the_same_nanosecond_have_a_stable_latest() {
     let (a, b) = ("a".repeat(32), "b".repeat(32));
     write_record(&e, "k", time, &b);
     write_record(&e, "k", time, &a);
-    let log = folder::log(&e.remote, &HistoryKey::new("k").unwrap(), 4).unwrap();
+    let log = history_log(&e, "k").unwrap();
     let ids: Vec<String> = log.iter().map(|r| r.id().to_string()).collect();
     assert_eq!(ids, [a, b], "ties are ordered by record key");
 }
@@ -1433,7 +1442,7 @@ fn os_junk_appearing_is_not_a_new_version() {
     assert_eq!((again.files, again.uploaded), (first.files, 0));
     assert!(again.history_record.is_none(), "junk made a new version");
     assert_eq!(std::fs::read(&again.pointer_path).unwrap(), pointer);
-    let versions = folder::log(&e.remote, &HistoryKey::new(KEY).unwrap(), 4).unwrap();
+    let versions = history_log(&e, KEY).unwrap();
     assert_eq!(versions.len(), 1);
 }
 
@@ -1512,7 +1521,7 @@ fn a_record_whose_name_and_pointer_disagree_is_refused() {
         let msg = format!("{err:#}");
         assert!(msg.contains("bad record") && msg.contains(&held), "{msg}");
     }
-    let err = folder::log(&e.remote, &HistoryKey::new("k").unwrap(), 4).unwrap_err();
+    let err = history_log(&e, "k").unwrap_err();
     assert!(format!("{err:#}").contains(&named), "{err:#}");
 }
 
