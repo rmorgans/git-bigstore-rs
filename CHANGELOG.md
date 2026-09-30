@@ -145,6 +145,11 @@
 
 ### Fixed
 
+- Downloads from an `rclone://` remote failed on Windows ("Access is
+  denied"): bigstore kept its temp file open while rclone renamed its
+  partial download over it, which Windows refuses. The temp file is now
+  closed while rclone writes (folder pull and history, and git-mode pull).
+  The Windows CI job now runs the rclone round trip.
 - `ref`, `dvc-ls` and `import-dvc-dir` refused legal DVC 3 `.dvc` files
   with fields beyond the output's hash (a regression since 0.1.0):
   `dvc import-url`'s `md5:`/`frozen:`/`deps:`, `meta:`/`desc:` annotations,
