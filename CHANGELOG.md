@@ -23,9 +23,11 @@
 - **Push checks the output's base**, the version its `.dvc` records in
   `meta: {bigstore: {base: <id>}}`, before uploading anything. An output
   equal to the only head adopts it and publishes nothing (this also
-  repairs a crash between the record and the `.dvc`). Otherwise it is
-  refused with the new `folder::Error::StaleBase { base, heads }` if there
-  is no base while history has versions, or the base is not the only head;
+  repairs a crash between the record and the `.dvc`). A `.dvc` without a
+  base that records the only head's content counts as based on it.
+  Otherwise push is refused with the new
+  `folder::Error::StaleBase { base, heads }` if there is no `.dvc` while
+  history has versions, or the base is not the only head;
   and with `folder::Error::Diverged { heads }` if the history has forked,
   unless `PushOptions::resolve` is `Resolve::Merge` (CLI:
   `folder push --resolve merge`) and the base is one of the heads. The
@@ -69,8 +71,9 @@
   (each with the id of its file name) and continues it, but never writes
   that form; 0.2 clients do not see 0.3 records, so a 0.2 writer left on a
   key forks it. Upgrade every writer of a key together. A `.dvc` 0.2 wrote
-  has no base: its output's first push adopts the head if unchanged, and is
-  `StaleBase` if changed.
+  has no base; if it records the latest version's content, its output
+  counts as based on that version, so a changed output's first push
+  follows it. If it records an older version, the push is `StaleBase`.
 - **Breaking (library):** `HistoryRecord::id()` is gone: `id` is now the
   record id, and `Selector::Id` (`--at <hex>`) matches record ids as
   `folder log` prints them, not content ids. `Selector::AtOrBefore` uses

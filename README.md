@@ -559,15 +559,18 @@ before uploading anything:
 
 1. Output equal to the only head: no new version; the head becomes the base.
    This also repairs a `.dvc` a crash left behind (see below).
-2. No base while the history has versions, or a base that is not the only
+2. A `.dvc` without a base (0.2 wrote it, or `dvc add` did) that records
+   the only head's content counts as based on the head: the output was last
+   synced to it.
+3. No base while the history has versions, or a base that is not the only
    head: refused, `folder::Error::StaleBase { base, heads }`. Nothing is
    published. Set local changes aside, pull the latest version, redo them.
-3. Several heads: refused, `folder::Error::Diverged { heads }`, unless
+4. Several heads: refused, `folder::Error::Diverged { heads }`, unless
    `--resolve merge` (`Resolve::Merge`) and the base is one of the heads;
    the new version then follows every head.
-4. Otherwise objects, then the `.dir` manifest, then the record, then the
+5. Otherwise objects, then the `.dir` manifest, then the record, then the
    `.dvc` with the new base: the base is written last.
-5. History is listed again. If another push published from the same base
+6. History is listed again. If another push published from the same base
    meanwhile, both versions stand: that is a *fork*. Push succeeds and says
    so (`PushReport::forked_with`, a warning from the CLI).
 
@@ -604,8 +607,10 @@ straight line in time order (a 0.2 record's id is that of its file name)
 and continues it, but never writes that form. A 0.2 client does not see
 0.3 records (they sit one directory deeper), so it would keep extending the
 0.2 line: 0.3 then reports a fork. Upgrade every writer of a key together.
-A `.dvc` 0.2 wrote has no base: the first 0.3 push of an unchanged output
-adopts the head, but a changed one is `StaleBase` until it is pulled again.
+A `.dvc` 0.2 wrote has no base. If it records the latest version's content,
+its output counts as based on it (step 2 above), so the first 0.3 push of
+local changes simply follows the head; if it records an older version, the
+push is `StaleBase`.
 
 What to push, and what push assumes:
 

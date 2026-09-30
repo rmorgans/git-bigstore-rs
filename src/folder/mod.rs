@@ -480,9 +480,11 @@ pub struct PushReport {
 ///
 /// History is checked first, from one listing, before anything is
 /// uploaded. An output equal to the latest version publishes no version
-/// (and becomes it, whatever its `.dvc` said). Otherwise the output's base
-/// must be the latest version: [`Error::StaleBase`] if it has none while
-/// history does, or another version landed since; [`Error::Diverged`] if
+/// (and becomes it, whatever its `.dvc` said). Otherwise the output must
+/// follow the latest version: its base is that version or, in a `.dvc`
+/// without a base (0.2 wrote it), the content recorded is that version's.
+/// If not, it is [`Error::StaleBase`]: no `.dvc` while history has
+/// versions, or another version landed since. It is [`Error::Diverged`] if
 /// the history has forked, unless [`PushOptions::resolve`] merges it.
 ///
 /// Then order is what makes this safe for DVC and for concurrent readers:
@@ -506,8 +508,14 @@ pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushRe
 pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
     let (name, pointer_path, local) = locate(output).await?;
     let mut scratch = stage(output, name, opts, |s| s).await?;
-    let base = base_of(local.as_ref());
-    let published = publish(remote, &mut scratch.get_mut().0, &pointer_path, base, opts).await;
+    let published = publish(
+        remote,
+        &mut scratch.get_mut().0,
+        &pointer_path,
+        local.as_ref(),
+        opts,
+    )
+    .await;
     let staged = &scratch.get().0;
     let report = published.map(|p| PushReport {
         pointer: p.pointer,
@@ -525,14 +533,6 @@ pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> R
     report
 }
 
-/// The base a `.dvc` records, if it is one bigstore wrote beside an output.
-fn base_of(pointer: Option<&DvcPointer>) -> Option<&RecordId> {
-    match pointer?.meta.as_ref()? {
-        BigstoreMeta::Base(id) => Some(id),
-        BigstoreMeta::Record { .. } => None,
-    }
-}
-
 /// What [`publish`] did.
 struct Published {
     pointer: DvcPointer,
@@ -543,14 +543,14 @@ struct Published {
     forked_with: Vec<RecordId>,
 }
 
-/// Publish a staged output, last synced to `base`, in push's order: decide
-/// against history, then objects, manifest, history record, `.dvc`; then
-/// look for a push that raced this one.
+/// Publish a staged output, whose `.dvc` is `local`, in push's order:
+/// decide against history, then objects, manifest, history record, `.dvc`;
+/// then look for a push that raced this one.
 async fn publish(
     remote: &Remote,
     staged: &mut Staged<Snapshot>,
     pointer_path: &Path,
-    base: Option<&RecordId>,
+    local: Option<&DvcPointer>,
     opts: &PushOptions,
 ) -> Result<Published> {
     let jobs = opts.jobs.max(1);
@@ -558,7 +558,7 @@ async fn publish(
         remote,
         &opts.history,
         &staged.pointer.output,
-        base,
+        local,
         opts.resolve,
         jobs,
     )
@@ -648,8 +648,9 @@ pub enum SyncState {
     /// still rewrite the `.dvc` beside it, if that is missing or records
     /// another base (say the output was copied in, not pulled).
     InSync,
-    /// The output changed since the latest version, its base: push would
-    /// add a version.
+    /// The output changed since the latest version, its base (or, in a
+    /// `.dvc` without a base, the content it records): push would add a
+    /// version.
     LocalAhead,
     /// The history has a newer version than the output's base, and the
     /// output has not changed since its `.dvc`: pull to catch up. Push
@@ -699,11 +700,13 @@ pub async fn status_async(
     .await;
     let report = checked.map(|(plan, heads)| {
         let output = &staged.pointer.output;
-        let base = base_of(local.as_ref());
+        let base = history::base_of(local.as_ref());
         let sync = match heads {
             history::Heads::None => SyncState::NoHistory,
             history::Heads::One(head) if head.pointer.output == *output => SyncState::InSync,
-            history::Heads::One(head) if base == Some(&head.id) => SyncState::LocalAhead,
+            history::Heads::One(head) if history::follows(&head, local.as_ref()) => {
+                SyncState::LocalAhead
+            }
             history::Heads::One(head) => match &local {
                 Some(p) if p.output == *output => SyncState::RemoteAhead { latest: *head },
                 _ => SyncState::Stale {

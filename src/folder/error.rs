@@ -82,7 +82,8 @@ pub enum Error {
     /// Push: the output's base (the version its `.dvc` says it was last
     /// pushed or pulled as) is not the latest version — another push landed
     /// since, a pull chose an older version, or there is no base while the
-    /// history has versions. Nothing was published. Set local changes
+    /// history has versions (no `.dvc`, or one without a base that records
+    /// another version's content). Nothing was published. Set local changes
     /// aside, pull the latest version, redo them, and push again.
     StaleBase {
         base: Option<RecordId>,

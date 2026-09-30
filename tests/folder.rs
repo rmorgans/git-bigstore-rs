@@ -3043,6 +3043,57 @@ fn a_02_history_reads_as_a_straight_line_that_new_versions_continue() {
     assert_eq!(diverged(&err), heads);
 }
 
+/// The pointer 0.2 wrote beside a single-file output `name` holding
+/// `content`: no base.
+fn pointer_02(content: &[u8], name: &str) -> DvcPointer {
+    DvcPointer {
+        output: DvcOutput::File {
+            md5: hash_reader(&mut &content[..], HashFunction::Md5).unwrap(),
+            size: content.len() as u64,
+        },
+        path: name.into(),
+        meta: None,
+    }
+}
+
+#[test]
+fn an_output_0_2_pushed_as_the_head_follows_it_when_changed() {
+    let e = env();
+    legacy_version(&e, "k", "20260901T000000.000000000Z", b"v0");
+    let head = legacy_version(&e, "k", "20260902T000000.000000000Z", b"v1");
+    // 0.2 pushed (or pulled) this output as v1, the head; then it changed.
+    let f = e.data.join("up/f");
+    write(&f, b"v1 edited");
+    let dvc = e.data.join("up/f.dvc");
+    write(&dvc, pointer_02(b"v1", "f").to_yaml().as_bytes());
+    let s = folder::status(&e.remote, &f, &opts("k")).unwrap();
+    assert!(matches!(s.sync, SyncState::LocalAhead), "{:?}", s.sync);
+    let pushed = folder::push(&e.remote, &f, &opts("k")).unwrap();
+    assert!(pushed.history_record.is_some());
+    let log = history_log(&e, "k").unwrap();
+    let last = log.last().unwrap();
+    assert_eq!((&last.id, &last.parents), (&pushed.version, &vec![head]));
+    assert_eq!(base_of(&dvc), Some(pushed.version.clone()));
+
+    // One whose 0.2 `.dvc` records an older version is stale.
+    let g = e.data.join("old/f");
+    write(&g, b"v0 edited");
+    write(
+        &e.data.join("old/f.dvc"),
+        pointer_02(b"v0", "f").to_yaml().as_bytes(),
+    );
+    let s = folder::status(&e.remote, &g, &opts("k")).unwrap();
+    assert!(
+        matches!(&s.sync, SyncState::Stale { base: None, head } if head.id == pushed.version),
+        "{:?}",
+        s.sync
+    );
+    let keys = remote_keys(&e.store);
+    let err = folder::push(&e.remote, &g, &opts("k")).unwrap_err();
+    assert_eq!(stale_base(&err), (None, &[pushed.version][..]));
+    assert_eq!(remote_keys(&e.store), keys, "a refused push published");
+}
+
 #[test]
 fn a_record_whose_name_disagrees_with_its_content_is_refused() {
     let e = env();

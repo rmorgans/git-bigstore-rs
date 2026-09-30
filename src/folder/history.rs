@@ -500,21 +500,40 @@ pub(super) enum Next {
     },
 }
 
-/// Decide what pushing `output`, last synced to `base`, does to `key`'s
+/// The base a `.dvc` records, if it is one bigstore wrote beside an output.
+pub(super) fn base_of(local: Option<&DvcPointer>) -> Option<&RecordId> {
+    match local?.meta.as_ref()? {
+        BigstoreMeta::Base(id) => Some(id),
+        BigstoreMeta::Record { .. } => None,
+    }
+}
+
+/// Whether an output whose `.dvc` is `local` was last synced to `head`:
+/// its base is the head or, for a `.dvc` without a base (0.2 wrote it), it
+/// records the head's content.
+pub(super) fn follows(head: &HistoryRecord, local: Option<&DvcPointer>) -> bool {
+    match base_of(local) {
+        Some(base) => *base == head.id,
+        None => local.is_some_and(|p| p.output == head.pointer.output),
+    }
+}
+
+/// Decide what pushing `output`, whose `.dvc` is `local`, does to `key`'s
 /// history, in order: an output equal to the only head adopts it (so a
 /// missing or stale base, as after a crash between the record and the
-/// `.dvc`, is no refusal); with history but no base, or a base that is not
-/// the only head, it is [`Error::StaleBase`]; with several heads it is
-/// [`Error::Diverged`] unless `resolve` merges them, which needs a base
-/// among them.
+/// `.dvc`, is no refusal); an output that does not [`follow`](follows) the
+/// only head, having no `.dvc` or another base, is [`Error::StaleBase`];
+/// with several heads it is [`Error::Diverged`] unless `resolve` merges
+/// them, which needs a base among them.
 pub(super) async fn next(
     remote: &Remote,
     key: &HistoryKey,
     output: &DvcOutput,
-    base: Option<&RecordId>,
+    local: Option<&DvcPointer>,
     resolve: Resolve,
     jobs: usize,
 ) -> Result<Next> {
+    let base = base_of(local);
     let stale = |heads| Error::StaleBase {
         base: base.cloned(),
         heads,
@@ -525,7 +544,7 @@ pub(super) async fn next(
             after: None,
         },
         Heads::One(head) if head.pointer.output == *output => Next::Adopt(head.id),
-        Heads::One(head) if base == Some(&head.id) => Next::Publish {
+        Heads::One(head) if follows(&head, local) => Next::Publish {
             parents: vec![head.id],
             after: Some(head.time),
         },
