@@ -1,0 +1,12 @@
+md5: ea52a03d2c66ec7951dc07b8b9c6b52e
+frozen: true
+deps:
+- md5: b1946ac92492d2347c6235b4d2611184
+  size: 6
+  hash: md5
+  path: ../src/f.txt
+outs:
+- md5: b1946ac92492d2347c6235b4d2611184
+  size: 6
+  hash: md5
+  path: imported.txt

@@ -1,0 +1,14 @@
+md5: c99405180decf9025823f0df606f6fb7
+frozen: true
+deps:
+- md5: 5b94ef7ba4840901cc23311660411a1d.dir
+  size: 2
+  nfiles: 2
+  hash: md5
+  path: ../src/d
+outs:
+- md5: 5b94ef7ba4840901cc23311660411a1d.dir
+  size: 2
+  nfiles: 2
+  hash: md5
+  path: imported_dir

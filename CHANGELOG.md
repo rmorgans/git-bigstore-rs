@@ -44,6 +44,14 @@
 
 ### Fixed
 
+- `ref`, `dvc-ls` and `import-dvc-dir` refused legal DVC 3 `.dvc` files
+  with fields beyond the output's hash (a regression since 0.1.0):
+  `dvc import-url`'s `md5:`/`frozen:`/`deps:`, `meta:`/`desc:` annotations,
+  `isexec:`, and per-output `remote:`/`push:`/`cloud:`. They are read for
+  their output again. Outputs with no md5-addressed object are refused
+  saying why (`cache: false`, not yet downloaded, etag/version_id only), as
+  is a `wdir:` other than `.`. `folder push` still refuses to overwrite such
+  a file, now naming the fields it would drop.
 - `pull` no longer overwrites uncommitted edits. It fills the cache, then
   replaces only files that are still the index's pointer, via
   `git checkout-index`: restored files keep their committed mode (executables

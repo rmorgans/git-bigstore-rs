@@ -456,7 +456,7 @@ fn cmd_ref(source: &RepoPath, dest: &RepoPath) -> Result<()> {
     let dvc::DvcPointer {
         output: dvc::DvcOutput::File { md5, .. },
         path: dvc_out_path,
-    } = dvc::DvcPointer::load(&source_path)?
+    } = dvc::DvcPointer::load_lenient(&source_path)?
     else {
         anyhow::bail!("{source} is a .dir .dvc file — use `git bigstore import-dvc-dir` instead");
     };
@@ -636,7 +636,8 @@ fn resolve_dir_manifest(
     dvc_cache_root: &Path,
     source_path: &Path,
 ) -> Result<(Hexdigest, Vec<dvc::ManifestEntry>)> {
-    let dvc::DvcOutput::Dir { manifest, .. } = dvc::DvcPointer::load(source_path)?.output else {
+    let dvc::DvcOutput::Dir { manifest, .. } = dvc::DvcPointer::load_lenient(source_path)?.output
+    else {
         anyhow::bail!(
             "{} is a single-file .dvc — use `git bigstore ref` instead",
             source_path.display()

@@ -2758,3 +2758,83 @@ fn one_shot_and_process_filters_agree() {
     }
     assert_eq!(listings[0], listings[1]);
 }
+
+// ──────────────────────────────────────────────────
+// .dvc files with DVC 3 stage and annotation fields
+// ──────────────────────────────────────────────────
+
+const STAGE_FIELDS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/dvc-3.67.1/stage_fields"
+);
+
+/// Copy a `.dvc` DVC 3.67.1 wrote (see `regen_stage_fields.py`) into the repo.
+fn copy_stage_fixture(t: &TestRepo, name: &str) {
+    let text = std::fs::read(Path::new(STAGE_FIELDS).join(name)).unwrap();
+    t.write_file(name, &text);
+}
+
+/// Put `content` into the repo's DVC cache as DVC 3 does; returns its md5.
+fn put_in_dvc_cache(t: &TestRepo, content: &[u8]) -> String {
+    let md5 = format!("{:x}", md5::Md5::digest(content));
+    t.write_file(
+        &format!(".dvc/cache/files/md5/{}/{}", &md5[..2], &md5[2..]),
+        content,
+    );
+    md5
+}
+
+#[test]
+fn ref_reads_a_dvc_import_url_file_with_stage_fields() {
+    // `dvc import-url` writes a stage md5, `frozen:` and `deps:`.
+    let t = TestRepo::new();
+    copy_stage_fixture(&t, "imported.txt.dvc");
+    put_in_dvc_cache(&t, b"hello\n");
+
+    bigstore_ok(&t.repo_dir, &["ref", "imported.txt.dvc", "imported.txt"]);
+    assert_eq!(t.read_file("imported.txt"), b"hello\n");
+}
+
+#[test]
+fn dvc_ls_and_import_dvc_dir_read_an_annotated_dvc_file() {
+    // `dvc add` plus the top-level `desc:`/`meta:` and per-output
+    // `desc:`/`type:`/`labels:`/`meta:`/`remote:`/`push:`/`persist:` the DVC
+    // docs allow.
+    let t = TestRepo::new();
+    copy_stage_fixture(&t, "annotated.dvc");
+    let one = put_in_dvc_cache(&t, b"1");
+    let two = put_in_dvc_cache(&t, b"2");
+    let manifest = format!(
+        r#"[{{"md5": "{one}", "relpath": "one.txt"}}, {{"md5": "{two}", "relpath": "sub/two.txt"}}]"#
+    );
+    let id = put_in_dvc_cache(&t, manifest.as_bytes());
+    assert_eq!(id, "c1aa8378201c5b38b6b109d77fbf79bc", "manifest bytes");
+
+    let listing = bigstore_ok(&t.repo_dir, &["dvc-ls", "annotated.dvc"]);
+    assert!(listing.contains(&format!("{one}  one.txt")), "{listing}");
+    assert!(
+        listing.contains(&format!("{two}  sub/two.txt")),
+        "{listing}"
+    );
+
+    bigstore_ok(&t.repo_dir, &["import-dvc-dir", "annotated.dvc", "data"]);
+    assert_eq!(t.read_file("data/one.txt"), b"1");
+    assert_eq!(t.read_file("data/sub/two.txt"), b"2");
+}
+
+#[test]
+fn ref_refuses_dvc_files_without_a_cached_md5_and_says_why() {
+    let t = TestRepo::new();
+    for (name, why) in [
+        ("uncached.bin.dvc", "cache: false"),
+        ("no_download.txt.dvc", "no md5"),
+        ("etag_only.bin.dvc", "etag"),
+    ] {
+        copy_stage_fixture(&t, name);
+        let out = bigstore(&t.repo_dir, &["ref", name, "out.bin"]);
+        assert!(!out.status.success(), "{name} accepted");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(why), "{name}: {stderr}");
+        assert!(stderr.contains(name), "{name} not named: {stderr}");
+    }
+}

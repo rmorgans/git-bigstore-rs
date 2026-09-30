@@ -1,0 +1,7 @@
+frozen: true
+deps:
+- hash: md5
+  path: ../src/f.txt
+outs:
+- hash: md5
+  path: no_exec.txt

@@ -289,6 +289,15 @@ shared/global caches (`dvc cache dir --global ~/.dvc/cache`) work automatically.
 If `dvc` is not installed, bigstore falls back to `.dvc/cache` in the DVC
 project directory.
 
+### Which `.dvc` files
+
+`ref`, `dvc-ls` and `import-dvc-dir` read any single-output DVC 3 `.dvc`
+(`hash: md5`), including stage fields (`dvc import-url`'s `md5:`, `frozen:`,
+`deps:`) and annotations (`meta:`, `desc:`, `labels:`...), which they
+ignore. They refuse, saying why, what has no object in the DVC cache:
+`cache: false`, outputs not yet downloaded (`--no-download`), cloud outputs
+tracked only by etag/version_id, and DVC 2 pointers (no `hash:` field).
+
 ### Single-file migration
 
 ```bash
