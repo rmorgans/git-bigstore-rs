@@ -61,9 +61,13 @@ const ATTEMPTS: usize = 3;
 
 /// Copy `path` into a temp file in `tmp_dir`, hashing the same bytes as they
 /// are written. The file's length and mtime are checked before and after:
-/// if either changed (append, truncation, replacement) the copy is retried,
-/// and after [`ATTEMPTS`] tries it is reported as [`SnapshotError::Changed`].
-/// Every snapshot returned is a state the file really was in.
+/// if either changed (append, truncation, replacement), or fewer or more
+/// bytes were read than the file ends with, the copy is retried, and after
+/// [`ATTEMPTS`] tries it is reported as [`SnapshotError::Changed`].
+///
+/// The digest always describes the copy. The copy is a state the file really
+/// was in unless a change that keeps the length lands within one tick of
+/// the filesystem's mtime (2 s on FAT): appends always change the length.
 pub fn snapshot(path: &Path, tmp_dir: &Path) -> std::result::Result<Snapshot, SnapshotError> {
     for _ in 0..ATTEMPTS {
         match try_snapshot(path, tmp_dir)? {
