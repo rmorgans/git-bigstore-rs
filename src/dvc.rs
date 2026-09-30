@@ -5,8 +5,10 @@
 //! bytes, so any formatting difference makes DVC report the data modified.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -197,12 +199,140 @@ pub enum DvcOutput {
 pub struct DvcPointer {
     pub output: DvcOutput,
     pub path: String,
+    /// bigstore's own `meta:`, which DVC keeps but does not read.
+    pub meta: Option<BigstoreMeta>,
+}
+
+/// A folder-mode history record's id: 32 lowercase hex characters, the
+/// first half of a SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RecordId(String);
+
+impl RecordId {
+    /// The id of `bytes`.
+    pub(crate) fn digest(bytes: &[u8]) -> Self {
+        Self(hex::encode(&sha2::Sha256::digest(bytes)[..16]))
+    }
+
+    /// `s` if it is an id.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        let hex = s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        hex.then(|| Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RecordId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The `meta: {bigstore: …}` folder mode writes into a `.dvc`: one of these
+/// two shapes exactly. DVC's schema allows any `meta:` and DVC ignores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BigstoreMeta {
+    /// In the `.dvc` beside an output: the history record the output was
+    /// last pushed or pulled as.
+    Base(RecordId),
+    /// In a history record: the records it follows (sorted, none for the
+    /// first), who pushed it and when.
+    Record {
+        parents: Vec<RecordId>,
+        writer: String,
+        time: DateTime<Utc>,
+    },
+}
+
+/// `meta:` as [`BigstoreMeta`] is written: nothing but `bigstore:`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlMeta {
+    bigstore: YamlBigstore,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum YamlBigstore {
+    Base(YamlBase),
+    Record(YamlRecord),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlBase {
+    base: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlRecord {
+    parents: Vec<String>,
+    writer: String,
+    time: String,
+}
+
+impl From<&BigstoreMeta> for YamlMeta {
+    fn from(meta: &BigstoreMeta) -> Self {
+        let bigstore = match meta {
+            BigstoreMeta::Base(id) => YamlBigstore::Base(YamlBase {
+                base: id.to_string(),
+            }),
+            BigstoreMeta::Record {
+                parents,
+                writer,
+                time,
+            } => YamlBigstore::Record(YamlRecord {
+                parents: parents.iter().map(RecordId::to_string).collect(),
+                writer: writer.clone(),
+                time: time.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            }),
+        };
+        Self { bigstore }
+    }
+}
+
+impl BigstoreMeta {
+    /// `meta` if it is exactly what [`DvcPointer::to_yaml`] writes for a
+    /// [`BigstoreMeta`]: ids of 32 lowercase hex characters, parents sorted
+    /// and distinct, an RFC 3339 time; `None` for anything else.
+    fn from_yaml(meta: &serde_yaml_ng::Value) -> Option<Self> {
+        let YamlMeta { bigstore } = serde_yaml_ng::from_value(meta.clone()).ok()?;
+        Some(match bigstore {
+            YamlBigstore::Base(YamlBase { base }) => Self::Base(RecordId::parse(&base)?),
+            YamlBigstore::Record(YamlRecord {
+                parents,
+                writer,
+                time,
+            }) => {
+                let parents = parents
+                    .iter()
+                    .map(|p| RecordId::parse(p))
+                    .collect::<Option<Vec<_>>>()?;
+                if !parents.windows(2).all(|w| w[0] < w[1]) {
+                    return None;
+                }
+                Self::Record {
+                    parents,
+                    writer,
+                    time: DateTime::parse_from_rfc3339(&time)
+                        .ok()?
+                        .with_timezone(&Utc),
+                }
+            }
+        })
+    }
 }
 
 /// What [`DvcPointer::to_yaml`] writes; field order is DVC's output order.
 #[derive(Serialize)]
 struct YamlFile {
     outs: [YamlOut; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<YamlMeta>,
 }
 
 #[derive(Serialize)]
@@ -231,13 +361,14 @@ struct DvcFile {
     frozen: Option<IgnoredAny>,
     locked: Option<IgnoredAny>,
     always_changed: Option<IgnoredAny>,
-    meta: Option<IgnoredAny>,
+    meta: Option<serde_yaml_ng::Value>,
     desc: Option<IgnoredAny>,
 }
 
 impl DvcFile {
-    /// Top-level keys [`DvcPointer::to_yaml`] does not write.
-    fn extra_fields(&self) -> impl Iterator<Item = &'static str> {
+    /// Top-level keys [`DvcPointer::to_yaml`] does not write, given whether
+    /// `meta:` is someone else's (not a [`BigstoreMeta`]).
+    fn extra_fields(&self, foreign_meta: bool) -> impl Iterator<Item = &'static str> {
         [
             ("wdir", self.wdir.is_some()),
             ("md5", self.md5.is_some()),
@@ -245,7 +376,7 @@ impl DvcFile {
             ("frozen", self.frozen.is_some()),
             ("locked", self.locked.is_some()),
             ("always_changed", self.always_changed.is_some()),
-            ("meta", self.meta.is_some()),
+            ("meta", foreign_meta),
             ("desc", self.desc.is_some()),
         ]
         .into_iter()
@@ -394,19 +525,26 @@ impl ParsedDvcFile {
                 }
             }
         };
+        let meta = file.meta.as_ref().map(BigstoreMeta::from_yaml);
+        let foreign_meta = matches!(meta, Some(None));
         Ok(Self {
             pointer: DvcPointer {
                 output,
                 path: name.clone(),
+                meta: meta.flatten(),
             },
             isexec: out.isexec.unwrap_or(false),
-            extra_fields: file.extra_fields().chain(out.extra_fields()).collect(),
+            extra_fields: file
+                .extra_fields(foreign_meta)
+                .chain(out.extra_fields())
+                .collect(),
         })
     }
 }
 
 impl DvcPointer {
-    /// DVC 3's YAML for this pointer, byte-exact.
+    /// DVC 3's YAML for this pointer, byte-exact without `meta`; `meta`
+    /// follows `outs:`, where DVC writes it.
     pub fn to_yaml(&self) -> String {
         let (md5, size, nfiles) = match &self.output {
             DvcOutput::Dir {
@@ -424,14 +562,16 @@ impl DvcPointer {
                 hash: "md5",
                 path: self.path.clone(),
             }],
+            meta: self.meta.as_ref().map(YamlMeta::from),
         };
         serde_yaml_ng::to_string(&file).expect("pointer YAML serialises")
     }
 
     /// Parse a `.dvc` holding exactly what [`Self::to_yaml`] writes (in any
     /// formatting), so replacing the file loses nothing. A stage (`deps:`),
-    /// annotations (`meta:`, `desc:`) or any other DVC field is refused,
-    /// naming the fields; use this before overwriting a `.dvc`.
+    /// annotations (a `meta:` that is not a [`BigstoreMeta`], `desc:`) or
+    /// any other DVC field is refused, naming the fields; use this before
+    /// overwriting a `.dvc`.
     pub fn parse(text: &str) -> Result<Self> {
         let ParsedDvcFile {
             pointer,
@@ -536,6 +676,64 @@ mod tests {
         let p = DvcPointer::parse(yaml).unwrap();
         assert!(matches!(p.output, DvcOutput::File { size: 6, .. }));
         assert_eq!(p.to_yaml(), yaml);
+    }
+
+    /// bigstore's own `meta:` (both shapes) round-trips through the strict
+    /// parser; any other `meta:`, including one that merely resembles it,
+    /// is someone else's and refuses an overwrite. The lenient reader takes
+    /// the output either way.
+    #[test]
+    fn only_bigstores_own_meta_is_accepted_by_the_strict_parser() {
+        let id = |c: &str| RecordId::parse(&c.repeat(32)).unwrap();
+        let out = "outs:\n- md5: 3253b41059cac6e987c5a5e9233ea5d0\n  size: 6\n  hash: md5\n  path: store.toml\n";
+        for meta in [
+            BigstoreMeta::Base(id("a")),
+            BigstoreMeta::Record {
+                parents: vec![],
+                writer: "123".into(),
+                time: DateTime::parse_from_rfc3339("2026-10-01T01:02:03.000000004Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            BigstoreMeta::Record {
+                parents: vec![id("a"), id("b")],
+                writer: "host: with \"quotes\"\n".into(),
+                time: Utc::now(),
+            },
+        ] {
+            let pointer = DvcPointer {
+                meta: Some(meta),
+                ..DvcPointer::parse(out).unwrap()
+            };
+            let yaml = pointer.to_yaml();
+            assert!(yaml.starts_with(out), "{yaml}");
+            assert_eq!(DvcPointer::parse(&yaml).unwrap(), pointer, "{yaml}");
+        }
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        let t = "'2026-10-01T00:00:00Z'";
+        for meta in [
+            "meta:\n  author: rick\n".to_string(),
+            "meta: 1\n".to_string(),
+            format!("meta:\n  bigstore:\n    base: {a}\n  author: rick\n"),
+            format!("meta:\n  bigstore:\n    base: {a}\n    note: x\n"),
+            format!("meta:\n  bigstore:\n    base: {}\n", a.to_uppercase()),
+            format!("meta:\n  bigstore:\n    base: {}\n", &a[1..]),
+            format!("meta:\n  bigstore:\n    base: {a}\n    parents: []\n    writer: h\n    time: {t}\n"),
+            format!("meta:\n  bigstore:\n    parents: [{b}, {a}]\n    writer: h\n    time: {t}\n"),
+            format!("meta:\n  bigstore:\n    parents: [{a}, {a}]\n    writer: h\n    time: {t}\n"),
+            "meta:\n  bigstore:\n    parents: []\n    writer: h\n    time: yesterday\n".to_string(),
+            "meta:\n  bigstore:\n    parents: []\n    writer: h\n".to_string(),
+        ] {
+            let text = format!("{out}{meta}");
+            let err = format!("{:#}", DvcPointer::parse(&text).unwrap_err());
+            assert!(
+                err.ends_with("bigstore does not write: meta"),
+                "{meta}: {err}"
+            );
+            let lenient = ParsedDvcFile::parse(&text).unwrap();
+            assert_eq!(lenient.pointer.meta, None, "{meta}");
+            assert_eq!(lenient.extra_fields, ["meta"], "{meta}");
+        }
     }
 
     #[test]

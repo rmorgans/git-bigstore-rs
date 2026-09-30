@@ -261,7 +261,14 @@ fn cancel_on_ctrl_c() -> Result<bigstore::folder::CancelToken> {
 #[derive(Subcommand)]
 enum FolderCommand {
     /// Back up a directory or file; writes <name>.dvc beside it
-    Push(FolderPushArgs),
+    Push {
+        #[command(flatten)]
+        args: FolderPushArgs,
+        /// When history has forked: refuse, or merge every head into one
+        /// version (the output's .dvc must name one of them as its base)
+        #[arg(long, value_enum, default_value = "refuse")]
+        resolve: ResolveArg,
+    },
     /// Say what push would upload and whether the output is the latest
     /// version in its history, without writing anything
     Status(FolderPushArgs),
@@ -272,7 +279,8 @@ enum FolderCommand {
         /// Restore a version of this history key instead of a .dvc file
         #[arg(long, conflicts_with = "pointer", requires = "into")]
         history: Option<String>,
-        /// Version: latest, an id prefix (8+ hex), or a time (RFC 3339)
+        /// Version: latest, an id prefix as `folder log` prints it (8+ hex),
+        /// or a time (RFC 3339). A .dvc naming it is written beside --into
         #[arg(long, default_value = "latest", requires = "history")]
         at: String,
         /// Where to restore (default: beside the .dvc file)
@@ -286,7 +294,8 @@ enum FolderCommand {
         #[arg(short, long)]
         jobs: Option<NonZeroUsize>,
     },
-    /// List the versions of a history key
+    /// List the versions of a history key, oldest first, with the versions
+    /// each follows; marks heads, forks and merges
     Log {
         history: String,
         #[command(flatten)]
@@ -301,6 +310,12 @@ enum FolderCommand {
         #[command(flatten)]
         remote: RemoteArgs,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ResolveArg {
+    Refuse,
+    Merge,
 }
 
 fn main() -> Result<()> {
@@ -569,6 +584,7 @@ fn cmd_ref(source: &RepoPath, dest: &RepoPath) -> Result<()> {
             dvc::DvcPointer {
                 output: dvc::DvcOutput::File { md5, .. },
                 path: dvc_out_path,
+                ..
             },
         isexec,
     } = dvc::DvcPointer::load_lenient(&source_path)?
@@ -816,9 +832,16 @@ fn open_folder_remote(args: &RemoteArgs) -> Result<bigstore::folder::Remote> {
 fn cmd_folder(cmd: FolderCommand) -> Result<()> {
     use bigstore::folder::{self, HistoryKey, Overwrite, PointerSource, Selector};
     match cmd {
-        FolderCommand::Push(args) => {
+        FolderCommand::Push { args, resolve } => {
             let r = {
                 let (remote, opts) = args.open()?;
+                let opts = folder::PushOptions {
+                    resolve: match resolve {
+                        ResolveArg::Refuse => folder::Resolve::Refuse,
+                        ResolveArg::Merge => folder::Resolve::Merge,
+                    },
+                    ..opts
+                };
                 folder::push(&remote, &args.path, &opts)?
             };
             for w in &r.warnings {
@@ -828,17 +851,25 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                 eprintln!("{} empty dir(s) not recorded (DVC cannot)", r.empty_dirs);
             }
             eprintln!(
-                "{} file(s): {} uploaded, {} already on the remote; wrote {}{}",
+                "{} file(s): {} uploaded, {} already on the remote; wrote {} ({} {})",
                 r.files,
                 r.uploaded,
                 r.already_present,
                 r.pointer_path.display(),
                 if r.history_record.is_some() {
-                    ""
+                    "new version"
                 } else {
-                    " (unchanged since the last version)"
-                }
+                    "already the latest version,"
+                },
+                r.version
             );
+            if !r.forked_with.is_empty() {
+                eprintln!(
+                    "warning: history has forked: {} pushed from the same base meanwhile; \
+                     reconcile, then push --resolve merge",
+                    join_ids(&r.forked_with)
+                );
+            }
         }
         FolderCommand::Status(args) => {
             let s = {
@@ -869,13 +900,21 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                 }
                 folder::SyncState::RemoteAhead { latest } => println!(
                     "history has a newer version, {} pushed {}; pull to update",
-                    latest.id(),
+                    latest.id,
                     when(latest)
                 ),
-                folder::SyncState::Diverged { latest } => println!(
-                    "diverged: changed locally, and history has another version, {} pushed {}",
-                    latest.id(),
-                    when(latest)
+                folder::SyncState::Stale { base, head } => println!(
+                    "stale: changed locally, but the latest version, {} pushed {}, is not this \
+                     output's base ({}); push would refuse: set changes aside, pull, redo them",
+                    head.id,
+                    when(head),
+                    base.as_ref()
+                        .map_or("none".to_string(), ToString::to_string)
+                ),
+                folder::SyncState::Diverged { heads } => println!(
+                    "diverged: history has forked into versions {}; pull one with --at <id>, \
+                     reconcile, then push --resolve merge",
+                    join_ids(heads)
                 ),
                 _ => println!("unknown sync state"),
             }
@@ -935,17 +974,51 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                 jobs: resolve_jobs(jobs)?.get(),
                 cancel: cancel_on_ctrl_c()?,
             };
-            for r in folder::log(&remote, &key, &opts)? {
+            let records = folder::log(&remote, &key, &opts)?;
+            let mut children: std::collections::HashMap<&dvc::RecordId, usize> =
+                std::collections::HashMap::new();
+            for p in records.iter().flat_map(|r| &r.parents) {
+                *children.entry(p).or_default() += 1;
+            }
+            let mut heads = Vec::new();
+            for r in &records {
                 let (kind, detail) = match &r.pointer.output {
                     dvc::DvcOutput::Dir { size, nfiles, .. } => {
                         ("dir", format!("{nfiles} files, {size} bytes"))
                     }
                     dvc::DvcOutput::File { size, .. } => ("file", format!("{size} bytes")),
                 };
+                let by = r
+                    .writer
+                    .as_ref()
+                    .map_or(String::new(), |w| format!("  by {w}"));
+                let from = match r.parents.as_slice() {
+                    [] => "root".to_string(),
+                    ps => join_ids(ps),
+                };
+                let mut marks = String::new();
+                if r.parents.len() > 1 {
+                    marks.push_str("  [merge]");
+                }
+                match children.get(&r.id) {
+                    None => {
+                        marks.push_str("  [head]");
+                        heads.push(&r.id);
+                    }
+                    Some(&n) if n > 1 => marks.push_str(&format!("  [fork: {n} children]")),
+                    Some(_) => {}
+                }
                 println!(
-                    "{}  {}  {kind}  {detail}",
+                    "{}  {}  {kind}  {detail}{by}  <- {from}{marks}",
                     r.time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    r.id()
+                    r.id
+                );
+            }
+            if heads.len() > 1 {
+                eprintln!(
+                    "history has forked: {} heads; pull one with --at <id>, reconcile, then \
+                     push --resolve merge",
+                    heads.len()
                 );
             }
         }
@@ -958,6 +1031,14 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Record ids, comma-separated.
+fn join_ids<'a>(ids: impl IntoIterator<Item = &'a bigstore::dvc::RecordId>) -> String {
+    ids.into_iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Resolve concurrency: --jobs flag > BIGSTORE_JOBS env > default (8).

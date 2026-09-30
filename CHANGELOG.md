@@ -12,6 +12,42 @@
   stays the permission error it was. object_store exposes neither S3's
   error code nor the storage class as data, so the code is read from the
   error response it reports.
+- **Folder history is a graph of parent-linked versions.** Each record is
+  a DVC 3 `.dvc` pointer plus `meta: {bigstore: {parents, writer, time}}`,
+  stored create-once as `bigstore-history/<key>/<parents>/<id>.dvc`
+  (`<id>`: the first 32 hex characters of the SHA-256 of the record;
+  `<parents>`: `root`, or the parent ids sorted and `+`-joined, at most 8).
+  One listing gives the graph; the latest version is the only *head* (a
+  record no other follows). A record whose bytes do not hash to its name's
+  id, or whose parents differ from its name's, is refused as a bad record.
+- **Push checks the output's base**, the version its `.dvc` records in
+  `meta: {bigstore: {base: <id>}}`, before uploading anything. An output
+  equal to the only head adopts it and publishes nothing (this also
+  repairs a crash between the record and the `.dvc`). Otherwise it is
+  refused with the new `folder::Error::StaleBase { base, heads }` if there
+  is no base while history has versions, or the base is not the only head;
+  and with `folder::Error::Diverged { heads }` if the history has forked,
+  unless `PushOptions::resolve` is `Resolve::Merge` (CLI:
+  `folder push --resolve merge`) and the base is one of the heads. The
+  record is published before the `.dvc`, which is written last. History is
+  then listed again: pushes that raced from the same base are reported in
+  `PushReport::forked_with` (a CLI warning).
+- `PushOptions::writer` (the host name by default) is recorded in each
+  version; `PushReport::version` is the version the output now is.
+- **Pull from history writes `<into>.dvc`** with the pulled version as its
+  base, last, once every file is in place; a cancelled or failed pull
+  leaves the old `.dvc`. A `.dvc` there that push would refuse to replace
+  is refused first. Pulling an older version makes the next push of it
+  `StaleBase`. `Selector::Latest` in a forked history is `Diverged`.
+- `SyncState::Stale { base, head }` and `SyncState::Diverged { heads }`;
+  `folder status` prints both. `folder log` prints each version's parents
+  and writer, and marks heads, fork points and merges.
+- `HistoryRecord` has `id`, `parents` and `writer` fields;
+  `HistoryRecord::output_id()` is the content id (manifest id or md5).
+- `bigstore::dvc::{RecordId, BigstoreMeta}`, and `DvcPointer::meta`: the
+  strict parser accepts exactly bigstore's two `meta:` shapes, and still
+  refuses any other `meta:` (so push never replaces a `.dvc` carrying
+  someone else's annotations).
 
 ### Changed
 
@@ -28,6 +64,20 @@
   `download_verified`. `transfer::Remote::store` is now a `&Store`.
 - rclone remotes are listed with `rclone lsjson` instead of `rclone lsf`,
   for object sizes and times; the keys listed are unchanged.
+- **Breaking (folder history): a hard cutover per history key.** 0.3 reads
+  0.2's `<time>-<content id>.dvc` records as a straight line in time order
+  (each with the id of its file name) and continues it, but never writes
+  that form; 0.2 clients do not see 0.3 records, so a 0.2 writer left on a
+  key forks it. Upgrade every writer of a key together. A `.dvc` 0.2 wrote
+  has no base: its output's first push adopts the head if unchanged, and is
+  `StaleBase` if changed.
+- **Breaking (library):** `HistoryRecord::id()` is gone: `id` is now the
+  record id, and `Selector::Id` (`--at <hex>`) matches record ids as
+  `folder log` prints them, not content ids. `Selector::AtOrBefore` uses
+  each record's own time and fetches every record. `SyncState::Diverged {
+  latest }` (changed locally and remotely) is now `Stale { base, head }`.
+  `PushOptions::cancel` stops a push before its record is published (it
+  was: before its `.dvc` was written).
 
 ### Fixed
 

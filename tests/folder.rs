@@ -1,11 +1,11 @@
 //! `bigstore::folder` as a library consumer uses it: plain folders, a
 //! `local://` remote, no git.
 
-use bigstore::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
+use bigstore::dvc::{BigstoreMeta, DvcOutput, DvcPointer, Manifest, ManifestEntry, RecordId};
 use bigstore::folder::{
     self, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey, HistoryRecord,
     LogOptions, Overwrite, Phase, PointerSource, Progress, ProgressEvent, PullOptions, PushOptions,
-    Refusal, Remote, RemoteConfig, Selector, SyncState,
+    Refusal, Remote, RemoteConfig, Resolve, Selector, SyncState,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
@@ -250,7 +250,7 @@ fn changing_one_file_uploads_one_object_and_adds_one_version() {
     assert_eq!(tree(&latest), tree(&w));
 
     // The first version is still restorable, by id prefix.
-    let old = versions[0].id().to_string();
+    let old = versions[0].id.to_string();
     let restore = e.data.parent().unwrap().join("v1");
     folder::pull(
         &e.remote,
@@ -273,10 +273,15 @@ fn single_file_outputs_back_up_config_files() {
     let store_toml = e.data.join("store.toml");
     write(&store_toml, b"x = 1\n");
     let report = folder::push(&e.remote, &store_toml, &opts("ds/store.toml")).unwrap();
-    // Byte-identical to `dvc add store.toml` (DVC 3.67.1).
+    // Byte-identical to `dvc add store.toml` (DVC 3.67.1), then the version
+    // it now is, in `meta:`, where DVC writes it.
     assert_eq!(
         std::fs::read_to_string(e.data.join("store.toml.dvc")).unwrap(),
-        "outs:\n- md5: 3253b41059cac6e987c5a5e9233ea5d0\n  size: 6\n  hash: md5\n  path: store.toml\n"
+        format!(
+            "outs:\n- md5: 3253b41059cac6e987c5a5e9233ea5d0\n  size: 6\n  hash: md5\n  \
+             path: store.toml\nmeta:\n  bigstore:\n    base: {}\n",
+            report.version
+        )
     );
     assert!(e
         .store
@@ -528,6 +533,7 @@ fn dvc_pushed_dir(e: &Env, files: &[(&str, &[u8])]) -> PathBuf {
             nfiles: files.len() as u64,
         },
         path: "out".into(),
+        meta: None,
     };
     let path = e.data.join("out.dvc");
     write(&path, pointer.to_yaml().as_bytes());
@@ -727,8 +733,8 @@ fn an_equivalent_crlf_pointer_is_left_untouched() {
     assert_eq!(std::fs::read_to_string(&first.pointer_path).unwrap(), crlf);
 }
 
-/// Put a history record on `e`'s remote directly, as another host's push
-/// would have: a single-file pointer to `md5` at `time` (record format).
+/// Put a 0.2 history record on `e`'s remote directly, as a 0.2 push would
+/// have: a single-file pointer to `md5` at `time` (`<time>-<md5>.dvc`).
 fn write_record(e: &Env, key: &str, time: &str, md5: &str) {
     let pointer = DvcPointer {
         output: DvcOutput::File {
@@ -736,6 +742,7 @@ fn write_record(e: &Env, key: &str, time: &str, md5: &str) {
             size: 1,
         },
         path: "f".into(),
+        meta: None,
     };
     write(
         &e.store
@@ -744,13 +751,42 @@ fn write_record(e: &Env, key: &str, time: &str, md5: &str) {
     );
 }
 
+/// A record id: the first half of the SHA-256 of `bytes`.
+fn record_id(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(&sha2::Sha256::digest(bytes)[..16])
+}
+
+/// A 0.2 record's id: that of its file name. Later records name it as a
+/// parent, so it can never change.
+fn legacy_id(time: &str, md5: &str) -> String {
+    record_id(format!("{time}-{md5}.dvc").as_bytes())
+}
+
 #[test]
 fn an_ambiguous_version_id_is_refused_and_lists_the_candidates() {
+    // Two 0.2 records whose ids share 8 characters but not 9: found by
+    // trying times (a birthday search, some 2^16 names).
     let e = env();
-    let a = format!("deadbeef{}", "0".repeat(24));
-    let b = format!("deadbeef{}", "1".repeat(24));
-    write_record(&e, "k", "20260901T000000.000000000Z", &a);
-    write_record(&e, "k", "20260902T000000.000000000Z", &b);
+    let md5 = "a".repeat(32);
+    let time = |s: u32| {
+        let t = chrono::DateTime::from_timestamp(1_788_000_000 + i64::from(s), 0).unwrap();
+        t.format("%Y%m%dT%H%M%S.000000000Z").to_string()
+    };
+    let mut seen = std::collections::HashMap::new();
+    let (t1, t2) = (0..)
+        .find_map(|s| {
+            let id = legacy_id(&time(s), &md5);
+            match seen.insert(id[..8].to_string(), s) {
+                Some(other) if legacy_id(&time(other), &md5)[8..9] != id[8..9] => Some((other, s)),
+                _ => None,
+            }
+        })
+        .unwrap();
+    let (a, b) = (time(t1), time(t2));
+    write_record(&e, "k", &a, &md5);
+    write_record(&e, "k", &b, &md5);
+    let (id_a, id_b) = (legacy_id(&a, &md5), legacy_id(&b, &md5));
     let pull = |id: &str| {
         folder::pull(
             &e.remote,
@@ -761,22 +797,18 @@ fn an_ambiguous_version_id_is_refused_and_lists_the_candidates() {
             &pull_opts(Some(e.data.join("f"))),
         )
     };
-    let err = pull("DEADBEEF").unwrap_err();
+    let err = pull(&id_a[..8].to_uppercase()).unwrap_err();
     let FolderError::AmbiguousId { prefix, candidates } = folder_error(&err) else {
         panic!("{err:#}")
     };
-    assert_eq!(prefix, "deadbeef");
-    let ids: Vec<String> = candidates.iter().map(|r| r.id().to_string()).collect();
-    assert_eq!(ids, [a.clone(), b.clone()]);
+    assert_eq!(*prefix, id_a[..8]);
+    let ids: Vec<String> = candidates.iter().map(|r| r.id.to_string()).collect();
+    assert_eq!(ids, [id_a.clone(), id_b.clone()]);
     let msg = format!("{err:#}");
     assert!(msg.contains("ambiguous"), "{msg}");
-    assert!(msg.contains(&a) && msg.contains(&b), "{msg}");
-    assert!(
-        msg.contains("2026-09-01") && msg.contains("2026-09-02"),
-        "{msg}"
-    );
+    assert!(msg.contains(&id_a) && msg.contains(&id_b), "{msg}");
     // A longer prefix picks one; the object is absent, so the fetch fails.
-    let msg = format!("{:#}", pull(&b[..9]).unwrap_err());
+    let msg = format!("{:#}", pull(&id_b[..9]).unwrap_err());
     assert!(!msg.contains("ambiguous"), "{msg}");
     assert!(!e.data.join("f").exists());
 }
@@ -887,7 +919,7 @@ fn history_holds_only_its_own_outputs_records() {
         history_log(&e, key)
             .unwrap()
             .iter()
-            .map(|r| r.id().to_string())
+            .map(|r| r.output_id().to_string())
             .collect()
     };
     assert_eq!(ids("k"), [md5('a')]);
@@ -1192,7 +1224,7 @@ fn records_pushed_in_the_same_nanosecond_have_a_stable_latest() {
     write_record(&e, "k", time, &b);
     write_record(&e, "k", time, &a);
     let log = history_log(&e, "k").unwrap();
-    let ids: Vec<String> = log.iter().map(|r| r.id().to_string()).collect();
+    let ids: Vec<String> = log.iter().map(|r| r.output_id().to_string()).collect();
     assert_eq!(ids, [a, b], "ties are ordered by record key");
 }
 
@@ -1549,7 +1581,8 @@ fn a_record_whose_name_and_pointer_disagree_is_refused() {
         dir.join(format!("20260901T000000.000000000Z-{named}.dvc")),
     )
     .unwrap();
-    for at in [Selector::Latest, Selector::Id(named[..8].into())] {
+    let id = legacy_id("20260901T000000.000000000Z", &named);
+    for at in [Selector::Latest, Selector::Id(id[..8].into())] {
         let err = folder::pull(
             &e.remote,
             &history("k", at),
@@ -1652,7 +1685,14 @@ fn status_says_what_push_would_do_and_writes_nothing() {
     );
 
     let pushed = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
-    assert_eq!(s.pointer, pushed.pointer, "status predicts the pointer");
+    assert_eq!(
+        s.pointer,
+        DvcPointer {
+            meta: None,
+            ..pushed.pointer.clone()
+        },
+        "status predicts the pointer, less its base"
+    );
     let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
     assert!(matches!(s.sync, SyncState::InSync), "{:?}", s.sync);
     assert_eq!((s.to_upload, s.already_present), (0, 4));
@@ -1690,7 +1730,13 @@ fn status_says_what_push_would_do_and_writes_nothing() {
     // Both changed since the .dvc.
     std::fs::write(&labels, b"{\"t\":5}\n").unwrap();
     let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
-    assert!(matches!(s.sync, SyncState::Diverged { .. }), "{:?}", s.sync);
+    let SyncState::Stale { base, head } = &s.sync else {
+        panic!("{:?}", s.sync)
+    };
+    assert_eq!(
+        (base.as_ref(), &head.id),
+        (Some(&pushed.version), &newer.version)
+    );
 }
 
 #[track_caller]
@@ -2250,7 +2296,10 @@ async fn async_fns_push_and_restore_on_a_current_thread_runtime() {
         .await
         .unwrap();
     assert_eq!(log.len(), 1);
-    assert_eq!((&log[0].key, &log[0].pointer), (&written, &pushed.pointer));
+    assert_eq!(
+        (&log[0].key, &log[0].id, &log[0].pointer.output),
+        (&written, &pushed.version, &pushed.pointer.output)
+    );
     assert_eq!(folder::keys_async(&e.remote, None).await.unwrap(), [key]);
 
     let into = e.data.parent().unwrap().join("restore");
@@ -2531,4 +2580,618 @@ async fn dropping_an_async_push_stops_its_hashing() {
     );
     assert!(!e.data.join("out.dvc").exists());
     assert!(remote_keys(&e.store).is_empty(), "something was published");
+}
+
+// ──────────────────────────────────────────────────
+// Parent-linked history
+// ──────────────────────────────────────────────────
+
+/// The base the `.dvc` at `path` records.
+#[track_caller]
+fn base_of(path: &Path) -> Option<RecordId> {
+    match DvcPointer::load(path).unwrap().meta {
+        Some(BigstoreMeta::Base(id)) => Some(id),
+        None => None,
+        other => panic!("not a base: {other:?}"),
+    }
+}
+
+#[track_caller]
+fn stale_base(err: &anyhow::Error) -> (Option<&RecordId>, &[RecordId]) {
+    match folder_error(err) {
+        FolderError::StaleBase { base, heads } => (base.as_ref(), heads),
+        _ => panic!("not StaleBase: {err:#}"),
+    }
+}
+
+#[track_caller]
+fn diverged(err: &anyhow::Error) -> &[RecordId] {
+    match folder_error(err) {
+        FolderError::Diverged { heads } => heads,
+        _ => panic!("not Diverged: {err:#}"),
+    }
+}
+
+fn as_writer(key: &str, writer: &str) -> PushOptions {
+    PushOptions {
+        writer: writer.into(),
+        ..opts(key)
+    }
+}
+
+fn by_id(id: &RecordId) -> Selector {
+    Selector::Id(id.as_str()[..8].into())
+}
+
+/// Run the CLI against `e`'s remote; returns (success, stdout, stderr).
+fn cli(e: &Env, args: &[&str]) -> (bool, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_git-bigstore"))
+        .args(args)
+        .args(["--remote", &format!("local://{}", e.store.display())])
+        .output()
+        .unwrap();
+    let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
+    (out.status.success(), text(out.stdout), text(out.stderr))
+}
+
+#[test]
+fn a_push_whose_base_is_not_the_latest_version_is_refused_and_publishes_nothing() {
+    let e = env();
+    let (a, b) = (e.data.join("a/f"), e.data.join("b/f"));
+    write(&a, b"v1");
+    let v1 = folder::push(&e.remote, &a, &opts("k")).unwrap().version;
+    // Another host takes v1; then this one pushes v2.
+    folder::pull(
+        &e.remote,
+        &history("k", Selector::Latest),
+        &pull_opts(Some(b.clone())),
+    )
+    .unwrap();
+    let b_dvc = e.data.join("b/f.dvc");
+    assert_eq!(base_of(&b_dvc), Some(v1.clone()));
+    write(&a, b"v2");
+    let v2 = folder::push(&e.remote, &a, &opts("k")).unwrap().version;
+
+    // Unchanged since its pull, b is behind; changed, it is stale.
+    let s = folder::status(&e.remote, &b, &opts("k")).unwrap();
+    assert!(
+        matches!(&s.sync, SyncState::RemoteAhead { latest } if latest.id == v2),
+        "{:?}",
+        s.sync
+    );
+    write(&b, b"b's change");
+    let s = folder::status(&e.remote, &b, &opts("k")).unwrap();
+    let SyncState::Stale { base, head } = &s.sync else {
+        panic!("{:?}", s.sync)
+    };
+    assert_eq!((base.as_ref(), &head.id), (Some(&v1), &v2));
+
+    let keys = remote_keys(&e.store);
+    let dvc = std::fs::read(&b_dvc).unwrap();
+    let err = folder::push(&e.remote, &b, &opts("k")).unwrap_err();
+    assert_eq!(stale_base(&err), (Some(&v1), &[v2.clone()][..]));
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(v1.as_str()) && msg.contains(v2.as_str()),
+        "{msg}"
+    );
+    assert_eq!(remote_keys(&e.store), keys, "a refused push published");
+    assert_eq!(std::fs::read(&b_dvc).unwrap(), dvc);
+
+    // No base at all, while history has versions: stale too.
+    let c = e.data.join("c/f");
+    write(&c, b"c");
+    let err = folder::push(&e.remote, &c, &opts("k")).unwrap_err();
+    assert_eq!(stale_base(&err), (None, &[v2][..]));
+    assert!(!e.data.join("c/f.dvc").exists());
+    assert_eq!(remote_keys(&e.store), keys, "a refused push published");
+}
+
+#[test]
+fn pushes_racing_from_one_base_both_land_as_a_fork_that_a_merge_joins() {
+    let e = env();
+    let (a, b) = (e.data.join("a/f"), e.data.join("b/f"));
+    write(&a, b"v1");
+    let v1 = folder::push(&e.remote, &a, &as_writer("k", "host-a"))
+        .unwrap()
+        .version;
+    folder::pull(
+        &e.remote,
+        &history("k", Selector::Latest),
+        &pull_opts(Some(b.clone())),
+    )
+    .unwrap();
+    write(&a, b"a's change");
+    write(&b, b"b's change");
+
+    // B's push checks history (one head: its base), and before it
+    // publishes, A's push from the same base lands.
+    let raced = Arc::new(Mutex::new(None));
+    let progress = {
+        let (raced, a) = (Arc::clone(&raced), a.clone());
+        let remote = Remote::open(&RemoteConfig {
+            url: format!("local://{}", e.store.display()),
+            endpoint: None,
+            region: None,
+            credentials: Credentials::FromEnv,
+        })
+        .unwrap();
+        Progress::new(move |event| {
+            let mut raced = raced.lock().unwrap();
+            if matches!(
+                event,
+                ProgressEvent::Started {
+                    phase: Phase::Uploading,
+                    ..
+                }
+            ) && raced.is_none()
+            {
+                let push = || folder::push(&remote, &a, &as_writer("k", "host-a"));
+                *raced = Some(
+                    std::thread::scope(|s| s.spawn(push).join())
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+        })
+    };
+    let b_push = folder::push(
+        &e.remote,
+        &b,
+        &PushOptions {
+            progress,
+            ..as_writer("k", "host-b")
+        },
+    )
+    .unwrap();
+    let a_push = raced
+        .lock()
+        .unwrap()
+        .take()
+        .expect("A pushed during B's push");
+    assert!(a_push.forked_with.is_empty(), "{:?}", a_push.forked_with);
+    assert_eq!(b_push.forked_with, std::slice::from_ref(&a_push.version));
+    let log = history_log(&e, "k").unwrap();
+    let mut forked: Vec<(RecordId, Vec<RecordId>, Option<String>)> = log[1..]
+        .iter()
+        .map(|r| (r.id.clone(), r.parents.clone(), r.writer.clone()))
+        .collect();
+    forked.sort();
+    let mut want = vec![
+        (
+            a_push.version.clone(),
+            vec![v1.clone()],
+            Some("host-a".into()),
+        ),
+        (
+            b_push.version.clone(),
+            vec![v1.clone()],
+            Some("host-b".into()),
+        ),
+    ];
+    want.sort();
+    assert_eq!((log.len(), forked), (3, want));
+    let mut heads = vec![a_push.version.clone(), b_push.version.clone()];
+    heads.sort();
+
+    // Latest is ambiguous; a version by id or time is not.
+    let c = e.data.join("c/f");
+    let err = folder::pull(
+        &e.remote,
+        &history("k", Selector::Latest),
+        &pull_opts(Some(c.clone())),
+    )
+    .unwrap_err();
+    assert_eq!(diverged(&err), heads);
+    assert!(!c.exists() && !e.data.join("c/f.dvc").exists());
+    folder::pull(
+        &e.remote,
+        &history("k", by_id(&b_push.version)),
+        &pull_opts(Some(c.clone())),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&c).unwrap(), b"b's change");
+    assert_eq!(
+        base_of(&e.data.join("c/f.dvc")),
+        Some(b_push.version.clone())
+    );
+    let newest = log.last().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let d = e.data.join("d/f");
+    folder::pull(
+        &e.remote,
+        &history("k", Selector::AtOrBefore(now)),
+        &pull_opts(Some(d.clone())),
+    )
+    .unwrap();
+    assert_eq!(base_of(&e.data.join("d/f.dvc")), Some(newest.id.clone()));
+
+    // Each side's next push is refused until a merge.
+    let s = folder::status(&e.remote, &a, &opts("k")).unwrap();
+    assert!(
+        matches!(&s.sync, SyncState::Diverged { heads: h } if *h == heads),
+        "{:?}",
+        s.sync
+    );
+    write(&a, b"a again");
+    let err = folder::push(&e.remote, &a, &opts("k")).unwrap_err();
+    assert_eq!(diverged(&err), heads);
+    let (ok, out, err) = cli(&e, &["folder", "log", "k"]);
+    assert!(ok, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert!(
+        lines[0].contains(&format!(
+            "{v1}  file  2 bytes  by host-a  <- root  [fork: 2 children]"
+        )),
+        "{out}"
+    );
+    for line in &lines[1..] {
+        assert!(line.ends_with(&format!("<- {v1}  [head]")), "{out}");
+    }
+    assert!(err.contains("history has forked: 2 heads"), "{err}");
+    let args = ["folder", "status", a.to_str().unwrap(), "--history", "k"];
+    let (ok, out, err) = cli(&e, &args);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!(
+            "diverged: history has forked into versions {}, {}",
+            heads[0], heads[1]
+        )),
+        "{out}"
+    );
+
+    // A merge needs a base among the heads: none, or an older version, is
+    // stale.
+    let merge = |p: &Path| {
+        folder::push(
+            &e.remote,
+            p,
+            &PushOptions {
+                resolve: Resolve::Merge,
+                ..opts("k")
+            },
+        )
+    };
+    let old = e.data.join("old/f");
+    folder::pull(
+        &e.remote,
+        &history("k", by_id(&v1)),
+        &pull_opts(Some(old.clone())),
+    )
+    .unwrap();
+    write(&old, b"from v1");
+    let err = merge(&old).unwrap_err();
+    assert_eq!(stale_base(&err), (Some(&v1), &heads[..]));
+
+    // A reconciles B's change into its own and merges, from the CLI.
+    write(&a, b"a's change + b's change");
+    let args = [
+        "folder",
+        "push",
+        a.to_str().unwrap(),
+        "--history",
+        "k",
+        "--resolve",
+        "merge",
+    ];
+    let (ok, _, err) = cli(&e, &args);
+    assert!(ok, "{err}");
+    assert!(!err.contains("forked"), "{err}");
+    let merged = base_of(&e.data.join("a/f.dvc")).unwrap();
+    let log = history_log(&e, "k").unwrap();
+    assert_eq!(
+        (log.len(), &log[3].id, &log[3].parents),
+        (4, &merged, &heads)
+    );
+    let name = format!("bigstore-history/k/{}+{}/{merged}.dvc", heads[0], heads[1]);
+    assert!(remote_keys(&e.store).contains(&name), "{name}");
+    let latest = e.data.join("g/f");
+    folder::pull(
+        &e.remote,
+        &history("k", Selector::Latest),
+        &pull_opts(Some(latest.clone())),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&latest).unwrap(), b"a's change + b's change");
+    let (ok, out, err) = cli(&e, &["folder", "log", "k"]);
+    assert!(ok && err.is_empty(), "{err}");
+    assert!(
+        out.lines()
+            .last()
+            .unwrap()
+            .ends_with(&format!("<- {}, {}  [merge]  [head]", heads[0], heads[1])),
+        "{out}"
+    );
+    // B, last synced to its own side, is behind the merge.
+    write(&b, b"b again");
+    let err = folder::push(&e.remote, &b, &opts("k")).unwrap_err();
+    assert_eq!(stale_base(&err), (Some(&b_push.version), &[merged][..]));
+}
+
+#[test]
+fn a_version_published_without_its_dvc_is_adopted_not_pushed_again() {
+    let e = env();
+    let f = e.data.join("f");
+    let dvc = e.data.join("f.dvc");
+    write(&f, b"v1");
+    let v1 = folder::push(&e.remote, &f, &opts("k")).unwrap().version;
+    let at_v1 = std::fs::read(&dvc).unwrap();
+    write(&f, b"v2");
+    let v2 = folder::push(&e.remote, &f, &opts("k")).unwrap().version;
+    // A crash after publishing v2's record, before writing the .dvc: it
+    // still says v1, which is not the head.
+    std::fs::write(&dvc, &at_v1).unwrap();
+    assert_eq!(base_of(&dvc), Some(v1));
+    let s = folder::status(&e.remote, &f, &opts("k")).unwrap();
+    assert!(matches!(s.sync, SyncState::InSync), "{:?}", s.sync);
+    let again = folder::push(&e.remote, &f, &opts("k")).unwrap();
+    assert_eq!(
+        (
+            again.history_record,
+            &again.version,
+            again.forked_with.len()
+        ),
+        (None, &v2, 0)
+    );
+    assert_eq!(base_of(&dvc), Some(v2.clone()));
+    // Or a crash before the first .dvc was written.
+    std::fs::remove_file(&dvc).unwrap();
+    let again = folder::push(&e.remote, &f, &opts("k")).unwrap();
+    assert_eq!((again.history_record, &again.version), (None, &v2));
+    assert_eq!(base_of(&dvc), Some(v2));
+    assert_eq!(history_log(&e, "k").unwrap().len(), 2);
+}
+
+/// A 0.2 version of `key` holding `content` at `time`: its object, and its
+/// record. Returns the record's id.
+fn legacy_version(e: &Env, key: &str, time: &str, content: &[u8]) -> RecordId {
+    let md5 = hash_reader(&mut &content[..], HashFunction::Md5).unwrap();
+    let hex = md5.to_string();
+    write(
+        &e.store.join("files/md5").join(&hex[..2]).join(&hex[2..]),
+        content,
+    );
+    let pointer = DvcPointer {
+        output: DvcOutput::File {
+            md5,
+            size: content.len() as u64,
+        },
+        path: "f".into(),
+        meta: None,
+    };
+    write(
+        &e.store
+            .join(format!("bigstore-history/{key}/{time}-{hex}.dvc")),
+        pointer.to_yaml().as_bytes(),
+    );
+    let log = history_log(e, key).unwrap();
+    let id = legacy_id(time, &hex);
+    log.into_iter()
+        .map(|r| r.id)
+        .find(|r| r.as_str() == id)
+        .expect("the record is read with its name's id")
+}
+
+#[test]
+fn a_02_history_reads_as_a_straight_line_that_new_versions_continue() {
+    let e = env();
+    let l1 = legacy_version(&e, "k", "20260901T000000.000000000Z", b"v1");
+    let l2 = legacy_version(&e, "k", "20260902T000000.000000000Z", b"v2");
+    type Line = Vec<(RecordId, Vec<RecordId>)>;
+    let line = || -> Line {
+        let log = history_log(&e, "k").unwrap();
+        log.into_iter().map(|r| (r.id, r.parents)).collect()
+    };
+    assert_eq!(
+        line(),
+        [(l1.clone(), vec![]), (l2.clone(), vec![l1.clone()])]
+    );
+    let log = history_log(&e, "k").unwrap();
+    assert!(log.iter().all(|r| r.writer.is_none()), "{log:?}");
+    assert_eq!(log[0].time.to_rfc3339(), "2026-09-01T00:00:00+00:00");
+
+    // The latest is the 0.2 head; a time picks by the record name's.
+    let f = e.data.join("f");
+    folder::pull(
+        &e.remote,
+        &history("k", Selector::Latest),
+        &pull_opts(Some(f.clone())),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), b"v2");
+    assert_eq!(base_of(&e.data.join("f.dvc")), Some(l2.clone()));
+    let old = e.data.join("old/f");
+    let at = Selector::AtOrBefore("2026-09-01T12:00:00Z".into());
+    folder::pull(&e.remote, &history("k", at), &pull_opts(Some(old.clone()))).unwrap();
+    assert_eq!(std::fs::read(&old).unwrap(), b"v1");
+
+    // A new version continues the line, named for its parent.
+    write(&f, b"v3");
+    let v3 = folder::push(&e.remote, &f, &opts("k")).unwrap().version;
+    let name = format!("bigstore-history/k/{l2}/{v3}.dvc");
+    assert!(remote_keys(&e.store).contains(&name), "{name}");
+    assert_eq!(
+        line(),
+        [
+            (l1.clone(), vec![]),
+            (l2.clone(), vec![l1]),
+            (v3.clone(), vec![l2.clone()])
+        ]
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let at = e.data.join("at/f");
+    folder::pull(
+        &e.remote,
+        &history("k", Selector::AtOrBefore(now)),
+        &pull_opts(Some(at.clone())),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&at).unwrap(), b"v3");
+
+    // A 0.2 writer not upgraded with the rest continues its own line from
+    // the last 0.2 record: a fork, not a silent new latest.
+    let l3 = legacy_version(&e, "k", "20991231T000000.000000000Z", b"v4 from 0.2");
+    let err = folder::pull(
+        &e.remote,
+        &history("k", Selector::Latest),
+        &pull_opts(Some(e.data.join("latest"))),
+    )
+    .unwrap_err();
+    let mut heads = vec![l3, v3];
+    heads.sort();
+    assert_eq!(diverged(&err), heads);
+}
+
+#[test]
+fn a_record_whose_name_disagrees_with_its_content_is_refused() {
+    let e = env();
+    let f = e.data.join("f");
+    write(&f, b"v1");
+    let v1 = folder::push(&e.remote, &f, &as_writer("k", "host-a"))
+        .unwrap()
+        .version;
+    write(&f, b"v2");
+    let v2 = folder::push(&e.remote, &f, &as_writer("k", "host-a"))
+        .unwrap()
+        .version;
+    let dir = e.store.join("bigstore-history/k");
+    let genuine = dir.join(format!("{v1}/{v2}.dvc"));
+    let bytes = std::fs::read(&genuine).unwrap();
+    let out = e.data.join("out");
+    let pull = |at: Selector| {
+        let err =
+            folder::pull(&e.remote, &history("k", at), &pull_opts(Some(out.clone()))).unwrap_err();
+        format!("{err:#}")
+    };
+
+    // Moved to claim other parents: its content says v1.
+    let moved = dir.join(format!("root/{v2}.dvc"));
+    std::fs::rename(&genuine, &moved).unwrap();
+    let msg = pull(by_id(&v2));
+    assert!(
+        msg.contains("bad record") && msg.contains(&format!("it follows {v1}, not the root")),
+        "{msg}"
+    );
+    let msg = format!("{:#}", history_log(&e, "k").unwrap_err());
+    assert!(msg.contains("bad record"), "{msg}");
+    std::fs::rename(&moved, &genuine).unwrap();
+
+    // Edited in place: its bytes are no longer the id its name gives.
+    let edited = String::from_utf8(bytes.clone()).unwrap();
+    std::fs::write(&genuine, edited.replace("host-a", "host-b")).unwrap();
+    for at in [Selector::Latest, by_id(&v2)] {
+        let msg = pull(at);
+        assert!(
+            msg.contains("bad record") && msg.contains(&format!("not the {v2} its name says")),
+            "{msg}"
+        );
+    }
+    std::fs::write(&genuine, &bytes).unwrap();
+
+    // A pointer that is no record, under a record's name.
+    let beside = std::fs::read(e.data.join("f.dvc")).unwrap();
+    write(
+        &dir.join(format!("{v2}/{}.dvc", record_id(&beside))),
+        &beside,
+    );
+    let msg = pull(Selector::Latest);
+    assert!(
+        msg.contains("bad record") && msg.contains("its meta is not what its name calls for"),
+        "{msg}"
+    );
+    assert!(!out.exists() && !e.data.join("out.dvc").exists());
+}
+
+#[test]
+fn a_dvc_with_someone_elses_meta_is_never_replaced() {
+    let e = env();
+    let f = e.data.join("f");
+    write(&f, b"x");
+    let dvc = e.data.join("f.dvc");
+    let theirs = format!(
+        "outs:\n- md5: 9dd4e461268c8034f5c8564e155c67a6\n  size: 1\n  hash: md5\n  path: f\n\
+         meta:\n  bigstore:\n    base: {}\n  author: rick\n",
+        "a".repeat(32)
+    );
+    write(&dvc, theirs.as_bytes());
+    let err = folder::push(&e.remote, &f, &opts("k")).unwrap_err();
+    assert_eq!(refused(&err), (dvc.as_path(), &Refusal::ForeignPointer));
+    // Nor does a pull from history, before it writes anything.
+    let g = e.data.join("g");
+    write(&g, b"y");
+    folder::push(&e.remote, &g, &opts("k")).unwrap();
+    let o = PullOptions {
+        overwrite: Overwrite::Force,
+        ..pull_opts(Some(f.clone()))
+    };
+    let err = folder::pull(&e.remote, &history("k", Selector::Latest), &o).unwrap_err();
+    assert_eq!(refused(&err), (dvc.as_path(), &Refusal::ForeignPointer));
+    assert_eq!(std::fs::read(&f).unwrap(), b"x");
+    assert_eq!(std::fs::read_to_string(&dvc).unwrap(), theirs);
+}
+
+#[test]
+fn a_pull_writes_its_base_last_so_a_cancelled_one_leaves_the_base() {
+    let e = env();
+    let out = e.data.join("out");
+    many_files(&out, 20);
+    let v1 = folder::push(&e.remote, &out, &opts("ds/out"))
+        .unwrap()
+        .version;
+    for (rel, _) in tree(&out) {
+        write(&out.join(&rel), format!("changed {rel}\n").as_bytes());
+    }
+    let v2 = folder::push(&e.remote, &out, &opts("ds/out"))
+        .unwrap()
+        .version;
+    let dvc = e.data.join("out.dvc");
+    let at_v2 = std::fs::read(&dvc).unwrap();
+    let cancelled_after_one_file = |into: &Path| {
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        PullOptions {
+            jobs: 1,
+            overwrite: Overwrite::Force,
+            cancel,
+            progress: Progress::new(move |e| {
+                if let ProgressEvent::Advanced {
+                    phase: Phase::Downloading,
+                    ..
+                } = e
+                {
+                    trigger.cancel();
+                }
+            }),
+            ..pull_opts(Some(into.to_path_buf()))
+        }
+    };
+    let old = || history("ds/out", by_id(&v1));
+    let err = folder::pull(&e.remote, &old(), &cancelled_after_one_file(&out)).unwrap_err();
+    assert_cancelled(&err);
+    let replaced = tree(&out)
+        .iter()
+        .filter(|(_, c)| !c.starts_with(b"changed"))
+        .count();
+    assert!((1..20).contains(&replaced), "{replaced}");
+    assert_eq!(
+        std::fs::read(&dvc).unwrap(),
+        at_v2,
+        "a cancelled pull moved the base"
+    );
+    let fresh = e.data.join("fresh");
+    let err = folder::pull(&e.remote, &old(), &cancelled_after_one_file(&fresh)).unwrap_err();
+    assert_cancelled(&err);
+    assert!(!e.data.join("fresh.dvc").exists());
+
+    // Pulled whole, v1 is the base, so a push of changes to it is stale.
+    let o = PullOptions {
+        overwrite: Overwrite::Force,
+        ..pull_opts(Some(out.clone()))
+    };
+    folder::pull(&e.remote, &old(), &o).unwrap();
+    assert_eq!(base_of(&dvc), Some(v1.clone()));
+    write(&out.join("f000.txt"), b"edited on v1\n");
+    let err = folder::push(&e.remote, &out, &opts("ds/out")).unwrap_err();
+    assert_eq!(stale_base(&err), (Some(&v1), &[v2][..]));
 }

@@ -2,10 +2,17 @@
 //!
 //! [`push`] backs up one *output* — a directory or a single file — to a
 //! remote in DVC 3's layout (`files/md5/xx/rest`, plus a `.dir` manifest for
-//! directories), writes a DVC 3 `.dvc` pointer next to it, and appends the
-//! pointer to a history log on the remote. [`pull`] restores an output from a
-//! pointer or from history. Real DVC can `dvc pull` what this writes, and
-//! this can pull what `dvc push` wrote.
+//! directories), records it as a version in its history on the remote, and
+//! writes a DVC 3 `.dvc` pointer next to it naming that version as its
+//! *base*. [`pull`] restores an output from a pointer or from history. Real
+//! DVC can `dvc pull` what this writes, and this can pull what `dvc push`
+//! wrote.
+//!
+//! History is a graph: each version names the versions it follows, and a
+//! push follows the output's base, which must be the latest version (the
+//! only *head*). Pushes from one base that race each other both land, as a
+//! fork that push reports and pull, status and the next push refuse to
+//! guess through; a push with [`Resolve::Merge`] joins it again.
 //!
 //! Every call comes in two forms with the same arguments and results.
 //! [`push`], [`status`], [`pull`], [`log`] and [`keys`] block: each runs its
@@ -26,8 +33,9 @@
 //! file, a downloaded file already being placed is placed whole, and
 //! uploads and downloads under way are abandoned (an S3 multipart upload
 //! may be left for the bucket's lifecycle rule to expire). A push dropped
-//! after writing its `.dvc` may lack its history record, as when the append
-//! fails. A [`CancelToken`] stops more gently: transfers under way finish
+//! after publishing its history record may not have written its `.dvc`;
+//! the next push of the same content adopts the record rather than add
+//! another. A [`CancelToken`] stops more gently: transfers under way finish
 //! first. [`Remote::open`] makes no request (for `local://` it only creates
 //! the directory) and has one form.
 //!
@@ -50,7 +58,7 @@ pub use crate::backend::store::Credentials;
 use crate::backend::{self, Store};
 use crate::cache::WorktreeMode;
 use crate::config::{BackendConfig, BigstoreConfig};
-use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
+use crate::dvc::{BigstoreMeta, DvcOutput, DvcPointer, Manifest, ManifestEntry, RecordId};
 use crate::types::{check_portable_component, long_path, Hexdigest, Layout, ManifestPath};
 pub use error::{Error, Refusal};
 pub use history::{
@@ -402,14 +410,19 @@ pub struct PushOptions {
     /// Entries of a directory output to skip; always includes
     /// [`DEFAULT_EXCLUDES`]. Not applied to a single-file output.
     pub exclude: Excludes,
-    /// Stops the push before it writes the `.dvc`; after that it completes.
+    /// Stops the push before it publishes its history record; after that it
+    /// completes.
     pub cancel: CancelToken,
     pub progress: Progress,
+    /// What to do when the history has forked.
+    pub resolve: Resolve,
+    /// Who pushes, recorded in each version: this host's name by default.
+    pub writer: String,
 }
 
 impl PushOptions {
     /// Push to `history` with 8 jobs, the default excludes, a token nobody
-    /// else can cancel and no progress reports.
+    /// else can cancel, no progress reports, forks refused, as this host.
     pub fn new(history: HistoryKey) -> Self {
         Self {
             history,
@@ -417,12 +430,28 @@ impl PushOptions {
             exclude: Excludes::default(),
             cancel: CancelToken::default(),
             progress: Progress::default(),
+            resolve: Resolve::default(),
+            writer: gethostname::gethostname().to_string_lossy().into_owned(),
         }
     }
 }
 
+/// What push does when the history has forked (several heads).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Resolve {
+    /// Refuse, as [`Error::Diverged`].
+    #[default]
+    Refuse,
+    /// Record the output as a merge following every head. Its base must be
+    /// one of them: pull a head by id, reconcile the others into it, then
+    /// push.
+    Merge,
+}
+
 #[derive(Debug)]
 pub struct PushReport {
+    /// The pointer written, with the version as its base.
     pub pointer: DvcPointer,
     /// The `.dvc` file written (or already identical) next to the output.
     pub pointer_path: PathBuf,
@@ -435,19 +464,36 @@ pub struct PushReport {
     pub empty_dirs: usize,
     /// Non-fatal observations, e.g. a `.jsonl` without a final newline.
     pub warnings: Vec<String>,
-    /// History record written; `None` if the latest record already was this
-    /// version.
+    /// The version the output now is: the one published, or the head it
+    /// already was.
+    pub version: RecordId,
+    /// Remote key of the history record published; `None` if the output
+    /// already was the latest version.
     pub history_record: Option<String>,
+    /// Versions another push published from the same base while this one
+    /// ran: the history has forked, and the next push is refused until a
+    /// push with [`Resolve::Merge`] joins it. Empty normally.
+    pub forked_with: Vec<RecordId>,
 }
 
 /// Back up `output` (a directory or a single file).
 ///
-/// Order is what makes this safe for DVC and for concurrent readers: every
-/// object is uploaded first, then the `.dir` manifest (DVC treats a present
-/// manifest as "all its objects are present"), then the local `.dvc`, then
-/// the history record. A failure at any step leaves at most unreferenced
-/// objects behind. Files are snapshotted while hashed, so an append during
-/// the push can never produce an object whose content does not match its key.
+/// History is checked first, from one listing, before anything is
+/// uploaded. An output equal to the latest version publishes no version
+/// (and becomes it, whatever its `.dvc` said). Otherwise the output's base
+/// must be the latest version: [`Error::StaleBase`] if it has none while
+/// history does, or another version landed since; [`Error::Diverged`] if
+/// the history has forked, unless [`PushOptions::resolve`] merges it.
+///
+/// Then order is what makes this safe for DVC and for concurrent readers:
+/// every object is uploaded first, then the `.dir` manifest (DVC treats a
+/// present manifest as "all its objects are present"), then the history
+/// record, under a name never written before, then the local `.dvc` with
+/// the new base. A failure at any step leaves at most unreferenced objects
+/// behind, or a record the next push adopts. Last, history is listed again
+/// to report a push that raced this one ([`PushReport::forked_with`]).
+/// Files are snapshotted while hashed, so an append during the push can
+/// never produce an object whose content does not match its key.
 ///
 /// Anything push will not back up is refused as [`Error::Refused`] before
 /// anything is published; an output that keeps changing through every retry
@@ -458,36 +504,68 @@ pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushRe
 
 /// [`push`] on the caller's tokio runtime (see [the module docs](self)).
 pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
-    let (name, pointer_path, _) = locate(output).await?;
+    let (name, pointer_path, local) = locate(output).await?;
     let mut scratch = stage(output, name, opts, |s| s).await?;
-    let published = publish(remote, &mut scratch.get_mut().0, &pointer_path, opts).await;
+    let base = base_of(local.as_ref());
+    let published = publish(remote, &mut scratch.get_mut().0, &pointer_path, base, opts).await;
     let staged = &scratch.get().0;
-    let report = published.map(|(uploaded, already_present, history_record)| PushReport {
-        pointer: staged.pointer.clone(),
+    let report = published.map(|p| PushReport {
+        pointer: p.pointer,
         pointer_path,
         files: staged.files,
-        uploaded,
-        already_present,
+        uploaded: p.uploaded,
+        already_present: p.already_present,
         empty_dirs: staged.empty_dirs,
         warnings: staged.warnings.clone(),
-        history_record,
+        version: p.version,
+        history_record: p.history_record,
+        forked_with: p.forked_with,
     });
     scratch.delete().await;
     report
 }
 
-/// Publish a staged output in push's order: objects, manifest, `.dvc`,
-/// history record. Returns the contents uploaded, those already present,
-/// and the history record written.
+/// The base a `.dvc` records, if it is one bigstore wrote beside an output.
+fn base_of(pointer: Option<&DvcPointer>) -> Option<&RecordId> {
+    match pointer?.meta.as_ref()? {
+        BigstoreMeta::Base(id) => Some(id),
+        BigstoreMeta::Record { .. } => None,
+    }
+}
+
+/// What [`publish`] did.
+struct Published {
+    pointer: DvcPointer,
+    uploaded: usize,
+    already_present: usize,
+    version: RecordId,
+    history_record: Option<String>,
+    forked_with: Vec<RecordId>,
+}
+
+/// Publish a staged output, last synced to `base`, in push's order: decide
+/// against history, then objects, manifest, history record, `.dvc`; then
+/// look for a push that raced this one.
 async fn publish(
     remote: &Remote,
     staged: &mut Staged<Snapshot>,
     pointer_path: &Path,
+    base: Option<&RecordId>,
     opts: &PushOptions,
-) -> Result<(usize, usize, Option<String>)> {
-    let plan = plan(remote, staged, opts.jobs.max(1)).await?;
+) -> Result<Published> {
+    let jobs = opts.jobs.max(1);
+    let next = history::next(
+        remote,
+        &opts.history,
+        &staged.pointer.output,
+        base,
+        opts.resolve,
+        jobs,
+    )
+    .await?;
+    let plan = plan(remote, staged, jobs).await?;
     upload_all(remote, &plan.upload, opts).await?;
-    let (uploaded, present, upload_manifest) =
+    let (uploaded, already_present, upload_manifest) =
         (plan.upload.len(), plan.present.len(), plan.manifest);
     if upload_manifest {
         opts.cancel.check()?;
@@ -498,17 +576,49 @@ async fn publish(
             .expect("planned only for a staged manifest");
         remote.store.put(&key, manifest).await?;
     }
-    // The last point to stop: past it, the .dvc and history must agree.
+    // The last point to stop: past it, the version is published.
     opts.cancel.check()?;
-    write_pointer_file(pointer_path, &staged.pointer).await?;
-    let history_record = history::append(remote, &opts.history, &staged.pointer).await?;
-    Ok((uploaded, present, history_record))
+    let (version, published) = match next {
+        history::Next::Adopt(head) => (head, None),
+        history::Next::Publish { parents, after } => {
+            let (id, key) = history::append(
+                remote,
+                &opts.history,
+                &staged.pointer,
+                parents.clone(),
+                after,
+                &opts.writer,
+            )
+            .await?;
+            (id, Some((key, parents)))
+        }
+    };
+    let pointer = DvcPointer {
+        meta: Some(BigstoreMeta::Base(version.clone())),
+        ..staged.pointer.clone()
+    };
+    write_pointer_file(pointer_path, &pointer).await?;
+    let (history_record, forked_with) = match published {
+        Some((key, parents)) => {
+            let raced = history::forked_with(remote, &opts.history, &version, &parents).await?;
+            (Some(key), raced)
+        }
+        None => (None, Vec::new()),
+    };
+    Ok(Published {
+        pointer,
+        uploaded,
+        already_present,
+        version,
+        history_record,
+        forked_with,
+    })
 }
 
 /// What [`status`] found: what [`push`] would do with the same arguments.
 #[derive(Debug)]
 pub struct StatusReport {
-    /// The pointer push would write.
+    /// The pointer push would write, less its base.
     pub pointer: DvcPointer,
     pub files: usize,
     /// Distinct contents push would upload (files with the same content count
@@ -526,8 +636,9 @@ pub struct StatusReport {
     pub sync: SyncState,
 }
 
-/// How a local output relates to the latest version in its history, judged
-/// by the `.dvc` beside it (the version it was last pushed or pulled as).
+/// How a local output relates to the latest version in its history (its
+/// head), judged by the `.dvc` beside it: its base, the version it was last
+/// pushed or pulled as, and the content it had then.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SyncState {
@@ -535,26 +646,34 @@ pub enum SyncState {
     NoHistory,
     /// The output is the latest version: push would add none. Push may
     /// still rewrite the `.dvc` beside it, if that is missing or records
-    /// another version (say the output was copied in, not pulled).
+    /// another base (say the output was copied in, not pulled).
     InSync,
-    /// The output changed since the latest version, which its `.dvc`
-    /// records: push would add a version.
+    /// The output changed since the latest version, its base: push would
+    /// add a version.
     LocalAhead,
-    /// The history has a newer version than the one the `.dvc` records, and
-    /// the output has not changed since: pull to catch up. A push would
-    /// record the older content as the newest version.
+    /// The history has a newer version than the output's base, and the
+    /// output has not changed since its `.dvc`: pull to catch up. Push
+    /// refuses ([`Error::StaleBase`]).
     RemoteAhead { latest: HistoryRecord },
-    /// The output changed and so did the history since its `.dvc` (or there
-    /// is no `.dvc` to tell): a pull or a push would set one side aside.
-    Diverged { latest: HistoryRecord },
+    /// The output changed, and the latest version is not its base (or it
+    /// has none): push refuses ([`Error::StaleBase`]). Set the changes
+    /// aside, pull, and redo them.
+    Stale {
+        base: Option<RecordId>,
+        head: HistoryRecord,
+    },
+    /// The history has forked: several heads. Pull refuses `Latest` and
+    /// push refuses ([`Error::Diverged`]) until a push with
+    /// [`Resolve::Merge`] joins them.
+    Diverged { heads: Vec<RecordId> },
 }
 
 /// What [`push`] would do, without doing it: `output` is walked, snapshotted
 /// and hashed exactly as push does, and the remote is asked which contents
-/// it has and what the latest version is (one history record fetched).
-/// Nothing is written to the remote or beside the output; snapshots go to a
-/// private temp directory, one file at a time. Refuses whatever push
-/// refuses.
+/// it has and what the heads of the history are (one listing, then the
+/// heads fetched). Nothing is written to the remote or beside the output;
+/// snapshots go to a private temp directory, one file at a time. Refuses
+/// whatever push refuses.
 pub fn status(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
     block_on("status", status_async(remote, output, opts))?
 }
@@ -572,20 +691,28 @@ pub async fn status_async(
     })
     .await?;
     let staged = &scratch.get().0;
+    let jobs = opts.jobs.max(1);
     let checked = async {
-        let plan = plan(remote, staged, opts.jobs.max(1)).await?;
-        Ok::<_, anyhow::Error>((plan, history::latest(remote, &opts.history).await?))
+        let plan = plan(remote, staged, jobs).await?;
+        Ok::<_, anyhow::Error>((plan, history::heads_of(remote, &opts.history, jobs).await?))
     }
     .await;
-    let report = checked.map(|(plan, latest)| {
+    let report = checked.map(|(plan, heads)| {
         let output = &staged.pointer.output;
-        let sync = match latest {
-            None => SyncState::NoHistory,
-            Some(latest) if latest.pointer.output == *output => SyncState::InSync,
-            Some(latest) => match local {
-                Some(p) if p.output == latest.pointer.output => SyncState::LocalAhead,
-                Some(p) if p.output == *output => SyncState::RemoteAhead { latest },
-                _ => SyncState::Diverged { latest },
+        let base = base_of(local.as_ref());
+        let sync = match heads {
+            history::Heads::None => SyncState::NoHistory,
+            history::Heads::One(head) if head.pointer.output == *output => SyncState::InSync,
+            history::Heads::One(head) if base == Some(&head.id) => SyncState::LocalAhead,
+            history::Heads::One(head) => match &local {
+                Some(p) if p.output == *output => SyncState::RemoteAhead { latest: *head },
+                _ => SyncState::Stale {
+                    base: base.cloned(),
+                    head: *head,
+                },
+            },
+            history::Heads::Many(heads) => SyncState::Diverged {
+                heads: heads.into_iter().map(|h| h.id).collect(),
             },
         };
         let bytes = |cs: &[&Hashed]| cs.iter().map(|c| c.size).sum();
@@ -819,6 +946,7 @@ fn snapshot_dir<C>(
                 nfiles: files as u64,
             },
             path: name.to_string(),
+            meta: None,
         },
         manifest: Some(manifest.to_bytes()),
         contents: contents.into_values().collect(),
@@ -852,6 +980,7 @@ fn snapshot_file<C>(
                 size: s.size(),
             },
             path: name.to_string(),
+            meta: None,
         },
         manifest: None,
         contents: vec![keep(s)],
@@ -1051,9 +1180,13 @@ fn current_umask() -> u32 {
 /// What to restore.
 #[derive(Debug, Clone)]
 pub enum PointerSource {
-    /// A `.dvc` file; the output is restored next to it.
+    /// A `.dvc` file; the output is restored next to it, and the `.dvc` is
+    /// left as it is.
     File(PathBuf),
-    /// A version from the remote's history.
+    /// A version from the remote's history. Once every file is restored,
+    /// `<into>.dvc` is written beside the output with that version as its
+    /// base, so pulling an old version makes the next push of it
+    /// [`Error::StaleBase`].
     History { key: HistoryKey, at: Selector },
 }
 
@@ -1094,6 +1227,8 @@ impl Default for PullOptions {
 
 #[derive(Debug)]
 pub struct PullReport {
+    /// The pointer restored: for a pull from history, as written beside the
+    /// output, with the version as its base.
     pub pointer: DvcPointer,
     pub written: usize,
     pub unchanged: usize,
@@ -1103,11 +1238,14 @@ pub struct PullReport {
 
 /// Restore an output. Every target is classified before anything is written:
 /// a symlinked or non-regular path is always refused ([`Error::Refused`]);
-/// differing files are refused (as [`Error::PullConflict`]) unless forced.
-/// Files are downloaded to a temp file beside their target, verified, then
-/// renamed into place — never linked. Local files not in the version are
-/// left alone. A history selector that matches nothing is
-/// [`Error::NoSuchVersion`].
+/// differing files are refused (as [`Error::PullConflict`]) unless forced;
+/// for a pull from history, so is a `.dvc` beside `into` that push would
+/// refuse to replace. Files are downloaded to a temp file beside their
+/// target, verified, then renamed into place — never linked. Local files
+/// not in the version are left alone. A pull from history writes its
+/// `.dvc` last, once every file is in place. A history selector that
+/// matches nothing is [`Error::NoSuchVersion`]; `Latest` in a forked
+/// history is [`Error::Diverged`].
 pub fn pull(remote: &Remote, source: &PointerSource, opts: &PullOptions) -> Result<PullReport> {
     block_on("pull", pull_async(remote, source, opts))?
 }
@@ -1120,15 +1258,15 @@ pub async fn pull_async(
 ) -> Result<PullReport> {
     // The mode restored files get. Only a `.dvc` DVC wrote can mark one
     // (`isexec`); push records none, so history never does.
-    let (pointer, mode, default_into) = match source {
+    let (pointer, mode, default_into, version) = match source {
         PointerSource::File(path) => {
             let path = path.clone();
             let (pointer, mode, into) = backend::blocking(move || read_pointer_file(&path)).await?;
-            (pointer, mode, Some(into))
+            (pointer, mode, Some(into), None)
         }
         PointerSource::History { key, at } => {
-            let record = history::select(remote, key, at, opts.jobs.max(1)).await?;
-            (record.pointer, WorktreeMode::Regular, None)
+            let record = history::select(remote, key, at, opts.jobs.max(1), &opts.cancel).await?;
+            (record.pointer, WorktreeMode::Regular, None, Some(record.id))
         }
     };
     let into = opts
@@ -1136,6 +1274,19 @@ pub async fn pull_async(
         .clone()
         .or(default_into)
         .ok_or(Error::DestinationRequired)?;
+    // The `.dvc` a pull from history writes, checked before anything is.
+    let beside = match version {
+        Some(version) => {
+            let (path, pointer_path, _) = locate(&into).await?;
+            let pointer = DvcPointer {
+                path,
+                meta: Some(BigstoreMeta::Base(version)),
+                ..pointer.clone()
+            };
+            Some((pointer_path, pointer))
+        }
+        None => None,
+    };
     opts.cancel.check()?;
 
     let targets: Vec<(PathBuf, Hexdigest)> = match &pointer.output {
@@ -1182,6 +1333,15 @@ pub async fn pull_async(
         },
     });
     let written = fetch_and_place(remote, checked.by_object, opts, mode).await?;
+    let pointer = match beside {
+        Some((path, pointer)) => {
+            let dir = path.parent().context("pointer path has no parent")?;
+            tokio::fs::create_dir_all(long_path(dir)?).await?;
+            write_pointer_file(&path, &pointer).await?;
+            pointer
+        }
+        None => pointer,
+    };
 
     Ok(PullReport {
         pointer,

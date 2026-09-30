@@ -185,7 +185,8 @@ fn bigstore_pulls_what_dvc_pushed_and_repushes_identically() {
         }
     }
 
-    // Re-pushing the same content from bigstore: same pointer, nothing new.
+    // Re-pushing the same content from bigstore: the same pointer, byte for
+    // byte, followed by the version it now is; nothing else new.
     let before = tree(&store).len();
     let dvc_yaml = std::fs::read_to_string(project.join("views.dvc")).unwrap();
     let report = folder::push(
@@ -197,10 +198,56 @@ fn bigstore_pulls_what_dvc_pushed_and_repushes_identically() {
     assert_eq!(report.uploaded, 0);
     assert_eq!(
         std::fs::read_to_string(project.join("views.dvc")).unwrap(),
-        dvc_yaml
+        format!(
+            "{dvc_yaml}meta:\n  bigstore:\n    base: {}\n",
+            report.version
+        )
     );
     // Only the history record is new.
     assert_eq!(tree(&store).len(), before + 1);
+}
+
+/// DVC ignores `meta:`: a `.dvc` bigstore wrote beside an output (its base)
+/// and a history record (its parents, writer and time) both pull and check
+/// clean as plain DVC pointers.
+#[test]
+#[ignore = "needs a pinned DVC (dvc-compat CI job)"]
+fn dvc_reads_pointers_and_history_records_carrying_bigstore_meta() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dvc = Dvc::new(tmp.path());
+    let store = tmp.path().join("remote");
+    let remote = local_remote(&store);
+    let src = tmp.path().join("src/host=xenoglossicist");
+    let opts = PushOptions::new(HistoryKey::new("ds/host=xenoglossicist").unwrap());
+    populate(&src);
+    folder::push(&remote, &src, &opts).unwrap();
+    write(&src.join("a.txt"), b"second version");
+    let report = folder::push(&remote, &src, &opts).unwrap();
+    let record = store.join(report.history_record.as_deref().unwrap());
+
+    for (i, pointer) in [&report.pointer_path, &record].into_iter().enumerate() {
+        let text = std::fs::read_to_string(pointer).unwrap();
+        assert!(text.contains("\nmeta:\n  bigstore:\n"), "{text}");
+        let consumer = tmp.path().join(format!("consumer{i}"));
+        std::fs::create_dir_all(&consumer).unwrap();
+        dvc.run(&consumer, &["init", "--no-scm", "-q"]);
+        dvc.run(
+            &consumer,
+            &["remote", "add", "-d", "r", store.to_str().unwrap()],
+        );
+        let copied = consumer.join("host=xenoglossicist.dvc");
+        std::fs::write(&copied, &text).unwrap();
+        // Fails if DVC cannot read the file.
+        dvc.run(&consumer, &["status", "-c"]);
+        dvc.run(&consumer, &["pull", "-q"]);
+        assert_eq!(tree(&consumer.join("host=xenoglossicist")), tree(&src));
+        assert!(
+            dvc.run(&consumer, &["status"]).contains("up to date"),
+            "{}",
+            pointer.display()
+        );
+        assert!(dvc.run(&consumer, &["status", "-c"]).contains("in sync"));
+    }
 }
 
 /// The README's recipe: with [`DEFAULT_EXCLUDES`] (and any custom patterns,
@@ -265,6 +312,9 @@ fn dvc_add_with_the_documented_dvcignore_matches_push() {
         },
     )
     .unwrap();
-    assert_eq!(report.pointer, by_dvc);
+    assert_eq!(
+        (&report.pointer.output, &report.pointer.path),
+        (&by_dvc.output, &by_dvc.path)
+    );
     assert_eq!(report.files, 13, "populate's 11 files and the 2 kept");
 }
