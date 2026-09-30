@@ -356,7 +356,9 @@ pub struct StatusReport {
 pub enum SyncState {
     /// The history is empty: push would record the first version.
     NoHistory,
-    /// The output is the latest version: push would add none.
+    /// The output is the latest version: push would add none. Push may
+    /// still rewrite the `.dvc` beside it, if that is missing or records
+    /// another version (say the output was copied in, not pulled).
     InSync,
     /// The output changed since the latest version, which its `.dvc`
     /// records: push would add a version.

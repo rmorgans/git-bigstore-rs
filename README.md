@@ -658,6 +658,10 @@ for key in folder::keys(&remote, Some(&under))? {
 }
 ```
 
+`keys` leaves out, silently, any key that `HistoryKey::new` would reject
+(records another tool, or a hand, put under a non-portable name); nothing
+bigstore pushes is affected.
+
 Dry run: `folder::status` walks, snapshots and hashes the output exactly as
 `push` does (and refuses what push refuses), asks the remote which contents
 it has and fetches the latest history record, and writes nothing, on the
@@ -677,6 +681,9 @@ match s.sync {
     _ => {}                                      // #[non_exhaustive]
 }
 ```
+
+`InSync` says push would record no new version. It may still rewrite the
+`.dvc` beside the output, if that is missing or records another version.
 
 The functions block and run their own tokio runtime. Calling them from inside
 a runtime returns an error; use `spawn_blocking`.

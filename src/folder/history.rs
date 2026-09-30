@@ -188,7 +188,9 @@ pub fn log(remote: &Remote, key: &HistoryKey, opts: &LogOptions) -> Result<Vec<H
 /// Every history key holding at least one version, sorted: all of them, or
 /// `under` and the keys below it (`a/b` matches `a/b` and `a/b/c`, not
 /// `a/bc`). One listing; no record is fetched. Objects that are not records
-/// are ignored.
+/// are ignored, and so are records under a key [`HistoryKey::new`] rejects
+/// (written by another tool, or by hand, with a non-portable name): such a
+/// key is left out silently, not reported.
 pub fn keys(remote: &Remote, under: Option<&HistoryKey>) -> Result<Vec<HistoryKey>> {
     let root = remote.key("bigstore-history/");
     let prefix = match under {
