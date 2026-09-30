@@ -8,8 +8,8 @@
 
 use bigstore::dvc::DvcPointer;
 use bigstore::folder::{
-    self, Credentials, Excludes, HistoryKey, Overwrite, PointerSource, PullOptions, PushOptions,
-    Remote, RemoteConfig, DEFAULT_EXCLUDES,
+    self, Credentials, Excludes, HistoryKey, PointerSource, PullOptions, PushOptions, Remote,
+    RemoteConfig, DEFAULT_EXCLUDES,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -120,11 +120,7 @@ fn dvc_pulls_and_verifies_what_bigstore_pushed() {
     let report = folder::push(
         &local_remote(&store),
         &src,
-        &PushOptions {
-            history: HistoryKey::new("ds/host=xenoglossicist").unwrap(),
-            jobs: 4,
-            exclude: Excludes::default(),
-        },
+        &PushOptions::new(HistoryKey::new("ds/host=xenoglossicist").unwrap()),
     )
     .unwrap();
 
@@ -176,8 +172,7 @@ fn bigstore_pulls_what_dvc_pushed_and_repushes_identically() {
             &PointerSource::File(project.join(pointer)),
             &PullOptions {
                 into: Some(restore.clone()),
-                overwrite: Overwrite::Refuse,
-                jobs: 4,
+                ..PullOptions::default()
             },
         )
         .unwrap();
@@ -194,11 +189,7 @@ fn bigstore_pulls_what_dvc_pushed_and_repushes_identically() {
     let report = folder::push(
         &remote,
         &project.join("views"),
-        &PushOptions {
-            history: HistoryKey::new("ds/views").unwrap(),
-            jobs: 4,
-            exclude: Excludes::default(),
-        },
+        &PushOptions::new(HistoryKey::new("ds/views").unwrap()),
     )
     .unwrap();
     assert_eq!(report.uploaded, 0);
@@ -259,9 +250,8 @@ fn dvc_add_with_the_documented_dvcignore_matches_push() {
         &local_remote(&tmp.path().join("remote")),
         &views,
         &PushOptions {
-            history: HistoryKey::new("ds/views").unwrap(),
-            jobs: 4,
             exclude: Excludes::new(["*.tmp", "/cache", "scratch/"]).unwrap(),
+            ..PushOptions::new(HistoryKey::new("ds/views").unwrap())
         },
     )
     .unwrap();

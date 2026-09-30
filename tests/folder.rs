@@ -61,17 +61,16 @@ fn write(path: &Path, content: &[u8]) {
 
 fn opts(key: &str) -> PushOptions {
     PushOptions {
-        history: HistoryKey::new(key).unwrap(),
         jobs: 4,
-        exclude: Excludes::default(),
+        ..PushOptions::new(HistoryKey::new(key).unwrap())
     }
 }
 
 fn pull_opts(into: Option<PathBuf>) -> PullOptions {
     PullOptions {
         into,
-        overwrite: Overwrite::Refuse,
         jobs: 4,
+        ..PullOptions::default()
     }
 }
 
@@ -1597,4 +1596,57 @@ fn status_says_what_push_would_do_and_writes_nothing() {
     std::fs::write(&labels, b"{\"t\":5}\n").unwrap();
     let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
     assert!(matches!(s.sync, SyncState::Diverged { .. }), "{:?}", s.sync);
+}
+
+#[track_caller]
+fn assert_cancelled(err: &anyhow::Error) {
+    assert!(
+        matches!(folder_error(err), FolderError::Cancelled),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn a_cancelled_push_publishes_nothing() {
+    let e = env();
+    let w = writer_dir(&e);
+    let pointer_path =
+        w.with_file_name(format!("{}.dvc", w.file_name().unwrap().to_str().unwrap()));
+    let cancelled = || {
+        let o = opts(KEY);
+        o.cancel.cancel();
+        o
+    };
+
+    let err = folder::push(&e.remote, &w, &cancelled()).unwrap_err();
+    assert_cancelled(&err);
+    assert!(!pointer_path.exists(), "a .dvc was written");
+    assert!(remote_keys(&e.store).is_empty(), "something was published");
+
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let pointer = std::fs::read(&pointer_path).unwrap();
+    let keys = remote_keys(&e.store);
+    write(&w.join("new.jsonl"), b"{}\n");
+    let err = folder::push(&e.remote, &w, &cancelled()).unwrap_err();
+    assert_cancelled(&err);
+    assert_eq!(std::fs::read(&pointer_path).unwrap(), pointer);
+    assert_eq!(remote_keys(&e.store), keys, "history or objects changed");
+    let err = folder::status(&e.remote, &w, &cancelled()).unwrap_err();
+    assert_cancelled(&err);
+}
+
+#[test]
+fn a_cancelled_pull_writes_nothing() {
+    let e = env();
+    let w = writer_dir(&e);
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let into = e.data.parent().unwrap().join("restore");
+    let o = PullOptions {
+        into: Some(into.clone()),
+        ..PullOptions::default()
+    };
+    o.cancel.cancel();
+    let err = folder::pull(&e.remote, &history(KEY, Selector::Latest), &o).unwrap_err();
+    assert_cancelled(&err);
+    assert!(tree(&into).is_empty(), "{:?}", tree(&into));
 }

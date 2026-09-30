@@ -172,12 +172,36 @@ impl FolderPushArgs {
     fn open(&self) -> Result<(bigstore::folder::Remote, bigstore::folder::PushOptions)> {
         use bigstore::folder::{Excludes, HistoryKey, PushOptions};
         let opts = PushOptions {
-            history: HistoryKey::new(&self.history)?,
             jobs: resolve_jobs(self.jobs)?.get(),
             exclude: Excludes::new(&self.exclude)?,
+            cancel: cancel_on_ctrl_c()?,
+            ..PushOptions::new(HistoryKey::new(&self.history)?)
         };
         Ok((open_folder_remote(&self.remote)?, opts))
     }
+}
+
+/// A token the first Ctrl-C cancels, so a folder command stops cleanly
+/// (a push publishes nothing); a second Ctrl-C exits at once.
+fn cancel_on_ctrl_c() -> Result<bigstore::folder::CancelToken> {
+    let token = bigstore::folder::CancelToken::new();
+    let cancel = token.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the Ctrl-C watcher")?;
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("cancelling; Ctrl-C again to stop at once");
+                cancel.cancel();
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    std::process::exit(130);
+                }
+            }
+        })
+    });
+    Ok(token)
 }
 
 #[derive(Subcommand)]
@@ -818,6 +842,7 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                         Overwrite::Refuse
                     },
                     jobs: resolve_jobs(jobs)?.get(),
+                    cancel: cancel_on_ctrl_c()?,
                 },
             )?;
             eprintln!(

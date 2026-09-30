@@ -59,6 +59,11 @@ pub enum Error {
     /// A remote URL folder mode does not support (only `s3://`, `local://`
     /// and `rclone://`).
     UnsupportedRemote { url: String },
+    /// The caller's [`CancelToken`](super::CancelToken) was cancelled. A
+    /// push published no `.dvc` and no history record (objects already
+    /// uploaded stay: they are content-addressed); a pull left every file
+    /// either as it was or fully restored, never partly written.
+    Cancelled,
 }
 
 /// Why a path was refused.
@@ -170,6 +175,7 @@ impl fmt::Display for Error {
                 f,
                 "folder mode supports s3://, local:// and rclone:// remotes, not {url}"
             ),
+            Self::Cancelled => f.write_str("cancelled"),
         }
     }
 }

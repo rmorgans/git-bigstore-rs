@@ -515,7 +515,10 @@ As a library (`default-features = false, features = ["ring"]` or
 [Cargo features](#cargo-features)):
 
 ```rust
-use bigstore::folder::{self, Credentials, Excludes, HistoryKey, PushOptions, Remote, RemoteConfig};
+use bigstore::folder::{
+    self, Credentials, Excludes, HistoryKey, PointerSource, PullOptions, PushOptions, Remote,
+    RemoteConfig,
+};
 
 let remote = Remote::open(&RemoteConfig {
     url: "s3://my-bucket/dvc".into(),
@@ -523,11 +526,34 @@ let remote = Remote::open(&RemoteConfig {
     region: Some("ap-southeast-2".into()),
     credentials: Credentials::Static { access_key_id, secret_access_key },
 })?;
+let key = HistoryKey::new("ST032/Beatons/annotations/reviewer=rick/host=mac")?;
 let report = folder::push(&remote, dir, &PushOptions {
-    history: HistoryKey::new("ST032/Beatons/annotations/reviewer=rick/host=mac")?,
-    jobs: 8,
-    exclude: Excludes::default(), // or Excludes::new(["*.tmp", "/cache/"])?
+    exclude: Excludes::new(["*.tmp", "/cache/"])?, // default: Excludes::default()
+    ..PushOptions::new(key) // 8 jobs, default excludes, never cancelled
 })?;
+let pulled = folder::pull(&remote, &PointerSource::File(dvc_file), &PullOptions::default())?;
+```
+
+Cancelling from another thread (a request handler, a UI button): every
+clone of a `CancelToken` shares one flag. Push, status and pull check it
+between files and between objects; whatever is being hashed, uploaded or
+downloaded at that moment finishes first. The call then returns
+`folder::Error::Cancelled`. A cancelled push has written no `.dvc` and no
+history record (objects already uploaded stay; they are content-addressed,
+and the next push skips them); the check before the `.dvc` is written is
+the last, after which the push completes. A cancelled pull leaves every file
+as it was or fully restored, never partly written, and no temp files.
+`git bigstore folder` cancels this way on the first Ctrl-C (a second one
+exits at once).
+
+```rust
+let cancel = folder::CancelToken::new();
+let opts = PushOptions { cancel: cancel.clone(), ..PushOptions::new(key) };
+std::thread::spawn(move || { /* later */ cancel.cancel() });
+match folder::push(&remote, dir, &opts) {
+    Err(e) if matches!(e.downcast_ref(), Some(folder::Error::Cancelled)) => { /* nothing published */ }
+    other => { other?; }
+}
 ```
 
 History, from the library:
@@ -584,6 +610,7 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `EndpointRequired` | an `s3://` remote without an endpoint |
 | `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
 | `InvalidExclude { pattern }` | an exclude pattern that does not compile (or uses `!`) |
+| `Cancelled` | the caller's `CancelToken` was cancelled; a push published no `.dvc` or history record, a pull wrote no partial file |
 
 | `folder::Refusal` | Refused by | `path` is |
 | --- | --- | --- |

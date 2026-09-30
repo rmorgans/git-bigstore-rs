@@ -438,11 +438,7 @@ mod tests {
     }
 
     fn push_opts() -> PushOptions {
-        PushOptions {
-            history: HistoryKey::new("k").unwrap(),
-            jobs: 4,
-            exclude: Excludes::default(),
-        }
+        PushOptions::new(HistoryKey::new("k").unwrap())
     }
 
     fn pull_from(remote: &Remote, at: Selector, into: PathBuf) -> Result<PullReport> {
@@ -454,8 +450,7 @@ mod tests {
             },
             &PullOptions {
                 into: Some(into),
-                overwrite: Overwrite::Refuse,
-                jobs: 4,
+                ..PullOptions::default()
             },
         )
     }

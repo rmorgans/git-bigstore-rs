@@ -57,6 +57,15 @@
 - `PushReport::already_present` counts what the remote already had when its
   manifest was there too; a push of an unchanged directory used to report
   `0 uploaded, 0 already on the remote`.
+- Cancellation for folder mode: `folder::CancelToken` (cloneable, shared
+  flag), as `PushOptions::cancel` and `PullOptions::cancel`, checked between
+  files and between objects by push, status and pull; the call returns
+  `folder::Error::Cancelled`. A cancelled push writes no `.dvc` and no
+  history record; a cancelled pull leaves no partly written file.
+  `git bigstore folder push|status|pull` cancel this way on the first Ctrl-C.
+  `PushOptions::new(history)` and `PullOptions::default()` give the defaults
+  (8 jobs), so new options fields no longer break struct literals written
+  as `PushOptions { jobs: 4, ..PushOptions::new(key) }`.
 
 ### Security
 

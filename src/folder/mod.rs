@@ -20,6 +20,8 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub use crate::backend::store::Credentials;
 use crate::backend::{self, Backend};
@@ -129,9 +131,45 @@ fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output> {
 }
 
 // ──────────────────────────────────────────────────
+// Cancellation
+// ──────────────────────────────────────────────────
+
+/// Stops a push, status or pull from another thread. Clones share one flag;
+/// the default token is never cancelled (nobody else holds it). Checked
+/// between files and between objects: a file being hashed, uploaded or
+/// downloaded when it is cancelled is finished first. A cancelled call
+/// returns [`Error::Cancelled`].
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancel every call holding a clone of this token. Idempotent.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            return Err(Error::Cancelled.into());
+        }
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────
 // Push
 // ──────────────────────────────────────────────────
 
+/// How to push. Build with [`PushOptions::new`] and set what differs:
+/// `PushOptions { jobs: 16, ..PushOptions::new(key) }`.
 #[derive(Debug, Clone)]
 pub struct PushOptions {
     pub history: HistoryKey,
@@ -140,6 +178,21 @@ pub struct PushOptions {
     /// Entries of a directory output to skip; always includes
     /// [`DEFAULT_EXCLUDES`]. Not applied to a single-file output.
     pub exclude: Excludes,
+    /// Stops the push before it writes the `.dvc`; after that it completes.
+    pub cancel: CancelToken,
+}
+
+impl PushOptions {
+    /// Push to `history` with 8 jobs, the default excludes, and a token
+    /// nobody else can cancel.
+    pub fn new(history: HistoryKey) -> Self {
+        Self {
+            history,
+            jobs: crate::transfer::DEFAULT_CONCURRENCY,
+            exclude: Excludes::default(),
+            cancel: CancelToken::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -180,15 +233,18 @@ pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushRe
 async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
     let (name, pointer_path, _) = locate(output)?;
     let tmp = tempfile::tempdir().context("failed to create a temp dir")?;
-    let staged = stage(output, &name, tmp.path(), &opts.exclude, |s| s)?;
+    let staged = stage(output, &name, tmp.path(), opts, |s| s)?;
     let jobs = opts.jobs.max(1);
     let plan = plan(remote, &staged, jobs).await?;
 
-    upload_all(remote, &plan.upload, jobs).await?;
+    upload_all(remote, &plan.upload, jobs, &opts.cancel).await?;
     if let Some(manifest) = plan.manifest {
+        opts.cancel.check()?;
         let key = remote.manifest_key(staged.id());
         backend::put_bytes(&remote.backend, &key, manifest.to_bytes()).await?;
     }
+    // The last point to stop: past it, the .dvc and history must agree.
+    opts.cancel.check()?;
     write_pointer_file(&pointer_path, &staged.pointer)?;
     let history_record = history::append(remote, &opts.history, &staged.pointer).await?;
 
@@ -259,7 +315,7 @@ pub fn status(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<Stat
 async fn status_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
     let (name, _, local) = locate(output)?;
     let tmp = tempfile::tempdir().context("failed to create a temp dir")?;
-    let staged = stage(output, &name, tmp.path(), &opts.exclude, |s| Hashed {
+    let staged = stage(output, &name, tmp.path(), opts, |s| Hashed {
         md5: s.md5().clone(),
         size: s.size(),
     })?;
@@ -363,7 +419,7 @@ fn stage<C>(
     output: &Path,
     name: &str,
     tmp: &Path,
-    excludes: &Excludes,
+    opts: &PushOptions,
     keep: fn(Snapshot) -> C,
 ) -> Result<Staged<C>> {
     let meta = std::fs::symlink_metadata(output)
@@ -371,9 +427,9 @@ fn stage<C>(
     let mut last_change = String::new();
     for _ in 0..PUSH_ATTEMPTS {
         let attempt = if meta.is_dir() {
-            snapshot_dir(output, name, tmp, excludes, keep)
+            snapshot_dir(output, name, tmp, opts, keep)
         } else if meta.is_file() {
-            snapshot_file(output, name, tmp, keep)
+            snapshot_file(output, name, tmp, opts, keep)
         } else {
             return Err(Error::Refused {
                 path: output.to_path_buf(),
@@ -405,10 +461,10 @@ fn snapshot_dir<C>(
     dir: &Path,
     name: &str,
     tmp: &Path,
-    excludes: &Excludes,
+    opts: &PushOptions,
     keep: fn(Snapshot) -> C,
 ) -> std::result::Result<Staged<C>, Retry> {
-    let walk = match walk::walk(dir, excludes) {
+    let walk = match walk::walk(dir, &opts.exclude) {
         Ok(w) => w,
         Err(WalkError::Changed(m)) => return Err(Retry::Changed(m)),
         Err(e) => return Err(Retry::Fatal(e.into())),
@@ -419,6 +475,7 @@ fn snapshot_dir<C>(
     let mut warnings = Vec::new();
     let mut size = 0;
     for f in walk.files {
+        opts.cancel.check().map_err(Retry::Fatal)?;
         let s = snapshot::snapshot(&f.path, tmp)?;
         warn_unterminated(f.relpath.as_str(), &s, &mut warnings);
         size += s.size();
@@ -452,8 +509,10 @@ fn snapshot_file<C>(
     file: &Path,
     name: &str,
     tmp: &Path,
+    opts: &PushOptions,
     keep: fn(Snapshot) -> C,
 ) -> std::result::Result<Staged<C>, Retry> {
+    opts.cancel.check().map_err(Retry::Fatal)?;
     let s = snapshot::snapshot(file, tmp)?;
     let mut warnings = Vec::new();
     warn_unterminated(&file.to_string_lossy(), &s, &mut warnings);
@@ -516,17 +575,29 @@ async fn plan<'a, C: Content + Sync>(
     })
 }
 
-async fn upload_all(remote: &Remote, snaps: &[&Snapshot], jobs: usize) -> Result<()> {
+/// Upload `snaps`, `jobs` at a time. Once `cancel` is cancelled no upload
+/// starts; those under way finish (dropping one could orphan a multipart
+/// upload) and the push stops.
+async fn upload_all(
+    remote: &Remote,
+    snaps: &[&Snapshot],
+    jobs: usize,
+    cancel: &CancelToken,
+) -> Result<()> {
     use futures::stream::{self, StreamExt, TryStreamExt};
     stream::iter(snaps)
         .map(|s| async move {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
                 .await
                 .with_context(|| format!("upload of {} failed", s.md5()))
         })
         .buffer_unordered(jobs)
-        .try_collect()
-        .await
+        .try_collect::<()>()
+        .await?;
+    cancel.check()
 }
 
 /// The output's name: one portable path component.
@@ -651,6 +722,8 @@ pub enum Overwrite {
     Force,
 }
 
+/// How to pull. `PullOptions::default()` restores beside the `.dvc`,
+/// refuses to replace differing files, runs 8 jobs and cannot be cancelled.
 #[derive(Debug, Clone)]
 pub struct PullOptions {
     /// Where to restore. Defaults to the `.dvc` file's `<dir>/<path>`;
@@ -658,6 +731,20 @@ pub struct PullOptions {
     pub into: Option<PathBuf>,
     pub overwrite: Overwrite,
     pub jobs: usize,
+    /// Stops the pull between files: each file is either left as it was or
+    /// fully restored, never partly written.
+    pub cancel: CancelToken,
+}
+
+impl Default for PullOptions {
+    fn default() -> Self {
+        Self {
+            into: None,
+            overwrite: Overwrite::Refuse,
+            jobs: crate::transfer::DEFAULT_CONCURRENCY,
+            cancel: CancelToken::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -701,6 +788,7 @@ async fn pull_async(
         .clone()
         .or(default_into)
         .context("pulling from history needs a destination (`into`)")?;
+    opts.cancel.check()?;
 
     let targets: Vec<(PathBuf, Hexdigest)> = match &pointer.output {
         DvcOutput::Dir { manifest, .. } => {
@@ -742,6 +830,7 @@ async fn pull_async(
     let mut conflicts = Vec::new();
     let mut unchanged = 0;
     for (path, md5) in &targets {
+        opts.cancel.check()?;
         match classify_target(&into, path, md5)? {
             Target::Same => unchanged += 1,
             Target::Missing => plan.push((path, md5, false)),
@@ -765,7 +854,7 @@ async fn pull_async(
     for (path, md5, replace) in plan {
         by_object.entry(md5).or_default().push((path, replace));
     }
-    let written = fetch_and_place(remote, by_object, opts.jobs.max(1)).await?;
+    let written = fetch_and_place(remote, by_object, opts.jobs.max(1), &opts.cancel).await?;
 
     Ok(PullReport {
         pointer,
@@ -871,14 +960,21 @@ fn count_extra(root: &Path, targets: &[(PathBuf, Hexdigest)]) -> usize {
         .count()
 }
 
+/// Download each object once and place it at every path that needs it,
+/// `jobs` objects at a time. Once `cancel` is cancelled no download starts;
+/// those under way finish and are placed whole, and the pull stops.
 async fn fetch_and_place(
     remote: &Remote,
     by_object: BTreeMap<&Hexdigest, Vec<(&PathBuf, bool)>>,
     jobs: usize,
+    cancel: &CancelToken,
 ) -> Result<usize> {
     use futures::stream::{self, StreamExt, TryStreamExt};
     let counts: Vec<usize> = stream::iter(by_object)
         .map(|(md5, places)| async move {
+            if cancel.is_cancelled() {
+                return Ok(0);
+            }
             let (first, _) = places[0];
             let dir = first.parent().context("target has no parent")?;
             std::fs::create_dir_all(dir)?;
@@ -899,6 +995,7 @@ async fn fetch_and_place(
         .buffer_unordered(jobs)
         .try_collect()
         .await?;
+    cancel.check()?;
     Ok(counts.into_iter().sum())
 }
 
