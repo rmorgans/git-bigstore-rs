@@ -11,6 +11,7 @@
 //! be called from inside one (that returns an error rather than panicking).
 //! Nothing here calls git.
 
+mod error;
 mod snapshot;
 mod walk;
 
@@ -24,6 +25,7 @@ use crate::backend::{self, Backend};
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath, PortableRelPath};
+pub use error::{Error, Refusal};
 
 use snapshot::{Snapshot, SnapshotError};
 use walk::WalkError;
@@ -59,14 +61,22 @@ pub struct Remote {
 }
 
 impl Remote {
+    /// Refuses, as [`Error::UnsupportedRemote`], any URL but `s3://`,
+    /// `local://` (`file://`) and `rclone://`, and, as
+    /// [`Error::EndpointRequired`], `s3://` without an endpoint.
     pub fn open(config: &RemoteConfig) -> Result<Self> {
-        let cfg = BigstoreConfig::from_url(&config.url, None)?;
+        let unsupported = || Error::UnsupportedRemote {
+            url: config.url.clone(),
+        };
+        let cfg = match config.url.split_once("://") {
+            Some(("s3" | "local" | "file" | "rclone", _)) => {
+                BigstoreConfig::from_url(&config.url, None)?
+            }
+            _ => return Err(unsupported().into()),
+        };
         let (backend, prefix) = match &cfg.backend {
-            BackendConfig::S3 { bucket, prefix, .. } if config.url.starts_with("s3://") => {
-                let endpoint = config.endpoint.as_deref().context(
-                    "S3 remote needs an endpoint (e.g. https://s3.ap-southeast-2.wasabisys.com); \
-                     folder mode never defaults to AWS",
-                )?;
+            BackendConfig::S3 { bucket, prefix, .. } => {
+                let endpoint = config.endpoint.as_deref().ok_or(Error::EndpointRequired)?;
                 let store = backend::store::build_strict_s3(
                     bucket,
                     endpoint,
@@ -78,10 +88,7 @@ impl Remote {
             BackendConfig::Local { .. } | BackendConfig::Rclone { .. } => {
                 (backend::from_config(&cfg)?, String::new())
             }
-            _ => anyhow::bail!(
-                "folder mode supports s3://, local:// and rclone:// remotes, not {}",
-                config.url
-            ),
+            _ => return Err(unsupported().into()),
         };
         Ok(Self { backend, prefix })
     }
@@ -224,10 +231,12 @@ fn select<'a>(records: &'a [HistoryRecord], at: &Selector) -> Result<&'a History
     let found = match at {
         Selector::Latest => records.last(),
         Selector::Id(prefix) => {
-            anyhow::ensure!(
-                prefix.len() >= 8 && prefix.bytes().all(|b| b.is_ascii_hexdigit()),
-                "version id prefix must be at least 8 hex characters"
-            );
+            if prefix.len() < 8 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(Error::InvalidVersionId {
+                    prefix: prefix.clone(),
+                }
+                .into());
+            }
             let prefix = prefix.to_ascii_lowercase();
             let matches: Vec<&HistoryRecord> = records
                 .iter()
@@ -237,24 +246,22 @@ fn select<'a>(records: &'a [HistoryRecord], at: &Selector) -> Result<&'a History
                 [] => None,
                 [one] => Some(*one),
                 many => {
-                    let candidates: String = many
-                        .iter()
-                        .map(|r| format!("\n  {}  pushed {}", r.id(), r.time.to_rfc3339()))
-                        .collect();
-                    anyhow::bail!(
-                        "version id prefix {prefix} is ambiguous; it matches:{candidates}"
-                    )
+                    return Err(Error::AmbiguousId {
+                        prefix,
+                        candidates: many.iter().map(|r| (*r).clone()).collect(),
+                    }
+                    .into())
                 }
             }
         }
         Selector::AtOrBefore(when) => {
             let when = chrono::DateTime::parse_from_rfc3339(when)
-                .with_context(|| format!("not an RFC 3339 time: {when:?}"))?
+                .with_context(|| Error::InvalidTime { time: when.clone() })?
                 .with_timezone(&chrono::Utc);
             records.iter().rev().find(|r| r.time <= when)
         }
     };
-    found.context("no matching version in history")
+    found.ok_or_else(|| Error::NoSuchVersion.into())
 }
 
 // ──────────────────────────────────────────────────
@@ -293,6 +300,10 @@ pub struct PushReport {
 /// the history record. A failure at any step leaves at most unreferenced
 /// objects behind. Files are snapshotted while hashed, so an append during
 /// the push can never produce an object whose content does not match its key.
+///
+/// Anything push will not back up is refused as [`Error::Refused`] before
+/// anything is published; an output that keeps changing through every retry
+/// is [`Error::OutputChanged`].
 pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
     block_on(push_async(remote, output, opts))?
 }
@@ -312,10 +323,11 @@ async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Resul
         } else if meta.is_file() {
             snapshot_file(output, tmp.path())
         } else {
-            anyhow::bail!(
-                "{} is neither a regular file nor a directory",
-                output.display()
-            );
+            return Err(Error::Refused {
+                path: output.to_path_buf(),
+                reason: Refusal::NotFileOrDirectory,
+            }
+            .into());
         };
         let staged = match attempt {
             Ok(s) => s,
@@ -327,7 +339,10 @@ async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Resul
         };
         return publish(remote, staged, name, pointer_path, opts).await;
     }
-    anyhow::bail!("{last_change}; the output kept changing, push again later")
+    Err(Error::OutputChanged {
+        detail: last_change,
+    }
+    .into())
 }
 
 enum Retry {
@@ -527,15 +542,23 @@ async fn append_history(
 
 /// The output's name: one portable path component.
 fn output_name(output: &Path) -> Result<String> {
+    let refused = |reason| Error::Refused {
+        path: output.to_path_buf(),
+        reason,
+    };
     let name = output
         .file_name()
-        .and_then(|n| n.to_str())
-        .with_context(|| format!("{} has no usable file name", output.display()))?;
-    check_portable_component(name)?;
-    anyhow::ensure!(
-        !name.ends_with(".dvc"),
-        "{name}: cannot back up a .dvc file"
-    );
+        .ok_or_else(|| refused(Refusal::NoFileName))?
+        .to_str()
+        .ok_or_else(|| refused(Refusal::NotUtf8Name))?;
+    check_portable_component(name).map_err(|e| {
+        refused(Refusal::NonPortableName {
+            detail: format!("{e:#}"),
+        })
+    })?;
+    if name.ends_with(".dvc") {
+        return Err(refused(Refusal::DvcFile).into());
+    }
     Ok(name.to_string())
 }
 
@@ -558,18 +581,17 @@ fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<()> {
             return Err(e).with_context(|| format!("failed to read {}", pointer_path.display()))
         }
     };
-    let existing = DvcPointer::parse(&text).with_context(|| {
-        format!(
-            "{} exists and is not a plain DVC 3 pointer; refusing to replace it",
-            pointer_path.display()
-        )
-    })?;
-    anyhow::ensure!(
-        existing.path == name,
-        "{} points at {:?}, not {name:?}; refusing to replace it",
-        pointer_path.display(),
-        existing.path
-    );
+    let refused = |reason| Error::Refused {
+        path: pointer_path.to_path_buf(),
+        reason,
+    };
+    let existing = DvcPointer::parse(&text).with_context(|| refused(Refusal::ForeignPointer))?;
+    if existing.path != name {
+        return Err(refused(Refusal::PointerForOtherOutput {
+            other: existing.path,
+        })
+        .into());
+    }
     Ok(())
 }
 
@@ -657,35 +679,13 @@ pub struct PullReport {
     pub extra_local: usize,
 }
 
-/// Local files that differ from the version being pulled, under
-/// [`Overwrite::Refuse`]. Nothing was written.
-#[derive(Debug)]
-pub struct PullConflict {
-    pub paths: Vec<PathBuf>,
-}
-
-impl std::fmt::Display for PullConflict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} local file(s) differ from the version being pulled (nothing written; \
-             use force to replace):",
-            self.paths.len()
-        )?;
-        for p in &self.paths {
-            write!(f, "\n  {}", p.display())?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for PullConflict {}
-
 /// Restore an output. Every target is classified before anything is written:
-/// a symlinked or non-regular path is always an error; differing files are
-/// refused (as [`PullConflict`]) unless forced. Files are downloaded to a
-/// temp file beside their target, verified, then renamed into place — never
-/// linked. Local files not in the version are left alone.
+/// a symlinked or non-regular path is always refused ([`Error::Refused`]);
+/// differing files are refused (as [`Error::PullConflict`]) unless forced.
+/// Files are downloaded to a temp file beside their target, verified, then
+/// renamed into place — never linked. Local files not in the version are
+/// left alone. A history selector that matches nothing is
+/// [`Error::NoSuchVersion`].
 pub fn pull(remote: &Remote, source: &PointerSource, opts: &PullOptions) -> Result<PullReport> {
     block_on(pull_async(remote, source, opts))?
 }
@@ -718,10 +718,11 @@ async fn pull_async(
             // not redirect writes (a committed `out -> elsewhere` beside
             // `out.dvc`). A file output's symlink is refused per target.
             if std::fs::symlink_metadata(&into).is_ok_and(|m| m.file_type().is_symlink()) {
-                anyhow::bail!(
-                    "{} is a symlink; refusing to write through it",
-                    into.display()
-                );
+                return Err(Error::Refused {
+                    path: into,
+                    reason: Refusal::SymlinkedOutput,
+                }
+                .into());
             }
             let raw = backend::get_bytes(
                 &remote.backend,
@@ -736,10 +737,10 @@ async fn pull_async(
                 .entries()
                 .iter()
                 .map(|e| {
-                    let path = e
-                        .relpath
-                        .to_repo_path()
-                        .with_context(|| format!("cannot restore {:?}", e.relpath.as_str()))?;
+                    let path = e.relpath.to_repo_path().with_context(|| Error::Refused {
+                        path: PathBuf::from(e.relpath.as_str()),
+                        reason: Refusal::UnwritableName,
+                    })?;
                     Ok((path.to_fs_path(&into), e.md5.clone()))
                 })
                 .collect::<Result<_>>()?
@@ -761,7 +762,7 @@ async fn pull_async(
         }
     }
     if !conflicts.is_empty() {
-        return Err(PullConflict { paths: conflicts }.into());
+        return Err(Error::PullConflict { paths: conflicts }.into());
     }
 
     let extra_local = match &pointer.output {
@@ -792,12 +793,15 @@ fn pointer_output(dvc: &Path, pointer: &DvcPointer) -> Result<PathBuf> {
     let single = ManifestPath::new(name)
         .and_then(|p| p.to_repo_path())
         .is_ok_and(|p| !p.as_str().contains('/'));
-    anyhow::ensure!(
-        single,
-        "{} names its output {name:?}, which is not a single file or directory \
-         name on this OS; refusing to restore it",
-        dvc.display()
-    );
+    if !single {
+        return Err(Error::Refused {
+            path: dvc.to_path_buf(),
+            reason: Refusal::PointerPathEscapes {
+                output: name.to_string(),
+            },
+        }
+        .into());
+    }
     let dir = dvc.parent().context("pointer has no parent directory")?;
     Ok(dir.join(name))
 }
@@ -819,10 +823,13 @@ fn classify_target(root: &Path, path: &Path, md5: &Hexdigest) -> Result<Target> 
             cur.push(c);
             match std::fs::symlink_metadata(&cur) {
                 Ok(m) if m.is_dir() => {}
-                Ok(_) => anyhow::bail!(
-                    "{} is in the way (not a directory); refusing to write through it",
-                    cur.display()
-                ),
+                Ok(_) => {
+                    return Err(Error::Refused {
+                        path: cur,
+                        reason: Refusal::NotADirectory,
+                    }
+                    .into())
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
                 Err(e) => return Err(e.into()),
             }
@@ -838,10 +845,11 @@ fn classify_target(root: &Path, path: &Path, md5: &Hexdigest) -> Result<Target> 
                 Ok(Target::Differs)
             }
         }
-        Ok(_) => anyhow::bail!(
-            "{} is not a regular file; refusing to replace it",
-            path.display()
-        ),
+        Ok(_) => Err(Error::Refused {
+            path: path.to_path_buf(),
+            reason: Refusal::NotRegularFile,
+        }
+        .into()),
     }
 }
 
@@ -851,10 +859,13 @@ fn check_case_collisions(manifest: &Manifest) -> Result<()> {
     for e in manifest.entries() {
         let folded = e.relpath.as_str().to_ascii_lowercase();
         if let Some(other) = seen.insert(folded, e.relpath.as_str()) {
-            anyhow::bail!(
-                "{other:?} and {:?} differ only by case and would collide on this filesystem",
-                e.relpath.as_str()
-            );
+            return Err(Error::Refused {
+                path: PathBuf::from(e.relpath.as_str()),
+                reason: Refusal::CaseCollision {
+                    other: other.to_string(),
+                },
+            }
+            .into());
         }
     }
     Ok(())
@@ -915,10 +926,16 @@ fn place(tmp: tempfile::NamedTempFile, path: &Path, replace: bool) -> Result<()>
             .with_context(|| format!("failed to write {}", path.display()))?;
     } else {
         tmp.persist_noclobber(path).map_err(|e| {
-            anyhow::Error::from(e.error).context(format!(
-                "{} appeared while pulling; left untouched",
-                path.display()
-            ))
+            let appeared = e.error.kind() == std::io::ErrorKind::AlreadyExists;
+            let e = anyhow::Error::from(e.error);
+            if appeared {
+                e.context(Error::Refused {
+                    path: path.to_path_buf(),
+                    reason: Refusal::AppearedWhilePulling,
+                })
+            } else {
+                e.context(format!("failed to write {}", path.display()))
+            }
         })?;
     }
     Ok(())

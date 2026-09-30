@@ -9,11 +9,28 @@
   in DVC 3's exact format, checked against real DVC 3.67.1 in CI on Linux and
   Windows. Includes snapshot-while-hashing (safe for files being appended to),
   an append-only history log on the remote with restore by id or time,
-  non-destructive pull with a typed `PullConflict`, a required S3 endpoint
+  non-destructive pull, a required S3 endpoint
   with no AWS/IMDS fallback, and a blocking API for sync callers.
 - `cli` cargo feature (default). `default-features = false` builds only the
   library.
 - Windows CI job that builds and uploads `git-bigstore.exe`.
+- `bigstore::folder::Error` (with `folder::Refusal`): every folder-mode
+  refusal is typed, so library callers can `downcast_ref` and match instead
+  of parsing messages: `Refused { path, reason }` (symlinks, special files,
+  nested `.git`/`.dvc`, `*.dvc` inside, non-portable names, foreign pointers,
+  a pointer path leaving its directory, symlinked or blocked destinations,
+  case collisions, …), `OutputChanged`, `PullConflict { paths }` (replaces the
+  `PullConflict` struct), `NoSuchVersion`, `AmbiguousId { candidates }`,
+  `InvalidVersionId`, `InvalidTime`, `EndpointRequired` and
+  `UnsupportedRemote`. Messages are unchanged, except for non-UTF-8 names:
+  one inside a pushed directory is now shown relative to it, like every other
+  refused entry, and an output whose own name is not UTF-8 says so instead of
+  "has no usable file name". Any URL scheme other than `s3`, `local`/`file`
+  and `rclone` is now `UnsupportedRemote` in folder mode (an unknown scheme
+  such as `ftp://` used to fail with the generic "unsupported scheme"
+  message). A pull whose final rename fails for any reason but a file
+  appearing there now says `failed to write <path>` instead of claiming one
+  appeared.
 
 ### Security
 

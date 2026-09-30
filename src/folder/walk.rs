@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::{Error, Refusal};
 use crate::types::PortableRelPath;
 
 /// One file of a directory output.
@@ -24,23 +25,23 @@ pub enum WalkError {
     /// Something appeared or vanished mid-walk: retry.
     Changed(String),
     /// The directory holds something folder mode refuses to back up.
-    Refused(String),
+    Refused {
+        /// Relative to the walked root, `/`-separated.
+        relpath: String,
+        reason: Refusal,
+    },
     Io(anyhow::Error),
-}
-
-impl std::fmt::Display for WalkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Changed(m) | Self::Refused(m) => f.write_str(m),
-            Self::Io(e) => write!(f, "{e:#}"),
-        }
-    }
 }
 
 impl From<WalkError> for anyhow::Error {
     fn from(e: WalkError) -> Self {
         match e {
-            WalkError::Changed(m) | WalkError::Refused(m) => anyhow::anyhow!(m),
+            WalkError::Changed(m) => anyhow::anyhow!(m),
+            WalkError::Refused { relpath, reason } => Error::Refused {
+                path: relpath.into(),
+                reason,
+            }
+            .into(),
             WalkError::Io(e) => e,
         }
     }
@@ -58,6 +59,10 @@ impl From<WalkError> for anyhow::Error {
 /// - names must be portable ([`PortableRelPath`]);
 /// - empty directories are counted.
 pub fn walk(root: &Path) -> Result<Walk, WalkError> {
+    let refused = |relpath: &str, reason| WalkError::Refused {
+        relpath: relpath.to_string(),
+        reason,
+    };
     let mut files = Vec::new();
     let mut empty_dirs = 0;
     let mut stack = vec![(root.to_path_buf(), String::new())];
@@ -86,22 +91,20 @@ pub fn walk(root: &Path) -> Result<Walk, WalkError> {
             };
             any = true;
             let name = entry.file_name();
-            let name = name.to_str().ok_or_else(|| {
-                WalkError::Refused(format!(
-                    "{}: name is not valid UTF-8",
-                    entry.path().display()
-                ))
-            })?;
+            let Some(name) = name.to_str() else {
+                let relpath = Path::new(&rel).join(&name);
+                return Err(refused(
+                    &relpath.to_string_lossy().replace('\\', "/"),
+                    Refusal::NotUtf8Name,
+                ));
+            };
             let relpath = if rel.is_empty() {
                 name.to_string()
             } else {
                 format!("{rel}/{name}")
             };
             if matches!(name, ".git" | ".hg" | ".dvc" | ".dvcignore") || name.ends_with(".dvc") {
-                return Err(WalkError::Refused(format!(
-                    "{relpath}: DVC control files and nested repositories/outputs \
-                     cannot be inside a backed-up directory"
-                )));
+                return Err(refused(&relpath, Refusal::ControlFile));
             }
             let path = entry.path();
             let kind = match std::fs::symlink_metadata(&path) {
@@ -121,21 +124,25 @@ pub fn walk(root: &Path) -> Result<Walk, WalkError> {
                 match std::fs::metadata(&path) {
                     Ok(m) if m.is_file() => true,
                     Ok(m) if m.is_dir() => {
-                        return Err(WalkError::Refused(format!(
-                            "{relpath}: symlink to a directory (DVC would silently skip it)"
-                        )))
+                        return Err(refused(&relpath, Refusal::SymlinkToDirectory))
                     }
                     Ok(_) => false,
-                    Err(_) => return Err(WalkError::Refused(format!("{relpath}: broken symlink"))),
+                    Err(_) => return Err(refused(&relpath, Refusal::BrokenSymlink)),
                 }
             } else {
                 kind.is_file()
             };
             if !is_file {
-                return Err(WalkError::Refused(format!("{relpath}: not a regular file")));
+                return Err(refused(&relpath, Refusal::SpecialFile));
             }
-            let relpath =
-                PortableRelPath::new(&relpath).map_err(|e| WalkError::Refused(format!("{e:#}")))?;
+            let relpath = PortableRelPath::new(&relpath).map_err(|e| {
+                refused(
+                    &relpath,
+                    Refusal::NonPortableName {
+                        detail: format!("{e:#}"),
+                    },
+                )
+            })?;
             files.push(WalkedFile { relpath, path });
         }
         if !any && !rel.is_empty() {
@@ -184,7 +191,13 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, b"x").unwrap();
             assert!(
-                matches!(walk(d.path()), Err(WalkError::Refused(_))),
+                matches!(
+                    walk(d.path()),
+                    Err(WalkError::Refused {
+                        reason: Refusal::ControlFile,
+                        ..
+                    })
+                ),
                 "{bad} accepted"
             );
         }
@@ -194,7 +207,13 @@ mod tests {
     fn refuses_non_portable_names() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("café.json"), b"x").unwrap();
-        assert!(matches!(walk(d.path()), Err(WalkError::Refused(_))));
+        assert!(matches!(
+            walk(d.path()),
+            Err(WalkError::Refused {
+                reason: Refusal::NonPortableName { .. },
+                ..
+            })
+        ));
     }
 
     #[cfg(unix)]
@@ -210,11 +229,23 @@ mod tests {
         std::fs::create_dir(d.path().join("dir")).unwrap();
         std::fs::write(d.path().join("dir/f"), b"f").unwrap();
         symlink("dir", d.path().join("dirlink")).unwrap();
-        assert!(matches!(walk(d.path()), Err(WalkError::Refused(_))));
+        assert!(matches!(
+            walk(d.path()),
+            Err(WalkError::Refused {
+                reason: Refusal::SymlinkToDirectory,
+                ..
+            })
+        ));
         std::fs::remove_file(d.path().join("dirlink")).unwrap();
 
         symlink("nowhere", d.path().join("broken")).unwrap();
-        assert!(matches!(walk(d.path()), Err(WalkError::Refused(_))));
+        assert!(matches!(
+            walk(d.path()),
+            Err(WalkError::Refused {
+                reason: Refusal::BrokenSymlink,
+                ..
+            })
+        ));
     }
 
     #[test]

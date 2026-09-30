@@ -451,9 +451,44 @@ let report = folder::push(&remote, dir, &PushOptions {
 ```
 
 The functions block and run their own tokio runtime. Calling them from inside
-a runtime returns an error; use `spawn_blocking`. A pull refused because of
-differing local files returns a typed `folder::PullConflict` in the error
-chain.
+a runtime returns an error; use `spawn_blocking`.
+
+Errors are `anyhow::Error`. Every refusal, and every other outcome a caller
+may want to act on, carries a `bigstore::folder::Error` in its chain, found
+with `err.downcast_ref::<folder::Error>()` whatever context was added above
+it. Match on it instead of on message text; its `Display` is the message the
+CLI prints. Both enums are `#[non_exhaustive]`.
+
+| `folder::Error` | When |
+| --- | --- |
+| `Refused { path, reason }` | push or pull will not touch `path`; `reason` is a `folder::Refusal` (below). Nothing was published or written. |
+| `OutputChanged { detail }` | files kept changing or vanishing through every retry; push again later |
+| `PullConflict { paths }` | local files differ from the version (`Overwrite::Refuse`); nothing written |
+| `NoSuchVersion` | no version in history matches the selector, or there is none |
+| `AmbiguousId { prefix, candidates }` | a version id prefix matches several versions (`candidates`, oldest first) |
+| `InvalidVersionId { prefix }`, `InvalidTime { time }` | a `Selector::Id` that is not 8+ hex characters; a `Selector::AtOrBefore` that is not RFC 3339 |
+| `EndpointRequired` | an `s3://` remote without an endpoint |
+| `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
+
+| `folder::Refusal` | Refused by | `path` is |
+| --- | --- | --- |
+| `NoFileName`, `NotUtf8Name` (of the output), `NonPortableName { detail }` (of the output), `DvcFile`, `NotFileOrDirectory` (a symlink or special file) | push, the output itself | the output |
+| `ForeignPointer` (not a plain DVC 3 pointer), `PointerForOtherOutput { other }` | push, the `.dvc` beside the output | the `.dvc` |
+| `ControlFile` (`.git`, `.hg`, `.dvc`, `.dvcignore`, `*.dvc`), `SymlinkToDirectory`, `BrokenSymlink`, `SpecialFile`, `NonPortableName { detail }`, `NotUtf8Name` | push, inside a directory | relative to the output, `/`-separated |
+| `PointerPathEscapes { output }` | pull, a `.dvc` naming an output outside its directory | the `.dvc` |
+| `SymlinkedOutput`, `NotADirectory`, `NotRegularFile`, `AppearedWhilePulling` | pull, the destination | the filesystem path |
+| `CaseCollision { other }`, `UnwritableName` (`\` or `:` on Windows) | pull, the manifest | the manifest name |
+
+```rust
+match folder::pull(&remote, &source, &opts) {
+    Ok(report) => { /* … */ }
+    Err(e) => match e.downcast_ref::<folder::Error>() {
+        Some(folder::Error::PullConflict { paths }) => { /* ask the user */ }
+        Some(folder::Error::Refused { path, reason }) => { /* a stable code per reason */ }
+        _ => return Err(e),
+    },
+}
+```
 
 ## Comparison: bigstore vs Git LFS vs DVC
 
