@@ -10,8 +10,12 @@ use crate::types::{HashFunction, Hexdigest};
 /// A private copy of a file and the md5 of exactly that copy's bytes. Only
 /// [`snapshot`] builds one, so the digest can never describe different bytes
 /// from the ones that get uploaded.
+///
+/// The copy is closed once written (a push may hold thousands of snapshots;
+/// holding each one open would exhaust file descriptors) and deleted on drop.
+/// Nothing else writes it: it lives in the push's private temp directory.
 pub struct Snapshot {
-    file: tempfile::NamedTempFile,
+    file: tempfile::TempPath,
     md5: Hexdigest,
     size: u64,
     unterminated_line: bool,
@@ -19,7 +23,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn path(&self) -> &Path {
-        self.file.path()
+        &self.file
     }
 
     pub fn md5(&self) -> &Hexdigest {
@@ -130,7 +134,7 @@ fn try_snapshot(
         return Ok(None);
     }
     Ok(Some(Snapshot {
-        file,
+        file: file.into_temp_path(),
         md5: hasher.finalize(),
         size,
         unterminated_line: last.is_some_and(|b| b != b'\n'),

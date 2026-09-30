@@ -3,12 +3,27 @@
 
 use bigstore::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use bigstore::folder::{
-    self, Credentials, HistoryKey, Overwrite, PointerSource, PullConflict, PullOptions,
-    PushOptions, Remote, RemoteConfig, Selector,
+    self, Credentials, Error as FolderError, Excludes, HistoryKey, Overwrite, PointerSource,
+    PullOptions, PushOptions, Refusal, Remote, RemoteConfig, Selector,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
 use std::path::{Path, PathBuf};
+
+/// The typed refusal in `err`'s chain.
+#[track_caller]
+fn refused(err: &anyhow::Error) -> (&Path, &Refusal) {
+    match err.downcast_ref::<FolderError>() {
+        Some(FolderError::Refused { path, reason }) => (path, reason),
+        _ => panic!("not a typed refusal: {err:#}"),
+    }
+}
+
+#[track_caller]
+fn folder_error(err: &anyhow::Error) -> &FolderError {
+    err.downcast_ref::<FolderError>()
+        .unwrap_or_else(|| panic!("not a folder::Error: {err:#}"))
+}
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dvc-3.67.1");
 
@@ -48,6 +63,7 @@ fn opts(key: &str) -> PushOptions {
     PushOptions {
         history: HistoryKey::new(key).unwrap(),
         jobs: 4,
+        exclude: Excludes::default(),
     }
 }
 
@@ -279,8 +295,10 @@ fn pull_refuses_differing_files_keeps_extras_and_force_replaces() {
         &pull_opts(None),
     )
     .unwrap_err();
-    let conflict = err.downcast_ref::<PullConflict>().expect("typed conflict");
-    assert_eq!(conflict.paths, std::slice::from_ref(&labels));
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths, std::slice::from_ref(&labels));
     assert_eq!(
         std::fs::read(&labels).unwrap(),
         b"local edit\n",
@@ -368,6 +386,10 @@ fn s3_without_an_endpoint_is_refused_before_any_request() {
     .err()
     .expect("must refuse");
     assert!(
+        matches!(folder_error(&err), FolderError::EndpointRequired),
+        "{err:#}"
+    );
+    assert!(
         format!("{err:#}").contains("never defaults to AWS"),
         "{err:#}"
     );
@@ -379,7 +401,8 @@ fn refuses_to_replace_a_foreign_dvc_file() {
     let w = writer_dir(&e);
     let pointer = w.parent().unwrap().join("host=ricks-macbook-pro.dvc");
     std::fs::write(&pointer, "cmd: python train.py\nouts:\n- path: model\n").unwrap();
-    assert!(folder::push(&e.remote, &w, &opts(KEY)).is_err());
+    let err = folder::push(&e.remote, &w, &opts(KEY)).unwrap_err();
+    assert_eq!(refused(&err), (pointer.as_path(), &Refusal::ForeignPointer));
     assert!(std::fs::read_to_string(&pointer)
         .unwrap()
         .starts_with("cmd:"));
@@ -486,6 +509,9 @@ fn pulls_a_name_push_refuses_when_this_os_can_create_it() {
     assert_eq!(std::fs::read(out.join("sub/ok.txt")).unwrap(), b"o");
 
     let err = folder::push(&e.remote, &out, &opts("ds/out")).unwrap_err();
+    let (path, reason) = refused(&err);
+    assert_eq!(path, Path::new("back\\slash.txt"));
+    assert!(matches!(reason, Refusal::NonPortableName { .. }), "{err:#}");
     assert!(
         format!("{err:#}").contains(r#""back\\slash.txt""#),
         "{err:#}"
@@ -500,6 +526,13 @@ fn windows_refuses_to_pull_a_name_it_would_misread() {
     let e = env();
     let pointer = dvc_pushed_dir(&e, &[("a\\..\\..\\escaped.txt", b"x"), ("ok.txt", b"o")]);
     let err = folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (
+            Path::new("a\\..\\..\\escaped.txt"),
+            &Refusal::UnwritableName
+        )
+    );
     assert!(
         format!("{err:#}").contains(r#""a\\..\\..\\escaped.txt""#),
         "{err:#}"
@@ -557,6 +590,43 @@ fn cli_works_without_git_on_path() {
     assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1);
 }
 
+/// Open files must be bounded by `--jobs`, not by the number of files: a
+/// launchd service gets 256 descriptors by default. The limit is lowered
+/// for the child process only.
+#[cfg(unix)]
+#[test]
+fn a_push_of_many_files_fits_a_low_open_file_limit() {
+    let e = env();
+    let w = e.data.join("many");
+    for i in 0..400 {
+        write(
+            &w.join(format!("f{i:03}.jsonl")),
+            format!("{{\"i\":{i}}}\n").as_bytes(),
+        );
+    }
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"ulimit -n 256 && exec "$0" "$@""#])
+        .arg(env!("CARGO_BIN_EXE_git-bigstore"))
+        .args(["folder", "push"])
+        .arg(&w)
+        .args(["--history", "ds/many", "--jobs", "8", "--remote"])
+        .arg(format!("local://{}", e.store.display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pointer = DvcPointer::load(&e.data.join("many.dvc")).unwrap();
+    assert!(
+        matches!(pointer.output, DvcOutput::Dir { nfiles: 400, .. }),
+        "{pointer:?}"
+    );
+    // 400 objects, the manifest and the history record.
+    assert_eq!(remote_keys(&e.store).len(), 402);
+}
+
 #[test]
 fn an_equivalent_crlf_pointer_is_left_untouched() {
     // DVC on Windows writes `.dvc` files with CRLF; re-pushing the same
@@ -606,7 +676,14 @@ fn an_ambiguous_version_id_is_refused_and_lists_the_candidates() {
             &pull_opts(Some(e.data.join("f"))),
         )
     };
-    let msg = format!("{:#}", pull("DEADBEEF").unwrap_err());
+    let err = pull("DEADBEEF").unwrap_err();
+    let FolderError::AmbiguousId { prefix, candidates } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(prefix, "deadbeef");
+    let ids: Vec<String> = candidates.iter().map(|r| r.id().to_string()).collect();
+    assert_eq!(ids, [a.clone(), b.clone()]);
+    let msg = format!("{err:#}");
     assert!(msg.contains("ambiguous"), "{msg}");
     assert!(msg.contains(&a) && msg.contains(&b), "{msg}");
     assert!(
@@ -685,6 +762,10 @@ fn at_or_before_restores_the_version_in_force_at_that_time() {
 
     let err = restore(rfc(v1.time - chrono::Duration::seconds(1)), "early").unwrap_err();
     assert!(
+        matches!(folder_error(&err), FolderError::NoSuchVersion),
+        "{err:#}"
+    );
+    assert!(
         format!("{err:#}").contains("no matching version"),
         "{err:#}"
     );
@@ -699,6 +780,10 @@ fn at_or_before_restores_the_version_in_force_at_that_time() {
     assert_eq!(r.pointer.output, v2.pointer.output);
 
     let err = restore("yesterday".into(), "bad").unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::InvalidTime { time } if time == "yesterday"),
+        "{err:#}"
+    );
     assert!(format!("{err:#}").contains("RFC 3339"), "{err:#}");
 }
 
@@ -749,6 +834,10 @@ fn pull_never_writes_through_a_symlinked_directory_or_over_a_non_file() {
     std::fs::create_dir(&into).unwrap();
     std::os::unix::fs::symlink(&outside, into.join("site=s1")).unwrap();
     let err = pull(&into).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (into.join("site=s1").as_path(), &Refusal::NotADirectory)
+    );
     assert!(
         format!("{err:#}").contains("refusing to write through"),
         "{err:#}"
@@ -771,6 +860,10 @@ fn pull_never_writes_through_a_symlinked_directory_or_over_a_non_file() {
         let into = root.join(name);
         make(&into.join(labels));
         let err = pull(&into).unwrap_err();
+        assert_eq!(
+            refused(&err),
+            (into.join(labels).as_path(), &Refusal::NotRegularFile)
+        );
         assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
         assert!(tree(&into).is_empty(), "{name}: nothing written");
     }
@@ -797,6 +890,7 @@ fn pull_refuses_a_directory_output_that_is_a_symlink() {
             &pull_opts(into),
         )
         .unwrap_err();
+        assert_eq!(refused(&err), (w.as_path(), &Refusal::SymlinkedOutput));
         let msg = format!("{err:#}");
         assert!(msg.contains("is a symlink"), "{msg}");
         assert!(msg.contains(&w.display().to_string()), "{msg}");
@@ -809,6 +903,15 @@ fn names_differing_only_by_case_are_refused_before_writing() {
     let e = env();
     let pointer = dvc_pushed_dir(&e, &[("Labels.jsonl", b"A"), ("labels.jsonl", b"a")]);
     let err = folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (
+            Path::new("labels.jsonl"),
+            &Refusal::CaseCollision {
+                other: "Labels.jsonl".into()
+            }
+        )
+    );
     let msg = format!("{err:#}");
     assert!(msg.contains("differ only by case"), "{msg}");
     assert!(
@@ -849,8 +952,10 @@ fn a_refused_pull_lists_every_differing_file_and_writes_nothing() {
         &pull_opts(None),
     )
     .unwrap_err();
-    let conflict = err.downcast_ref::<PullConflict>().expect("typed conflict");
-    assert_eq!(conflict.paths, [a.clone(), b.clone()]);
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths, &[a.clone(), b.clone()]);
     let shown = err.to_string();
     assert!(shown.starts_with("2 local file(s) differ"), "{shown}");
     assert!(shown.contains(&a.display().to_string()) && shown.contains(&b.display().to_string()));
@@ -871,6 +976,10 @@ fn remotes_other_than_s3_local_and_rclone_are_refused() {
     })
     .err()
     .expect("must refuse");
+    assert!(
+        matches!(folder_error(&err), FolderError::UnsupportedRemote { url } if url == "gs://bucket/dvc"),
+        "{err:#}"
+    );
     assert!(format!("{err:#}").contains("gs://bucket/dvc"), "{err:#}");
 }
 
@@ -882,6 +991,10 @@ fn push_refuses_an_output_that_is_a_symlink() {
     let link = e.data.join("link");
     std::os::unix::fs::symlink(&w, &link).unwrap();
     let err = folder::push(&e.remote, &link, &opts(KEY)).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (link.as_path(), &Refusal::NotFileOrDirectory)
+    );
     assert!(
         format!("{err:#}").contains("neither a regular file nor a directory"),
         "{err:#}"
@@ -899,6 +1012,15 @@ fn push_refuses_to_replace_a_pointer_it_cannot_read_or_that_names_another_output
     let foreign = "outs:\n- md5: 3253b41059cac6e987c5a5e9233ea5d0\n  size: 6\n  hash: md5\n  path: other.toml\n";
     write(&pointer, foreign.as_bytes());
     let err = folder::push(&e.remote, &file, &opts("ds/store.toml")).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (
+            pointer.as_path(),
+            &Refusal::PointerForOtherOutput {
+                other: "other.toml".into()
+            }
+        )
+    );
     assert!(format!("{err:#}").contains("\"other.toml\""), "{err:#}");
     assert_eq!(std::fs::read_to_string(&pointer).unwrap(), foreign);
 
@@ -986,6 +1108,10 @@ fn push_needs_an_existing_output_with_a_name() {
     let err = folder::push(&e.remote, &e.data.join("missing"), &opts(KEY)).unwrap_err();
     assert!(format!("{err:#}").contains("failed to stat"), "{err:#}");
     let err = folder::push(&e.remote, &e.data.join(".."), &opts(KEY)).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (e.data.join("..").as_path(), &Refusal::NoFileName)
+    );
     assert!(
         format!("{err:#}").contains("no usable file name"),
         "{err:#}"
@@ -1052,10 +1178,266 @@ fn pull_refuses_a_pointer_whose_path_leaves_its_directory() {
             &pull_opts(None),
         )
         .expect_err(bad);
+        assert_eq!(
+            refused(&err),
+            (
+                dvc.as_path(),
+                &Refusal::PointerPathEscapes { output: bad.into() }
+            )
+        );
         let msg = format!("{err:#}");
         assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
         assert!(msg.contains("evil.dvc"), "{bad:?}: {msg}");
         assert!(!outside.exists(), "{bad:?}: wrote outside");
         assert!(!e.data.join("sub").exists(), "{bad:?}: wrote below");
+    }
+}
+
+/// Every refusal inside a directory output is typed, names the entry
+/// relative to the output, keeps its message, and publishes nothing.
+#[cfg(unix)]
+#[test]
+fn every_refusal_inside_a_pushed_directory_is_typed() {
+    use std::os::unix::fs::symlink;
+    let control =
+        ": DVC control files and nested repositories/outputs cannot be inside a backed-up directory";
+    let cafe = "path \"sub/café.json\": \"café.json\": only printable ASCII names are portable";
+    /// Make the offending entry; the path, reason and message expected.
+    type Case = (fn(&Path), &'static str, Refusal, String);
+    let cases: [Case; 6] = [
+        (
+            |o| write(&o.join(".git/HEAD"), b"x"),
+            ".git",
+            Refusal::ControlFile,
+            format!(".git{control}"),
+        ),
+        (
+            |o| write(&o.join("sub/x.dvc"), b"x"),
+            "sub/x.dvc",
+            Refusal::ControlFile,
+            format!("sub/x.dvc{control}"),
+        ),
+        (
+            |o| {
+                write(&o.join("d/f"), b"f");
+                symlink("d", o.join("l")).unwrap();
+            },
+            "l",
+            Refusal::SymlinkToDirectory,
+            "l: symlink to a directory (DVC would silently skip it)".into(),
+        ),
+        (
+            |o| symlink("nowhere", o.join("b")).unwrap(),
+            "b",
+            Refusal::BrokenSymlink,
+            "b: broken symlink".into(),
+        ),
+        (
+            |o| {
+                let fifo = std::process::Command::new("mkfifo")
+                    .arg(o.join("p"))
+                    .status()
+                    .unwrap();
+                assert!(fifo.success());
+            },
+            "p",
+            Refusal::SpecialFile,
+            "p: not a regular file".into(),
+        ),
+        (
+            |o| write(&o.join("sub/café.json"), b"x"),
+            "sub/café.json",
+            Refusal::NonPortableName {
+                detail: cafe.into(),
+            },
+            cafe.into(),
+        ),
+    ];
+    for (make, path, reason, message) in cases {
+        let e = env();
+        let out = e.data.join("out");
+        write(&out.join("ok.txt"), b"ok");
+        make(&out);
+        let err = folder::push(&e.remote, &out, &opts("ds/out")).unwrap_err();
+        assert_eq!(refused(&err), (Path::new(path), &reason), "{err:#}");
+        assert_eq!(err.to_string(), message);
+        assert!(!e.data.join("out.dvc").exists(), "{path}: pointer written");
+        assert!(remote_keys(&e.store).is_empty(), "{path}: uploaded");
+    }
+}
+
+#[test]
+fn push_refuses_an_output_that_is_a_pointer_or_has_a_non_portable_name() {
+    let e = env();
+    let dvc = e.data.join("old.dvc");
+    write(&dvc, b"outs: []\n");
+    let err = folder::push(&e.remote, &dvc, &opts("ds/old")).unwrap_err();
+    assert_eq!(refused(&err), (dvc.as_path(), &Refusal::DvcFile));
+    assert_eq!(err.to_string(), "old.dvc: cannot back up a .dvc file");
+
+    let cafe = e.data.join("café");
+    write(&cafe.join("a.txt"), b"a");
+    let err = folder::push(&e.remote, &cafe, &opts("ds/cafe")).unwrap_err();
+    let detail = "\"café\": only printable ASCII names are portable";
+    assert_eq!(
+        refused(&err),
+        (
+            cafe.as_path(),
+            &Refusal::NonPortableName {
+                detail: detail.into()
+            }
+        )
+    );
+    assert_eq!(err.to_string(), detail);
+    assert!(remote_keys(&e.store).is_empty());
+}
+
+#[test]
+fn selecting_a_version_that_is_absent_or_malformed_is_typed() {
+    let e = env();
+    let pull = |at: Selector| {
+        folder::pull(
+            &e.remote,
+            &history("k", at),
+            &pull_opts(Some(e.data.join("r"))),
+        )
+        .unwrap_err()
+    };
+    let err = pull(Selector::Latest);
+    assert!(
+        matches!(folder_error(&err), FolderError::NoSuchVersion),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), "no matching version in history");
+    for bad in ["deadbee", "zzzzzzzz"] {
+        let err = pull(Selector::Id(bad.into()));
+        assert!(
+            matches!(folder_error(&err), FolderError::InvalidVersionId { prefix } if prefix == bad),
+            "{err:#}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "version id prefix must be at least 8 hex characters"
+        );
+    }
+}
+
+/// A file appended to faster than it can be read never yields a snapshot:
+/// push gives up with a typed error and publishes nothing.
+#[test]
+fn an_output_that_never_stops_changing_is_typed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let e = env();
+    let file = e.data.join("growing.bin");
+    write(&file, &vec![0u8; 2 << 20]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (file, stop) = (file.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                std::io::Write::write_all(&mut f, b"x").unwrap();
+            }
+        })
+    };
+    let result = folder::push(&e.remote, &file, &opts("ds/growing"));
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let err = result.unwrap_err();
+    let FolderError::OutputChanged { detail } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(
+        *detail,
+        format!("{} kept changing while being read", file.display())
+    );
+    assert_eq!(
+        err.to_string(),
+        format!("{detail}; the output kept changing, push again later")
+    );
+    assert!(!e.data.join("growing.bin.dvc").exists());
+    assert!(remote_keys(&e.store).is_empty());
+}
+
+/// Finder writes `.DS_Store` just by showing a folder, and Explorer and
+/// non-Mac volumes add their own files. None of it is data: a push after
+/// they appear is a no-op.
+#[test]
+fn os_junk_appearing_is_not_a_new_version() {
+    let e = env();
+    let w = writer_dir(&e);
+    let first = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let pointer = std::fs::read(&first.pointer_path).unwrap();
+    for junk in [
+        ".DS_Store",
+        "site=s1/.DS_Store",
+        "site=s1/date=2026-09-02/src_02/._labels.jsonl",
+        "Thumbs.db",
+        "site=s1/desktop.ini",
+    ] {
+        write(&w.join(junk), b"junk");
+    }
+    let again = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    assert_eq!(again.pointer.output, first.pointer.output);
+    assert_eq!((again.files, again.uploaded), (first.files, 0));
+    assert!(again.history_record.is_none(), "junk made a new version");
+    assert_eq!(std::fs::read(&again.pointer_path).unwrap(), pointer);
+    let versions = folder::log(&e.remote, &HistoryKey::new(KEY).unwrap()).unwrap();
+    assert_eq!(versions.len(), 1);
+}
+
+#[test]
+fn custom_excludes_follow_gitignore_rules_relative_to_the_output() {
+    let e = env();
+    let out = e.data.join("out");
+    for rel in [
+        "keep.txt",
+        "x.tmp",
+        "a/y.tmp",
+        "cache/big.bin",
+        "a/cache/kept.bin",
+        "scratch/s.bin",
+        "a/scratch/s.bin",
+        "a/b/only.log",
+        "b/scratch",
+    ] {
+        write(&out.join(rel), rel.as_bytes());
+    }
+    let report = folder::push(
+        &e.remote,
+        &out,
+        &PushOptions {
+            exclude: Excludes::new(["*.tmp", "/cache", "scratch/", "a/b/*.log"]).unwrap(),
+            ..opts("ds/out")
+        },
+    )
+    .unwrap();
+    let restore = e.data.parent().unwrap().join("restore");
+    folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path),
+        &pull_opts(Some(restore.clone())),
+    )
+    .unwrap();
+    let kept: Vec<String> = tree(&restore).into_iter().map(|(k, _)| k).collect();
+    // `/cache` is anchored to the output; `scratch/` matches directories
+    // only, at any depth.
+    assert_eq!(kept, ["a/cache/kept.bin", "b/scratch", "keep.txt"]);
+    // `a/b` held only an excluded file, so DVC would see it empty too.
+    assert_eq!(report.empty_dirs, 1);
+}
+
+#[test]
+fn an_invalid_exclude_pattern_is_typed() {
+    for bad in ["!keep.txt", "a[", "/", ""] {
+        let err = Excludes::new([bad]).unwrap_err();
+        assert!(
+            matches!(folder_error(&err), FolderError::InvalidExclude { pattern } if pattern == bad),
+            "{bad:?}: {err:#}"
+        );
     }
 }

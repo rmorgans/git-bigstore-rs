@@ -1,0 +1,10 @@
+outs:
+- md5: 3e2b31c72181b87149ff995e7202c0e3
+  size: 10
+  isexec: true
+  hash: md5
+  path: run.sh
+- md5: 9e3669d19b675bd57058fd4664205d2a
+  size: 1
+  hash: md5
+  path: versioned.bin

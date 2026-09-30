@@ -56,6 +56,17 @@ jobs:
       - name: Library builds without the CLI
         run: cargo build --lib --no-default-features
 
+      - name: Library feature combinations
+        run: |
+          for features in ring aws-lc-rs ring,aws-lc-rs ring,gcp,azure,progress; do
+            cargo clippy --lib --tests --no-default-features --features "$features" -- -D warnings
+          done
+
+      - name: Library tests without the CLI
+        run: |
+          cargo test --lib --no-default-features
+          cargo test --lib --no-default-features --features ring
+
       - name: Test
         run: cargo test --all-targets -- --include-ignored
 
@@ -91,6 +102,9 @@ jobs:
 
       - name: Build release
         run: cargo build --release --locked
+
+      - name: Library builds with ring
+        run: cargo build --lib --locked --no-default-features --features ring
 
       - name: Folder-mode tests
         run: |

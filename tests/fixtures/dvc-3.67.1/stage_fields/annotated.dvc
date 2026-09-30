@@ -1,0 +1,19 @@
+desc: Training images, v2
+meta:
+  owner: rick
+  tags: [a, b]
+outs:
+- md5: c1aa8378201c5b38b6b109d77fbf79bc.dir
+  size: 2
+  nfiles: 2
+  hash: md5
+  path: annotated
+  desc: the images
+  type: dataset
+  labels:
+  - train
+  meta:
+    source: camera
+  remote: other
+  push: false
+  persist: true

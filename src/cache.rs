@@ -9,6 +9,11 @@ pub fn cache_dir(git_dir: &Path) -> PathBuf {
     git_dir.join("bigstore").join("objects")
 }
 
+/// Scratch space for filter-process spools, on the cache's filesystem.
+pub(crate) fn spool_dir(git_dir: &Path) -> PathBuf {
+    git_dir.join("bigstore").join("tmp")
+}
+
 /// Full path to a cached object.
 /// Layout: .git/bigstore/objects/{hash_fn}/<first2>/<rest>
 ///

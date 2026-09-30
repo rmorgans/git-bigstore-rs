@@ -18,9 +18,22 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
-# The git-bigstore binary. Library users (`bigstore::folder`, …) can turn it
-# off with `default-features = false` and drop clap and tracing-subscriber.
-cli = ["dep:clap", "dep:tracing-subscriber"]
+# The git-bigstore binary, with every backend and progress bars. Library users
+# (`bigstore::folder`, …) can turn it off with `default-features = false` and
+# pick features from below.
+cli = ["dep:clap", "dep:tracing-subscriber", "progress", "gcp", "azure", "aws-lc-rs"]
+# Progress bars on stderr while `bigstore::transfer` pushes or pulls.
+progress = ["dep:indicatif"]
+# gs:// (Google Cloud Storage) and az:// (Azure Blob Storage) remotes. Without
+# them those URLs fail with an error naming the feature; s3://, local:// and
+# rclone:// are always available.
+gcp = ["object_store/gcp-base"]
+azure = ["object_store/azure-base"]
+# The crypto behind TLS and request signing for s3://, gs:// and az://. Enable
+# one; with both, aws-lc-rs is used (as object_store does). With neither, only
+# local:// and rclone:// work and a cloud URL fails with an error.
+aws-lc-rs = ["object_store/aws-lc-rs", "reqwest/rustls"]
+ring = ["object_store/ring", "dep:rustls"]
 
 [dependencies]
 anyhow = "1"
@@ -29,9 +42,16 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 futures = "0.3.32"
 globset = "0.4.18"
 hex = "0.4"
-indicatif = "0.18.4"
+indicatif = { version = "0.18.4", optional = true }
 md-5 = "0.10.6"
-object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.14", features = ["aws-base", "reqwest"] }
+# Direct only to choose reqwest's TLS crypto: object_store needs rustls, and
+# `rustls-no-provider` leaves the provider to the aws-lc-rs / ring features.
+# object_store already depends on it.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# Direct only to install ring as the process's rustls provider (ring feature);
+# reqwest already depends on it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml_ng = "0.10.0"

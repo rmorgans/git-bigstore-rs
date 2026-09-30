@@ -9,11 +9,39 @@
   in DVC 3's exact format, checked against real DVC 3.67.1 in CI on Linux and
   Windows. Includes snapshot-while-hashing (safe for files being appended to),
   an append-only history log on the remote with restore by id or time,
-  non-destructive pull with a typed `PullConflict`, a required S3 endpoint
+  non-destructive pull, a required S3 endpoint
   with no AWS/IMDS fallback, and a blocking API for sync callers.
 - `cli` cargo feature (default). `default-features = false` builds only the
   library.
 - Windows CI job that builds and uploads `git-bigstore.exe`.
+- `bigstore::folder::Error` (with `folder::Refusal`): every folder-mode
+  refusal is typed, so library callers can `downcast_ref` and match instead
+  of parsing messages: `Refused { path, reason }` (symlinks, special files,
+  nested `.git`/`.dvc`, `*.dvc` inside, non-portable names, foreign pointers,
+  a pointer path leaving its directory, symlinked or blocked destinations,
+  case collisions, …), `OutputChanged`, `PullConflict { paths }` (replaces the
+  `PullConflict` struct), `NoSuchVersion`, `AmbiguousId { candidates }`,
+  `InvalidVersionId`, `InvalidTime`, `EndpointRequired` and
+  `UnsupportedRemote`. Messages are unchanged, except for non-UTF-8 names:
+  one inside a pushed directory is now shown relative to it, like every other
+  refused entry, and an output whose own name is not UTF-8 says so instead of
+  "has no usable file name". Any URL scheme other than `s3`, `local`/`file`
+  and `rclone` is now `UnsupportedRemote` in folder mode (an unknown scheme
+  such as `ftp://` used to fail with the generic "unsupported scheme"
+  message). A pull whose final rename fails for any reason but a file
+  appearing there now says `failed to write <path>` instead of claiming one
+  appeared.
+- `progress` cargo feature (enabled by `cli`). Without it the library does
+  not depend on `indicatif` and `bigstore::transfer` draws no progress bars.
+- `gcp` and `azure` cargo features (enabled by `cli`). Library users with
+  `default-features = false` no longer build object_store's GCS and Azure
+  clients; a `gs://` or `az://` URL then fails with an error naming the
+  missing feature.
+- `aws-lc-rs` (enabled by `cli`) and `ring` cargo features choose the crypto
+  behind TLS and S3/GCS/Azure request signing, so a library user on ring
+  (`default-features = false, features = ["ring"]`) no longer builds
+  aws-lc-rs. With neither, cloud URLs fail with an error naming both
+  features; `local://` and `rclone://` still work.
 
 ### Security
 
@@ -41,9 +69,30 @@
   versions reject the `%f` now on the clean command); otherwise every
   checkout, `git add` and `git status` of a tracked file fails (nothing is
   corrupted).
+- **`folder push` skips OS junk**: `.DS_Store`, `._*` (AppleDouble),
+  `Thumbs.db` and `desktop.ini`, at any depth. Finder writes `.DS_Store` just
+  by showing a folder, which made the next push a new manifest and history
+  record. `--exclude PATTERN` (`PushOptions::exclude`, `folder::Excludes`)
+  skips more, with `.gitignore` rules relative to the pushed directory.
+  Anyone also running `dvc add` on the folder needs the same patterns in
+  `.dvcignore`; the README gives the lines.
 
 ### Fixed
 
+- `ref`, `dvc-ls` and `import-dvc-dir` refused legal DVC 3 `.dvc` files
+  with fields beyond the output's hash (a regression since 0.1.0):
+  `dvc import-url`'s `md5:`/`frozen:`/`deps:`, `meta:`/`desc:` annotations,
+  `isexec:`, and per-output `remote:`/`push:`/`cloud:`. They are read for
+  their output again. Outputs with no md5-addressed object are refused
+  saying why (`cache: false`, not yet downloaded, etag/version_id only), as
+  is a `wdir:` other than `.`. `folder push` still refuses to overwrite such
+  a file, now naming the fields it would drop.
+- On Windows, `import-dvc-dir`, `folder pull` and every other path bigstore
+  writes refuse names Windows cannot create before writing anything, naming
+  the path: device names (`CON`, `nul.txt`, `com1.log`, `con .txt`,
+  `CONIN$`), a trailing `.` or space, `* ? " < > |` and control characters.
+  Before, such a name from a manifest made on Unix failed at the final
+  rename. Folder push's portability check refuses the same device names.
 - `pull` no longer overwrites uncommitted edits. It fills the cache, then
   replaces only files that are still the index's pointer, via
   `git checkout-index`: restored files keep their committed mode (executables
@@ -77,6 +126,10 @@
   (`out -> elsewhere` committed beside `out.dvc`) and wrote there. A
   symlinked output root is now refused, like any symlinked directory below
   it and like `folder push` already did.
+- `folder push` kept one file open per unique file until the upload, so a
+  folder of a few hundred files failed with `Too many open files` under a
+  256-descriptor limit (the macOS launchd default). Snapshots are now closed
+  once hashed; open files are bounded by `--jobs`.
 - One blob that is not a pointer (e.g. committed before its `filter=bigstore`
   rule) no longer aborts the whole push or pull; `status` reports it as
   `not a pointer in git (git add --renormalize)`.
@@ -143,6 +196,20 @@
   upload can't poison the bucket) — writes downloads to a private per-run temp
   dir (no predictable shared path), and cleans up on failure.
 - Push/pull progress bar now advances for skipped and not-found objects.
+- The filter process no longer spools checkouts of large non-pointer files
+  (committed before their `filter=bigstore` rule) to the system temp dir,
+  which could fill a small `/tmp` or tmpfs, or fail when `TMPDIR` is
+  unusable. Content over 8 MiB now goes to an unnamed file in
+  `.git/bigstore/tmp`, on the cache's filesystem; files a crashed filter left
+  there are removed when the next one starts.
+- A failed index lookup during clean (or a failed blob read in `log`,
+  `status`, `push`, `pull`) could hang the filter or command for good:
+  closing the `git cat-file` helper waited for it to exit while it was still
+  blocked writing the rest of a blob over 64 KiB. Its output pipe is now closed
+  first, so it exits.
+- A malformed packet inside a file's content no longer lets the filter
+  process answer `status=error` and carry on, reading payload bytes as packet
+  headers. It now exits with the error, and git starts a fresh filter.
 
 ### Changed
 

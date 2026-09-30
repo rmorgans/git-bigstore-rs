@@ -30,6 +30,37 @@ cargo install --path .
 The binary is called `git-bigstore`. Git discovers it automatically as a
 subcommand (`git bigstore ...`).
 
+### Cargo features
+
+The defaults build the binary with everything. A library user (the crate is
+`bigstore`) turns them off with `default-features = false` and picks what it
+needs:
+
+| Feature | Default | Enables |
+|---------|---------|---------|
+| `cli` | yes | The `git-bigstore` binary (clap, tracing-subscriber) and everything below |
+| `progress` | via `cli` | Progress bars on stderr during `bigstore::transfer` push and pull |
+| `gcp` | via `cli` | `gs://` remotes (Google Cloud Storage) |
+| `azure` | via `cli` | `az://` remotes (Azure Blob Storage) |
+| `aws-lc-rs` | via `cli` | aws-lc-rs as the crypto for TLS and request signing |
+| `ring` | no | ring as the crypto for TLS and request signing |
+
+`s3://` (and R2, Tigris), `local://` and `rclone://` are always built in. A
+URL whose backend is left out fails with an error naming the feature.
+
+Cloud remotes (`s3://`, `gs://`, `az://`) need one crypto provider:
+`aws-lc-rs` or `ring`. With neither they fail with an error, and only
+`local://` and `rclone://` work. With both, aws-lc-rs is used. An application
+already built on ring (the folder-mode library, S3 only):
+
+```toml
+bigstore = { package = "git-bigstore-rs", git = "…", rev = "…", default-features = false, features = ["ring"] }
+```
+
+With `ring`, bigstore installs ring as the process's default rustls
+`CryptoProvider` when it builds its first cloud client, unless the
+application installed one already.
+
 ## Quick start
 
 ```bash
@@ -289,6 +320,15 @@ shared/global caches (`dvc cache dir --global ~/.dvc/cache`) work automatically.
 If `dvc` is not installed, bigstore falls back to `.dvc/cache` in the DVC
 project directory.
 
+### Which `.dvc` files
+
+`ref`, `dvc-ls` and `import-dvc-dir` read any single-output DVC 3 `.dvc`
+(`hash: md5`), including stage fields (`dvc import-url`'s `md5:`, `frozen:`,
+`deps:`) and annotations (`meta:`, `desc:`, `labels:`...), which they
+ignore. They refuse, saying why, what has no object in the DVC cache:
+`cache: false`, outputs not yet downloaded (`--no-download`), cloud outputs
+tracked only by etag/version_id, and DVC 2 pointers (no `hash:` field).
+
 ### Single-file migration
 
 ```bash
@@ -424,19 +464,47 @@ What it guarantees:
   cannot record them.
 - **Pull restores what this OS can create.** A manifest `dvc push` wrote may
   hold names push would refuse (`back\slash.txt`, non-ASCII). Pull restores
-  them where the OS allows it; on Windows it refuses `\` and `:` by name,
-  before writing anything, since they would change the path. Names that
-  differ only by case are refused everywhere.
+  them where the OS allows it; on Windows it refuses by name, before writing
+  anything, `\` and `:` (they would change the path) and names Windows
+  cannot create (`nul.txt`, `com1`, a trailing `.` or space, `*?"<>|`).
+  Names that differ only by case are refused everywhere.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
+- **Skips OS junk.** `.DS_Store` (Finder writes one just by showing a
+  folder), `._*` (AppleDouble files macOS writes beside files on FAT,
+  exFAT and network volumes), `Thumbs.db` and `desktop.ini` are never backed
+  up, at any depth, so opening a folder never makes a new version. Add more
+  with `--exclude PATTERN` (repeatable; `PushOptions::exclude` in the
+  library), using `.gitignore` rules relative to the pushed directory: `*.tmp`
+  matches at any depth, `/cache` only at the top, `scratch/` only
+  directories; `!` is not supported. A directory holding only skipped files
+  counts as empty. Pull is unaffected: it never deletes local files.
+
+Push records exactly what DVC 3 would, so if you also run `dvc add` on the
+same folder, DVC must ignore the same files. Add these lines to the DVC
+project's `.dvcignore`:
+
+```gitignore
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+```
+
+plus any `--exclude` patterns: unanchored ones (`*.tmp`, `scratch/`) as they
+are, and anchored ones prefixed with the folder's path from the project root
+(`--exclude /cache` on `data/views` is `/data/views/cache`). With that, `dvc
+add` gives the same `.dir` md5 as `folder push` (CI checks this).
 
 Do not run `dvc gc --cloud` against this remote: DVC only knows the latest
 `.dvc` files, and would delete the objects of older versions.
 
-As a library (`default-features = false` drops the CLI's dependencies):
+As a library (`default-features = false, features = ["ring"]` or
+`["aws-lc-rs"]` drops the CLI's dependencies and keeps S3; see
+[Cargo features](#cargo-features)):
 
 ```rust
-use bigstore::folder::{self, Credentials, HistoryKey, PushOptions, Remote, RemoteConfig};
+use bigstore::folder::{self, Credentials, Excludes, HistoryKey, PushOptions, Remote, RemoteConfig};
 
 let remote = Remote::open(&RemoteConfig {
     url: "s3://my-bucket/dvc".into(),
@@ -447,13 +515,50 @@ let remote = Remote::open(&RemoteConfig {
 let report = folder::push(&remote, dir, &PushOptions {
     history: HistoryKey::new("ST032/Beatons/annotations/reviewer=rick/host=mac")?,
     jobs: 8,
+    exclude: Excludes::default(), // or Excludes::new(["*.tmp", "/cache/"])?
 })?;
 ```
 
 The functions block and run their own tokio runtime. Calling them from inside
-a runtime returns an error; use `spawn_blocking`. A pull refused because of
-differing local files returns a typed `folder::PullConflict` in the error
-chain.
+a runtime returns an error; use `spawn_blocking`.
+
+Errors are `anyhow::Error`. Every refusal, and every other outcome a caller
+may want to act on, carries a `bigstore::folder::Error` in its chain, found
+with `err.downcast_ref::<folder::Error>()` whatever context was added above
+it. Match on it instead of on message text; its `Display` is the message the
+CLI prints. Both enums are `#[non_exhaustive]`.
+
+| `folder::Error` | When |
+| --- | --- |
+| `Refused { path, reason }` | push or pull will not touch `path`; `reason` is a `folder::Refusal` (below). Nothing was published or written. |
+| `OutputChanged { detail }` | files kept changing or vanishing through every retry; push again later |
+| `PullConflict { paths }` | local files differ from the version (`Overwrite::Refuse`); nothing written |
+| `NoSuchVersion` | no version in history matches the selector, or there is none |
+| `AmbiguousId { prefix, candidates }` | a version id prefix matches several versions (`candidates`, oldest first) |
+| `InvalidVersionId { prefix }`, `InvalidTime { time }` | a `Selector::Id` that is not 8+ hex characters; a `Selector::AtOrBefore` that is not RFC 3339 |
+| `EndpointRequired` | an `s3://` remote without an endpoint |
+| `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
+| `InvalidExclude { pattern }` | an exclude pattern that does not compile (or uses `!`) |
+
+| `folder::Refusal` | Refused by | `path` is |
+| --- | --- | --- |
+| `NoFileName`, `NotUtf8Name` (of the output), `NonPortableName { detail }` (of the output), `DvcFile`, `NotFileOrDirectory` (a symlink or special file) | push, the output itself | the output |
+| `ForeignPointer` (not a plain DVC 3 pointer), `PointerForOtherOutput { other }` | push, the `.dvc` beside the output | the `.dvc` |
+| `ControlFile` (`.git`, `.hg`, `.dvc`, `.dvcignore`, `*.dvc`), `SymlinkToDirectory`, `BrokenSymlink`, `SpecialFile`, `NonPortableName { detail }`, `NotUtf8Name` | push, inside a directory | relative to the output, `/`-separated |
+| `PointerPathEscapes { output }` | pull, a `.dvc` naming an output outside its directory | the `.dvc` |
+| `SymlinkedOutput`, `NotADirectory`, `NotRegularFile`, `AppearedWhilePulling` | pull, the destination | the filesystem path |
+| `CaseCollision { other }`, `UnwritableName` (`\` or `:` on Windows) | pull, the manifest | the manifest name |
+
+```rust
+match folder::pull(&remote, &source, &opts) {
+    Ok(report) => { /* … */ }
+    Err(e) => match e.downcast_ref::<folder::Error>() {
+        Some(folder::Error::PullConflict { paths }) => { /* ask the user */ }
+        Some(folder::Error::Refused { path, reason }) => { /* a stable code per reason */ }
+        _ => return Err(e),
+    },
+}
+```
 
 ## Comparison: bigstore vs Git LFS vs DVC
 
@@ -583,7 +688,9 @@ committed it.
 
 **"not a pointer in git (git add --renormalize)"** — The file was committed
 before its `filter=bigstore` rule existed, so git holds its raw content. Run
-`git add --renormalize <path>` and commit to move it into bigstore.
+`git add --renormalize <path>` and commit to move it into bigstore. Until
+then, checkout passes it through unchanged, buffering content over 8 MiB in
+`.git/bigstore/tmp` (not the system temp dir).
 
 **"pointer only (needs pull)"** — The file is tracked but not downloaded. Run
 `git bigstore pull`.
