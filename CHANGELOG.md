@@ -20,6 +20,11 @@
   `default-features = false` no longer build object_store's GCS and Azure
   clients; a `gs://` or `az://` URL then fails with an error naming the
   missing feature.
+- `aws-lc-rs` (enabled by `cli`) and `ring` cargo features choose the crypto
+  behind TLS and S3/GCS/Azure request signing, so a library user on ring
+  (`default-features = false, features = ["ring"]`) no longer builds
+  aws-lc-rs. With neither, cloud URLs fail with an error naming both
+  features; `local://` and `rclone://` still work.
 
 ### Security
 
