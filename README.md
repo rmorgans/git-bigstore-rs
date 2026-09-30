@@ -30,6 +30,17 @@ cargo install --path .
 The binary is called `git-bigstore`. Git discovers it automatically as a
 subcommand (`git bigstore ...`).
 
+### Cargo features
+
+The defaults build the binary with everything. A library user (the crate is
+`bigstore`) turns them off with `default-features = false` and picks what it
+needs:
+
+| Feature | Default | Enables |
+|---------|---------|---------|
+| `cli` | yes | The `git-bigstore` binary (clap, tracing-subscriber) and everything below |
+| `progress` | via `cli` | Progress bars on stderr during `bigstore::transfer` push and pull |
+
 ## Quick start
 
 ```bash

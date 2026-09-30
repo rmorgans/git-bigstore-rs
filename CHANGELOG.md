@@ -14,6 +14,8 @@
 - `cli` cargo feature (default). `default-features = false` builds only the
   library.
 - Windows CI job that builds and uploads `git-bigstore.exe`.
+- `progress` cargo feature (enabled by `cli`). Without it the library does
+  not depend on `indicatif` and `bigstore::transfer` draws no progress bars.
 
 ### Security
 
