@@ -244,9 +244,13 @@ impl RepoPath {
         RepoPath(format!("{}/{}", self.0, child.0))
     }
 
-    /// The on-disk location under `repo_root`.
+    /// The on-disk location under `repo_root`, joined component by
+    /// component so it uses the native separator (`\` on Windows) rather
+    /// than keeping the stored `/`.
     pub fn to_fs_path(&self, repo_root: &Path) -> PathBuf {
-        repo_root.join(&self.0)
+        let mut path = repo_root.to_path_buf();
+        path.extend(self.0.split('/'));
+        path
     }
 }
 

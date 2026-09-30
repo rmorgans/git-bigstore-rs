@@ -996,8 +996,15 @@ fn a_refused_pull_lists_every_differing_file_and_writes_nothing() {
     let e = env();
     let w = writer_dir(&e);
     let report = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
-    let a = w.join("site=s1/date=2026-09-01/src_01/labels.jsonl");
-    let b = w.join("site=s1/date=2026-09-02/src_02/labels.jsonl");
+    // Pull reports the destination as given, then the file's relative path
+    // with the native separator (`\` on Windows).
+    let under = |rel: &str| {
+        let mut p = w.clone();
+        p.extend(rel.split('/'));
+        p
+    };
+    let a = under("site=s1/date=2026-09-01/src_01/labels.jsonl");
+    let b = under("site=s1/date=2026-09-02/src_02/labels.jsonl");
     std::fs::write(&a, b"edit a\n").unwrap();
     std::fs::write(&b, b"edit b\n").unwrap();
     std::fs::remove_file(w.join("site=s1/date=2026-09-01/src_01/regions.jsonl")).unwrap();
@@ -1014,11 +1021,8 @@ fn a_refused_pull_lists_every_differing_file_and_writes_nothing() {
     assert_eq!(paths, &[a.clone(), b.clone()]);
     let shown = err.to_string();
     assert!(shown.starts_with("2 local file(s) differ"), "{shown}");
-    // The message shows each path in native form (`\` on Windows), while `a`
-    // and `b` were joined with `/`; compare component-wise normalised forms.
-    let native = |p: &Path| p.components().collect::<PathBuf>().display().to_string();
     assert!(
-        shown.contains(&native(&a)) && shown.contains(&native(&b)),
+        shown.contains(&a.display().to_string()) && shown.contains(&b.display().to_string()),
         "{shown}"
     );
     // Refusal is all or nothing: the missing file was not restored either.
