@@ -149,25 +149,44 @@ struct RemoteArgs {
     region: Option<String>,
 }
 
+/// What `folder push` backs up, and how; `folder status` takes the same.
+#[derive(clap::Args)]
+struct FolderPushArgs {
+    /// Directory or file to back up
+    path: PathBuf,
+    /// History key, e.g. <survey>/<dataset>/<output path>
+    #[arg(long)]
+    history: String,
+    #[command(flatten)]
+    remote: RemoteArgs,
+    #[arg(short, long)]
+    jobs: Option<NonZeroUsize>,
+    /// Also skip entries matching this .gitignore-style pattern, relative
+    /// to the directory (repeatable). .DS_Store, ._*, Thumbs.db and
+    /// desktop.ini are always skipped.
+    #[arg(long, value_name = "PATTERN")]
+    exclude: Vec<String>,
+}
+
+impl FolderPushArgs {
+    fn open(&self) -> Result<(bigstore::folder::Remote, bigstore::folder::PushOptions)> {
+        use bigstore::folder::{Excludes, HistoryKey, PushOptions};
+        let opts = PushOptions {
+            history: HistoryKey::new(&self.history)?,
+            jobs: resolve_jobs(self.jobs)?.get(),
+            exclude: Excludes::new(&self.exclude)?,
+        };
+        Ok((open_folder_remote(&self.remote)?, opts))
+    }
+}
+
 #[derive(Subcommand)]
 enum FolderCommand {
     /// Back up a directory or file; writes <name>.dvc beside it
-    Push {
-        /// Directory or file to back up
-        path: PathBuf,
-        /// History key, e.g. <survey>/<dataset>/<output path>
-        #[arg(long)]
-        history: String,
-        #[command(flatten)]
-        remote: RemoteArgs,
-        #[arg(short, long)]
-        jobs: Option<NonZeroUsize>,
-        /// Also skip entries matching this .gitignore-style pattern, relative
-        /// to the directory (repeatable). .DS_Store, ._*, Thumbs.db and
-        /// desktop.ini are always skipped.
-        #[arg(long, value_name = "PATTERN")]
-        exclude: Vec<String>,
-    },
+    Push(FolderPushArgs),
+    /// Say what push would upload and whether the output is the latest
+    /// version in its history, without writing anything
+    Status(FolderPushArgs),
     /// Restore from a .dvc file, or from history with --history
     Pull {
         /// The .dvc file to restore (omit with --history)
@@ -704,23 +723,9 @@ fn open_folder_remote(args: &RemoteArgs) -> Result<bigstore::folder::Remote> {
 fn cmd_folder(cmd: FolderCommand) -> Result<()> {
     use bigstore::folder::{self, HistoryKey, Overwrite, PointerSource, Selector};
     match cmd {
-        FolderCommand::Push {
-            path,
-            history,
-            remote,
-            jobs,
-            exclude,
-        } => {
-            let remote = open_folder_remote(&remote)?;
-            let r = folder::push(
-                &remote,
-                &path,
-                &folder::PushOptions {
-                    history: HistoryKey::new(&history)?,
-                    jobs: resolve_jobs(jobs)?.get(),
-                    exclude: folder::Excludes::new(&exclude)?,
-                },
-            )?;
+        FolderCommand::Push(args) => {
+            let (remote, opts) = args.open()?;
+            let r = folder::push(&remote, &args.path, &opts)?;
             for w in &r.warnings {
                 eprintln!("warning: {w}");
             }
@@ -739,6 +744,44 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                     " (unchanged since the last version)"
                 }
             );
+        }
+        FolderCommand::Status(args) => {
+            let (remote, opts) = args.open()?;
+            let s = folder::status(&remote, &args.path, &opts)?;
+            for w in &s.warnings {
+                eprintln!("warning: {w}");
+            }
+            if s.empty_dirs > 0 {
+                eprintln!(
+                    "{} empty dir(s) would not be recorded (DVC cannot)",
+                    s.empty_dirs
+                );
+            }
+            println!(
+                "{} file(s): {} to upload ({} bytes), {} already on the remote ({} bytes)",
+                s.files, s.to_upload, s.to_upload_bytes, s.already_present, s.already_present_bytes
+            );
+            let when = |r: &folder::HistoryRecord| {
+                r.time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            };
+            match &s.sync {
+                folder::SyncState::NoHistory => println!("no version in history yet"),
+                folder::SyncState::InSync => println!("in sync: this is the latest version"),
+                folder::SyncState::LocalAhead => {
+                    println!("changed since the latest version; push to record it")
+                }
+                folder::SyncState::RemoteAhead { latest } => println!(
+                    "history has a newer version, {} pushed {}; pull to update",
+                    latest.id(),
+                    when(latest)
+                ),
+                folder::SyncState::Diverged { latest } => println!(
+                    "diverged: changed locally, and history has another version, {} pushed {}",
+                    latest.id(),
+                    when(latest)
+                ),
+                _ => println!("unknown sync state"),
+            }
         }
         FolderCommand::Pull {
             pointer,

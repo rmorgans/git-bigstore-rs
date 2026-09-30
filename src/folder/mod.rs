@@ -148,7 +148,9 @@ pub struct PushReport {
     /// The `.dvc` file written (or already identical) next to the output.
     pub pointer_path: PathBuf,
     pub files: usize,
+    /// Distinct contents uploaded (files with the same content count once).
     pub uploaded: usize,
+    /// Distinct contents the remote already had.
     pub already_present: usize,
     /// Empty directories, which DVC cannot record.
     pub empty_dirs: usize,
@@ -176,40 +178,123 @@ pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushRe
 }
 
 async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
+    let (name, pointer_path, _) = locate(output)?;
+    let tmp = tempfile::tempdir().context("failed to create a temp dir")?;
+    let staged = stage(output, &name, tmp.path(), &opts.exclude, |s| s)?;
+    let jobs = opts.jobs.max(1);
+    let plan = plan(remote, &staged, jobs).await?;
+
+    upload_all(remote, &plan.upload, jobs).await?;
+    if let Some(manifest) = plan.manifest {
+        let key = remote.manifest_key(staged.id());
+        backend::put_bytes(&remote.backend, &key, manifest.to_bytes()).await?;
+    }
+    write_pointer_file(&pointer_path, &staged.pointer)?;
+    let history_record = history::append(remote, &opts.history, &staged.pointer).await?;
+
+    Ok(PushReport {
+        uploaded: plan.upload.len(),
+        already_present: plan.present.len(),
+        pointer: staged.pointer,
+        pointer_path,
+        files: staged.files,
+        empty_dirs: staged.empty_dirs,
+        warnings: staged.warnings,
+        history_record,
+    })
+}
+
+/// What [`status`] found: what [`push`] would do with the same arguments.
+#[derive(Debug)]
+pub struct StatusReport {
+    /// The pointer push would write.
+    pub pointer: DvcPointer,
+    pub files: usize,
+    /// Distinct contents push would upload (files with the same content count
+    /// once), and their total size.
+    pub to_upload: usize,
+    pub to_upload_bytes: u64,
+    /// Distinct contents the remote already has, and their total size.
+    pub already_present: usize,
+    pub already_present_bytes: u64,
+    /// Empty directories, which DVC cannot record.
+    pub empty_dirs: usize,
+    /// Non-fatal observations, as push would report them.
+    pub warnings: Vec<String>,
+    /// How the output relates to the latest version in its history.
+    pub sync: SyncState,
+}
+
+/// How a local output relates to the latest version in its history, judged
+/// by the `.dvc` beside it (the version it was last pushed or pulled as).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SyncState {
+    /// The history is empty: push would record the first version.
+    NoHistory,
+    /// The output is the latest version: push would add none.
+    InSync,
+    /// The output changed since the latest version, which its `.dvc`
+    /// records: push would add a version.
+    LocalAhead,
+    /// The history has a newer version than the one the `.dvc` records, and
+    /// the output has not changed since: pull to catch up. A push would
+    /// record the older content as the newest version.
+    RemoteAhead { latest: HistoryRecord },
+    /// The output changed and so did the history since its `.dvc` (or there
+    /// is no `.dvc` to tell): a pull or a push would set one side aside.
+    Diverged { latest: HistoryRecord },
+}
+
+/// What [`push`] would do, without doing it: `output` is walked, snapshotted
+/// and hashed exactly as push does, and the remote is asked which contents
+/// it has and what the latest version is (one history record fetched).
+/// Nothing is written to the remote or beside the output; snapshots go to a
+/// private temp directory, one file at a time. Refuses whatever push
+/// refuses.
+pub fn status(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
+    block_on(status_async(remote, output, opts))?
+}
+
+async fn status_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
+    let (name, _, local) = locate(output)?;
+    let tmp = tempfile::tempdir().context("failed to create a temp dir")?;
+    let staged = stage(output, &name, tmp.path(), &opts.exclude, |s| Hashed {
+        md5: s.md5().clone(),
+        size: s.size(),
+    })?;
+    let plan = plan(remote, &staged, opts.jobs.max(1)).await?;
+    let output = &staged.pointer.output;
+    let sync = match history::latest(remote, &opts.history).await? {
+        None => SyncState::NoHistory,
+        Some(latest) if latest.pointer.output == *output => SyncState::InSync,
+        Some(latest) => match local {
+            Some(p) if p.output == latest.pointer.output => SyncState::LocalAhead,
+            Some(p) if p.output == *output => SyncState::RemoteAhead { latest },
+            _ => SyncState::Diverged { latest },
+        },
+    };
+    let bytes = |cs: &[&Hashed]| cs.iter().map(|c| c.size).sum();
+    Ok(StatusReport {
+        to_upload: plan.upload.len(),
+        to_upload_bytes: bytes(&plan.upload),
+        already_present: plan.present.len(),
+        already_present_bytes: bytes(&plan.present),
+        pointer: staged.pointer,
+        files: staged.files,
+        empty_dirs: staged.empty_dirs,
+        warnings: staged.warnings,
+        sync,
+    })
+}
+
+/// The output's name, its `.dvc` path, and the pointer already there (push
+/// refuses to replace anything else).
+fn locate(output: &Path) -> Result<(String, PathBuf, Option<DvcPointer>)> {
     let name = output_name(output)?;
     let pointer_path = pointer_path_for(output)?;
-    check_existing_pointer(&pointer_path, &name)?;
-    let meta = std::fs::symlink_metadata(output)
-        .with_context(|| format!("failed to stat {}", output.display()))?;
-    let tmp = tempfile::tempdir().context("failed to create a temp dir")?;
-
-    let mut last_change = String::new();
-    for _ in 0..PUSH_ATTEMPTS {
-        let attempt = if meta.is_dir() {
-            snapshot_dir(output, tmp.path(), &opts.exclude)
-        } else if meta.is_file() {
-            snapshot_file(output, tmp.path())
-        } else {
-            return Err(Error::Refused {
-                path: output.to_path_buf(),
-                reason: Refusal::NotFileOrDirectory,
-            }
-            .into());
-        };
-        let staged = match attempt {
-            Ok(s) => s,
-            Err(Retry::Changed(msg)) => {
-                last_change = msg;
-                continue;
-            }
-            Err(Retry::Fatal(e)) => return Err(e),
-        };
-        return publish(remote, staged, name, pointer_path, opts).await;
-    }
-    Err(Error::OutputChanged {
-        detail: last_change,
-    }
-    .into())
+    let existing = check_existing_pointer(&pointer_path, &name)?;
+    Ok((name, pointer_path, existing))
 }
 
 enum Retry {
@@ -226,20 +311,86 @@ impl From<SnapshotError> for Retry {
     }
 }
 
-/// An output fully snapshotted, ready to upload.
-struct Staged {
-    kind: StagedKind,
+/// One distinct content of a staged output.
+trait Content {
+    fn md5(&self) -> &Hexdigest;
+}
+
+impl Content for Snapshot {
+    fn md5(&self) -> &Hexdigest {
+        Snapshot::md5(self)
+    }
+}
+
+/// A snapshot's digest and size, the copy itself already deleted: all
+/// status needs.
+struct Hashed {
+    md5: Hexdigest,
+    size: u64,
+}
+
+impl Content for Hashed {
+    fn md5(&self) -> &Hexdigest {
+        &self.md5
+    }
+}
+
+/// An output fully snapshotted and hashed: what push publishes.
+struct Staged<C> {
+    pointer: DvcPointer,
+    /// A directory output's manifest.
+    manifest: Option<Manifest>,
+    /// Distinct contents, by md5.
+    contents: Vec<C>,
+    files: usize,
     warnings: Vec<String>,
     empty_dirs: usize,
 }
 
-enum StagedKind {
-    Dir {
-        manifest: Manifest,
-        snapshots: BTreeMap<Hexdigest, Snapshot>,
-        size: u64,
-    },
-    File(Snapshot),
+impl<C> Staged<C> {
+    /// The version's id: manifest id or file md5.
+    fn id(&self) -> &Hexdigest {
+        match &self.pointer.output {
+            DvcOutput::Dir { manifest, .. } => manifest,
+            DvcOutput::File { md5, .. } => md5,
+        }
+    }
+}
+
+/// Snapshot `output` (named `name`) into `tmp`, restarting while files
+/// change under it; `keep` turns each snapshot into what the caller holds.
+fn stage<C>(
+    output: &Path,
+    name: &str,
+    tmp: &Path,
+    excludes: &Excludes,
+    keep: fn(Snapshot) -> C,
+) -> Result<Staged<C>> {
+    let meta = std::fs::symlink_metadata(output)
+        .with_context(|| format!("failed to stat {}", output.display()))?;
+    let mut last_change = String::new();
+    for _ in 0..PUSH_ATTEMPTS {
+        let attempt = if meta.is_dir() {
+            snapshot_dir(output, name, tmp, excludes, keep)
+        } else if meta.is_file() {
+            snapshot_file(output, name, tmp, keep)
+        } else {
+            return Err(Error::Refused {
+                path: output.to_path_buf(),
+                reason: Refusal::NotFileOrDirectory,
+            }
+            .into());
+        };
+        match attempt {
+            Ok(staged) => return Ok(staged),
+            Err(Retry::Changed(msg)) => last_change = msg,
+            Err(Retry::Fatal(e)) => return Err(e),
+        }
+    }
+    Err(Error::OutputChanged {
+        detail: last_change,
+    }
+    .into())
 }
 
 fn warn_unterminated(relpath: &str, s: &Snapshot, warnings: &mut Vec<String>) {
@@ -250,14 +401,21 @@ fn warn_unterminated(relpath: &str, s: &Snapshot, warnings: &mut Vec<String>) {
     }
 }
 
-fn snapshot_dir(dir: &Path, tmp: &Path, excludes: &Excludes) -> std::result::Result<Staged, Retry> {
+fn snapshot_dir<C>(
+    dir: &Path,
+    name: &str,
+    tmp: &Path,
+    excludes: &Excludes,
+    keep: fn(Snapshot) -> C,
+) -> std::result::Result<Staged<C>, Retry> {
     let walk = match walk::walk(dir, excludes) {
         Ok(w) => w,
         Err(WalkError::Changed(m)) => return Err(Retry::Changed(m)),
         Err(e) => return Err(Retry::Fatal(e.into())),
     };
-    let mut entries = Vec::with_capacity(walk.files.len());
-    let mut snapshots = BTreeMap::new();
+    let files = walk.files.len();
+    let mut entries = Vec::with_capacity(files);
+    let mut contents = BTreeMap::new();
     let mut warnings = Vec::new();
     let mut size = 0;
     for f in walk.files {
@@ -268,114 +426,107 @@ fn snapshot_dir(dir: &Path, tmp: &Path, excludes: &Excludes) -> std::result::Res
             relpath: f.relpath.to_manifest_path(),
             md5: s.md5().clone(),
         });
-        snapshots.entry(s.md5().clone()).or_insert(s);
+        if !contents.contains_key(s.md5()) {
+            contents.insert(s.md5().clone(), keep(s));
+        }
     }
     let manifest = Manifest::from_entries(entries).map_err(Retry::Fatal)?;
     Ok(Staged {
-        kind: StagedKind::Dir {
-            manifest,
-            snapshots,
-            size,
+        pointer: DvcPointer {
+            output: DvcOutput::Dir {
+                manifest: manifest.id(),
+                size,
+                nfiles: files as u64,
+            },
+            path: name.to_string(),
         },
+        manifest: Some(manifest),
+        contents: contents.into_values().collect(),
+        files,
         warnings,
         empty_dirs: walk.empty_dirs,
     })
 }
 
-fn snapshot_file(file: &Path, tmp: &Path) -> std::result::Result<Staged, Retry> {
+fn snapshot_file<C>(
+    file: &Path,
+    name: &str,
+    tmp: &Path,
+    keep: fn(Snapshot) -> C,
+) -> std::result::Result<Staged<C>, Retry> {
     let s = snapshot::snapshot(file, tmp)?;
     let mut warnings = Vec::new();
     warn_unterminated(&file.to_string_lossy(), &s, &mut warnings);
     Ok(Staged {
-        kind: StagedKind::File(s),
+        pointer: DvcPointer {
+            output: DvcOutput::File {
+                md5: s.md5().clone(),
+                size: s.size(),
+            },
+            path: name.to_string(),
+        },
+        manifest: None,
+        contents: vec![keep(s)],
+        files: 1,
         warnings,
         empty_dirs: 0,
     })
 }
 
-async fn publish(
+/// Which of a staged output's contents the remote lacks.
+struct Plan<'a, C> {
+    upload: Vec<&'a C>,
+    present: Vec<&'a C>,
+    /// The manifest to upload after the objects; `None` for a file output
+    /// or a manifest already on the remote.
+    manifest: Option<&'a Manifest>,
+}
+
+async fn plan<'a, C: Content + Sync>(
     remote: &Remote,
-    staged: Staged,
-    name: String,
-    pointer_path: PathBuf,
-    opts: &PushOptions,
-) -> Result<PushReport> {
-    let (pointer, files, uploads, manifest_bytes) = match staged.kind {
-        StagedKind::Dir {
-            manifest,
-            snapshots,
-            size,
-        } => {
-            let id = manifest.id();
-            let pointer = DvcPointer {
-                output: DvcOutput::Dir {
-                    manifest: id.clone(),
-                    size,
-                    nfiles: manifest.entries().len() as u64,
-                },
-                path: name,
-            };
-            // A manifest already on the remote means all its objects are
-            // (DVC's own invariant, and ours: it is uploaded last).
-            let complete = backend::exists(&remote.backend, &remote.manifest_key(&id)).await?;
-            let uploads: Vec<Snapshot> = if complete {
-                Vec::new()
-            } else {
-                snapshots.into_values().collect()
-            };
-            let bytes = (!complete).then(|| manifest.to_bytes());
-            (pointer, manifest.entries().len(), uploads, bytes)
-        }
-        StagedKind::File(s) => {
-            let pointer = DvcPointer {
-                output: DvcOutput::File {
-                    md5: s.md5().clone(),
-                    size: s.size(),
-                },
-                path: name,
-            };
-            (pointer, 1, vec![s], None)
-        }
-    };
-
-    let (uploaded, already_present) = upload_all(remote, &uploads, opts.jobs.max(1)).await?;
-    if let (DvcOutput::Dir { manifest, .. }, Some(bytes)) = (&pointer.output, manifest_bytes) {
-        backend::put_bytes(&remote.backend, &remote.manifest_key(manifest), bytes).await?;
+    staged: &'a Staged<C>,
+    jobs: usize,
+) -> Result<Plan<'a, C>> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    // A manifest already on the remote means all its objects are (DVC's own
+    // invariant, and ours: it is uploaded last).
+    if staged.manifest.is_some()
+        && backend::exists(&remote.backend, &remote.manifest_key(staged.id())).await?
+    {
+        return Ok(Plan {
+            upload: Vec::new(),
+            present: staged.contents.iter().collect(),
+            manifest: None,
+        });
     }
-    write_pointer_file(&pointer_path, &pointer)?;
-    let history_record = history::append(remote, &opts.history, &pointer).await?;
-
-    Ok(PushReport {
-        pointer,
-        pointer_path,
-        files,
-        uploaded,
-        already_present,
-        empty_dirs: staged.empty_dirs,
-        warnings: staged.warnings,
-        history_record,
+    let there: Vec<bool> = stream::iter(&staged.contents)
+        .map(|c| async move { backend::exists(&remote.backend, &remote.object_key(c.md5())).await })
+        .buffered(jobs)
+        .try_collect()
+        .await?;
+    let (present, upload): (Vec<_>, Vec<_>) = staged
+        .contents
+        .iter()
+        .zip(there)
+        .partition(|(_, there)| *there);
+    Ok(Plan {
+        upload: upload.into_iter().map(|(c, _)| c).collect(),
+        present: present.into_iter().map(|(c, _)| c).collect(),
+        manifest: staged.manifest.as_ref(),
     })
 }
 
-/// Upload each snapshot the remote lacks. Returns (uploaded, already there).
-async fn upload_all(remote: &Remote, snaps: &[Snapshot], jobs: usize) -> Result<(usize, usize)> {
+async fn upload_all(remote: &Remote, snaps: &[&Snapshot], jobs: usize) -> Result<()> {
     use futures::stream::{self, StreamExt, TryStreamExt};
-    let results: Vec<bool> = stream::iter(snaps)
+    stream::iter(snaps)
         .map(|s| async move {
-            let key = remote.object_key(s.md5());
-            if backend::exists(&remote.backend, &key).await? {
-                return Ok::<_, anyhow::Error>(false);
-            }
-            backend::upload(&remote.backend, s.path(), &key)
+            backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
                 .await
-                .with_context(|| format!("upload of {} failed", s.md5()))?;
-            Ok(true)
+                .with_context(|| format!("upload of {} failed", s.md5()))
         })
         .buffer_unordered(jobs)
         .try_collect()
-        .await?;
-    let uploaded = results.iter().filter(|u| **u).count();
-    Ok((uploaded, results.len() - uploaded))
+        .await
 }
 
 /// The output's name: one portable path component.
@@ -409,12 +560,13 @@ fn pointer_path_for(output: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!("{name}.dvc")))
 }
 
-/// Refuse to replace a `.dvc` that is not a plain bigstore/DVC pointer for
-/// this output (e.g. a hand-written one with extra fields or a stage).
-fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<()> {
+/// The pointer already beside the output, if any. Refuses to replace a
+/// `.dvc` that is not a plain bigstore/DVC pointer for this output (e.g. a
+/// hand-written one with extra fields or a stage).
+fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<Option<DvcPointer>> {
     let text = match std::fs::read_to_string(pointer_path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(e).with_context(|| format!("failed to read {}", pointer_path.display()))
         }
@@ -430,7 +582,7 @@ fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<()> {
         })
         .into());
     }
-    Ok(())
+    Ok(Some(existing))
 }
 
 /// Write the pointer atomically. A file that already says the same thing is

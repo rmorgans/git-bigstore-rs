@@ -4,7 +4,7 @@
 use bigstore::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use bigstore::folder::{
     self, Credentials, Error as FolderError, Excludes, HistoryKey, Overwrite, PointerSource,
-    PullOptions, PushOptions, Refusal, Remote, RemoteConfig, Selector,
+    PullOptions, PushOptions, Refusal, Remote, RemoteConfig, Selector, SyncState,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
@@ -1529,4 +1529,72 @@ fn keys_lists_every_history_key_under_a_prefix() {
         ]
     );
     assert!(keys(Some("nothing/here")).is_empty());
+}
+
+#[test]
+fn status_says_what_push_would_do_and_writes_nothing() {
+    let e = env();
+    let w = writer_dir(&e);
+    let parent = w.parent().unwrap().to_path_buf();
+    let listing = |dir: &Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|d| d.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    };
+    let before = (listing(&parent), tree(&w));
+
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(matches!(s.sync, SyncState::NoHistory), "{:?}", s.sync);
+    assert_eq!((s.files, s.to_upload, s.already_present), (4, 4, 0));
+    let total: u64 = tree(&w).iter().map(|(_, c)| c.len() as u64).sum();
+    assert_eq!((s.to_upload_bytes, s.already_present_bytes), (total, 0));
+    assert_eq!((listing(&parent), tree(&w)), before, "status wrote locally");
+    assert!(
+        remote_keys(&e.store).is_empty(),
+        "status wrote to the remote"
+    );
+
+    let pushed = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    assert_eq!(s.pointer, pushed.pointer, "status predicts the pointer");
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(matches!(s.sync, SyncState::InSync), "{:?}", s.sync);
+    assert_eq!((s.to_upload, s.already_present), (0, 4));
+    assert_eq!(s.already_present_bytes, total);
+    // A no-op push counts what is already there, as status does.
+    let again = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    assert_eq!((again.uploaded, again.already_present), (0, 4));
+
+    let labels = w.join("site=s1/date=2026-09-02/src_02/labels.jsonl");
+    std::fs::write(&labels, b"{\"t\":3}\n{\"t\":4}\n").unwrap();
+    let keys_before = remote_keys(&e.store);
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(matches!(s.sync, SyncState::LocalAhead), "{:?}", s.sync);
+    assert_eq!((s.to_upload, s.to_upload_bytes), (1, 16));
+    assert_eq!(remote_keys(&e.store), keys_before);
+
+    // Another host pushes a newer version; this copy is still what its
+    // .dvc records.
+    std::fs::write(&labels, b"{\"t\":3}\n").unwrap();
+    let other = e.data.parent().unwrap().join("other/host");
+    folder::pull(
+        &e.remote,
+        &history(KEY, Selector::Latest),
+        &pull_opts(Some(other.clone())),
+    )
+    .unwrap();
+    std::fs::write(other.join("new.jsonl"), b"{}\n").unwrap();
+    let newer = folder::push(&e.remote, &other, &opts(KEY)).unwrap();
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    let SyncState::RemoteAhead { latest } = &s.sync else {
+        panic!("{:?}", s.sync)
+    };
+    assert_eq!(latest.pointer.output, newer.pointer.output);
+
+    // Both changed since the .dvc.
+    std::fs::write(&labels, b"{\"t\":5}\n").unwrap();
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(matches!(s.sync, SyncState::Diverged { .. }), "{:?}", s.sync);
 }

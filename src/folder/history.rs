@@ -252,10 +252,7 @@ pub(super) async fn append(
     key: &HistoryKey,
     pointer: &DvcPointer,
 ) -> Result<Option<String>> {
-    let latest = match list(remote, key).await?.last() {
-        Some(l) => Some(fetch(remote, l).await?),
-        None => None,
-    };
+    let latest = latest(remote, key).await?;
     if latest
         .as_ref()
         .is_some_and(|r| r.pointer.output == pointer.output)
@@ -274,6 +271,14 @@ pub(super) async fn append(
     );
     backend::put_bytes(&remote.backend, &record, pointer.to_yaml().into_bytes()).await?;
     Ok(Some(record))
+}
+
+/// The newest version of `key`, if any; only that record is fetched.
+pub(super) async fn latest(remote: &Remote, key: &HistoryKey) -> Result<Option<HistoryRecord>> {
+    match list(remote, key).await?.last() {
+        Some(l) => Ok(Some(fetch(remote, l).await?)),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]

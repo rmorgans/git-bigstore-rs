@@ -47,6 +47,16 @@
   whole path components), so a host can find other writers' outputs without
   a pointer. One listing; nested keys (`k` and `k/sub`) are both reported and
   objects that are not records are ignored.
+- `folder::status(&remote, output, &push_options)` and `git bigstore folder
+  status` (push's arguments): what a push would upload (distinct contents and
+  bytes, and what the remote already has), the pointer it would write, and
+  `SyncState` against the latest history version (`NoHistory`, `InSync`,
+  `LocalAhead`, `RemoteAhead`, `Diverged`, judged by the `.dvc` beside the
+  output). It shares push's walk, snapshot and hashing, refuses what push
+  refuses, and writes nothing to the remote or beside the output.
+- `PushReport::already_present` counts what the remote already had when its
+  manifest was there too; a push of an unchanged directory used to report
+  `0 uploaded, 0 already on the remote`.
 
 ### Security
 

@@ -430,6 +430,11 @@ git bigstore folder push ds/annotations/reviewer=rick/host=mac \
     --history ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
 git bigstore folder push ds/store.toml --history ST032/Beatons/store.toml --remote $R
 
+# What push would upload, and whether this is the latest version; writes
+# nothing (same arguments as push).
+git bigstore folder status ds/annotations/reviewer=rick/host=mac \
+    --history ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
+
 # Every version ever pushed, oldest first.
 git bigstore folder log ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
 
@@ -536,6 +541,26 @@ for key in folder::keys(&remote, Some(&under))? {
     for v in folder::log(&remote, &key, 8)? {
         println!("{}  {}  {}", key.as_str(), v.time, v.id());
     }
+}
+```
+
+Dry run: `folder::status` walks, snapshots and hashes the output exactly as
+`push` does (and refuses what push refuses), asks the remote which contents
+it has and fetches the latest history record, and writes nothing, on the
+remote or beside the output. Snapshots go to a private temp directory one
+file at a time. `sync` compares the output with the latest version, using
+the `.dvc` beside it as the version it was last pushed or pulled as:
+
+```rust
+let s = folder::status(&remote, dir, &opts)?; // the PushOptions push would get
+println!("{} to upload ({} bytes)", s.to_upload, s.to_upload_bytes);
+match s.sync {
+    folder::SyncState::NoHistory => {}           // never pushed
+    folder::SyncState::InSync => {}              // push would add no version
+    folder::SyncState::LocalAhead => {}          // changed since its .dvc: push
+    folder::SyncState::RemoteAhead { latest } => {} // newer version elsewhere: pull
+    folder::SyncState::Diverged { latest } => {} // both changed (or no .dvc)
+    _ => {}                                      // #[non_exhaustive]
 }
 ```
 
