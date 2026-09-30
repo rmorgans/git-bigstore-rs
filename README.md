@@ -57,9 +57,13 @@ already built on ring (the folder-mode library, S3 only):
 bigstore = { package = "git-bigstore-rs", git = "…", rev = "…", default-features = false, features = ["ring"] }
 ```
 
-With `ring`, bigstore installs ring as the process's default rustls
-`CryptoProvider` when it builds its first cloud client, unless the
-application installed one already.
+With `ring` (and not `aws-lc-rs`), bigstore installs ring as the process's
+default rustls `CryptoProvider` when it builds its first cloud client
+(in folder mode, `Remote::open` of an `s3://` remote), unless the
+application installed one already. An application that installs its own
+provider must do so before that call: afterwards a default is set, so its
+`CryptoProvider::install_default()` returns `Err`, and the usual
+`.expect(…)` on it panics.
 
 ## Quick start
 
@@ -482,6 +486,11 @@ What it guarantees:
   normalization (`é` as one code point or as `e` plus an accent, as macOS
   and Linux may each write it) are refused everywhere, before anything is
   written: macOS and Windows would store them as one file.
+- **Any path length, Windows included.** Push and pull work with paths
+  longer than Windows' 260-character `MAX_PATH` whether or not the machine
+  enables long paths (`LongPathsEnabled`): the renames that bypass std's own
+  long-path handling are given verbatim `\\?\` paths. Paths in reports and
+  errors stay in the form you passed.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
 - **Skips OS junk.** `.DS_Store` (Finder writes one just by showing a
@@ -491,7 +500,8 @@ What it guarantees:
   with `--exclude PATTERN` (repeatable; `PushOptions::exclude` in the
   library), using `.gitignore` rules relative to the pushed directory: `*.tmp`
   matches at any depth, `/cache` only at the top, `scratch/` only
-  directories; `!` is not supported. A directory holding only skipped files
+  directories (a symlink to one included, as in DVC: it is skipped, never
+  followed); `!` is not supported. A directory holding only skipped files
   counts as empty. Pull is unaffected: it never deletes local files.
 
 Push records exactly what DVC 3 would, so if you also run `dvc add` on the
@@ -512,6 +522,46 @@ add` gives the same `.dir` md5 as `folder push` (CI checks this).
 
 Do not run `dvc gc --cloud` against this remote: DVC only knows the latest
 `.dvc` files, and would delete the objects of older versions.
+
+What to push, and what push assumes:
+
+- **Push the writer's directory.** The unit of push is one output: the
+  directory one writer owns, e.g. `annotations/reviewer=rick/host=h` with
+  every recording below it (`site=…/date=…/src_…`), under a history key that
+  names it. Each version is then the writer's whole state at one moment, one
+  `.dvc` and one history per writer. Every push reads and hashes every file
+  of the output; unchanged files are not uploaded again.
+- **Choose that granularity once.** Push writes `<name>.dvc` beside the
+  output and refuses an output with any `*.dvc` inside it (DVC forbids
+  nested outputs). After pushing `…/host=h/site=s1`, pushing `…/host=h` is
+  refused until `site=s1.dvc` is deleted; after pushing `…/host=h`, its
+  parent (which now holds `host=h.dvc`) is refused. Give a different output
+  a different history key (one key's versions should all be one output), so
+  switching granularity starts a new history.
+- **A manifest on the remote means its objects are there.** When the
+  directory's `.dir` manifest already exists on the remote, push uploads
+  nothing and checks no objects (the report shows 0 uploaded, 0 already
+  present): bigstore and DVC both upload a manifest only after every object
+  it lists. That is wrong if objects were deleted behind their manifest: by
+  hand, by a bucket lifecycle rule, or by a copy or sync of the bucket that
+  stopped part way. Push then succeeds, and pulling that version fails on
+  the missing object. To repair, delete the manifest
+  (`files/md5/xx/<rest>.dir`, named by the `.dvc`'s `md5`) and push again:
+  push then checks each object and uploads the missing ones. Single-file
+  outputs always check their object.
+- **Change detection is length plus mtime.** A file's length and mtime are
+  read before and after it is copied, and the copy is retried if either
+  moved, or if the bytes copied are not the length the file ended at.
+  Appending always changes the length, so a file that is only appended to
+  is always captured as a state it really had. A change that keeps the
+  length (a rewrite in place, or a cut and an append of the same size) is
+  seen only through the mtime: where the mtime is coarser than the change
+  (FAT's 2 s, or a kernel clock tick of a few ms on some Linux
+  filesystems), such a change during the copy can go unnoticed and the
+  snapshot can mix old and new bytes of that file. Its object still matches
+  its key, because the digest is taken from the copied bytes as they are
+  written, and the next push, which reads every file again, records the
+  file as it then is.
 
 As a library (`default-features = false, features = ["ring"]` or
 `["aws-lc-rs"]` drops the CLI's dependencies and keeps S3; see

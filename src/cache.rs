@@ -114,10 +114,18 @@ pub fn dvc_cache_path(dvc_cache_root: &Path, hexdigest: &Hexdigest) -> PathBuf {
         .join(hexdigest.rest())
 }
 
-/// Atomically write a copy of `src` to a working-tree path. The file gets the
-/// permissions of any newly created file (0666 minus umask), not the
-/// owner-only mode of a temp file.
-pub fn copy_to_worktree(src: &Path, dest: &Path) -> Result<()> {
+/// The mode a file restored to the working tree gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeMode {
+    /// What any newly created file gets: 0666 minus umask.
+    Regular,
+    /// 0777 minus umask, as git checks out an executable (unix only).
+    Executable,
+}
+
+/// Atomically write a copy of `src` to a working-tree path with `mode`'s
+/// permissions, not the owner-only mode of a temp file.
+pub fn copy_to_worktree(src: &Path, dest: &Path, mode: WorktreeMode) -> Result<()> {
     let parent = dest
         .parent()
         .with_context(|| format!("{} has no parent directory", dest.display()))?;
@@ -126,8 +134,16 @@ pub fn copy_to_worktree(src: &Path, dest: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
+        // Passed to open(2), so the umask applies.
+        let bits = match mode {
+            WorktreeMode::Regular => 0o666,
+            WorktreeMode::Executable => 0o777,
+        };
+        builder.permissions(std::fs::Permissions::from_mode(bits));
     }
+    // Windows has no execute bit.
+    #[cfg(not(unix))]
+    let _ = (&mut builder, mode);
     let mut tmp = builder.tempfile_in(parent)?;
     std::io::copy(&mut std::fs::File::open(src)?, &mut tmp)?;
     tmp.persist(dest)?;

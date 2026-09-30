@@ -1925,3 +1925,80 @@ fn an_invalid_history_key_and_a_history_pull_without_a_destination_are_typed() {
     );
     assert!(format!("{err:#}").contains("into"), "{err:#}");
 }
+
+// ── Edges: long paths ───────────────────────────────
+
+/// `n` directory levels of 62 characters each, `/`-joined.
+fn deep(tag: &str, n: usize) -> String {
+    (0..n)
+        .map(|i| format!("{tag}{i}_{}", "x".repeat(58)))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Everything past Windows' 260-character `MAX_PATH`: the output's own
+/// path (so its `.dvc` too), each file's path inside it (~250 characters,
+/// like asset-store's deepest), and the pull destination. On Windows this
+/// only passes because every path handed to tempfile's raw `MoveFileExW`
+/// is verbatim; the paths push and pull report stay as the caller gave them.
+#[test]
+fn outputs_and_files_beyond_max_path_push_and_pull() {
+    let e = env();
+    let output = e.data.join(deep("out", 4)).join("host=h");
+    let rel = format!(
+        "site=s1/date=2026-09-01/{}/src_0001_camera_left/gt_geometry/tracks.parquet",
+        deep("src", 3)
+    );
+    let twin = format!("site=s1/date=2026-09-02/{}/labels.jsonl", deep("src", 3));
+    assert!(rel.len() >= 250, "{}", rel.len());
+    assert!(output.join(&rel).as_os_str().len() > 300);
+    write(&output.join(&rel), b"PAR1 geometry");
+    write(&output.join(&twin), b"{\"t\":1}\n");
+    // Same content under another long path: one download, one copy.
+    write(
+        &output.join(format!("{}/copy.jsonl", deep("dup", 4))),
+        b"{\"t\":1}\n",
+    );
+
+    let report = folder::push(&e.remote, &output, &opts("ds/long")).unwrap();
+    assert_eq!(report.files, 3);
+    let pointer = output.parent().unwrap().join("host=h.dvc");
+    assert_eq!(report.pointer_path.as_os_str(), pointer.as_os_str());
+    assert!(pointer.is_file());
+
+    let restore = e.data.parent().unwrap().join(deep("in", 4));
+    let pulled = folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path.clone()),
+        &pull_opts(Some(restore.clone())),
+    )
+    .unwrap();
+    assert_eq!(pulled.written, 3);
+    assert_eq!(tree(&restore), tree(&output));
+
+    // A conflict names the file in the caller's form, then force replaces.
+    let target = restore.join(&rel);
+    std::fs::write(&target, b"local edit").unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path.clone()),
+        &pull_opts(Some(restore.clone())),
+    )
+    .unwrap_err();
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].as_os_str(), target.as_os_str());
+    let forced = folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path),
+        &PullOptions {
+            overwrite: Overwrite::Force,
+            ..pull_opts(Some(restore.clone()))
+        },
+    )
+    .unwrap();
+    assert_eq!(forced.written, 1);
+    assert_eq!(std::fs::read(&target).unwrap(), b"PAR1 geometry");
+}

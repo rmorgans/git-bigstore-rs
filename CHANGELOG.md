@@ -115,7 +115,9 @@
   `Thumbs.db` and `desktop.ini`, at any depth. Finder writes `.DS_Store` just
   by showing a folder, which made the next push a new manifest and history
   record. `--exclude PATTERN` (`PushOptions::exclude`, `folder::Excludes`)
-  skips more, with `.gitignore` rules relative to the pushed directory.
+  skips more, with `.gitignore` rules relative to the pushed directory; a
+  directory-only pattern (`scratch/`) also skips a symlink to a directory,
+  as `.dvcignore` does, instead of refusing it, and never follows it.
   Anyone also running `dvc add` on the folder needs the same patterns in
   `.dvcignore`; the README gives the lines.
 - **Folder history is read by listing.** A record's name holds its time and
@@ -145,12 +147,28 @@
   saying why (`cache: false`, not yet downloaded, etag/version_id only), as
   is a `wdir:` other than `.`. `folder push` still refuses to overwrite such
   a file, now naming the fields it would drop.
+- `ref` of a `.dvc` with `isexec: true` (DVC's mark for an executable
+  file) wrote the file without its execute bit. On unix it is now written
+  0777 minus umask, as git checks out an executable; DVC's `.dir`
+  manifests record no modes, so `import-dvc-dir` is unchanged.
 - On Windows, `import-dvc-dir`, `folder pull` and every other path bigstore
   writes refuse names Windows cannot create before writing anything, naming
   the path: device names (`CON`, `nul.txt`, `com1.log`, `con .txt`,
   `CONIN$`), a trailing `.` or space, `* ? " < > |` and control characters.
   Before, such a name from a manifest made on Unix failed at the final
   rename. Folder push's portability check refuses the same device names.
+  Only paths about to be created are checked (manifest entries, `ref`'s
+  destination, `import-dvc-dir`'s destination root): paths git reports
+  are read as before, so `log` of a history that once held `docs/aux.md`
+  works on Windows.
+- On Windows, `folder pull` into a path past the 260-character `MAX_PATH`,
+  and `folder push` of an output whose `.dvc` lands past it, failed at the
+  final rename unless both the machine (`LongPathsEnabled`) and the program
+  (its manifest) opted into long paths: std lifts the limit for its own
+  calls, but tempfile's `persist` hands paths to `MoveFileExW` as they are.
+  Those renames and their temp files now use verbatim `\\?\` paths, so any
+  depth works on any machine; paths in reports and errors stay as given. CI
+  checks it on Windows with `LongPathsEnabled` off.
 - `pull` no longer overwrites uncommitted edits. It fills the cache, then
   replaces only files that are still the index's pointer, via
   `git checkout-index`: restored files keep their committed mode (executables

@@ -112,6 +112,17 @@ jobs:
           cargo test --test folder
           cargo test --test dvc_compat -- --ignored
 
+      - name: Long paths without the OS opt-in
+        # With LongPathsEnabled off, Win32 gives no process paths past
+        # MAX_PATH unless they are verbatim (\\?\), so this proves folder
+        # mode does not depend on the machine's setting.
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+          "LongPathsEnabled was $((Get-ItemProperty $key).LongPathsEnabled)"
+          Set-ItemProperty $key -Name LongPathsEnabled -Value 0
+          cargo test --test folder -- --exact outputs_and_files_beyond_max_path_push_and_pull
+
       - name: Upload git-bigstore.exe
         uses: actions/upload-artifact@v4
         with:
