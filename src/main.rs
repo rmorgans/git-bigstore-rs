@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use bigstore::backend;
-use bigstore::cache::{self, DvcImportResult};
+use bigstore::cache::{self, DvcImportResult, WorktreeMode};
 use bigstore::config::BigstoreConfig;
 use bigstore::filter::{self, WorktreeFile};
 use bigstore::git::{self, IndexBlob};
@@ -458,9 +458,13 @@ fn cmd_ref(source: &RepoPath, dest: &RepoPath) -> Result<()> {
     let git_dir = git::common_dir()?;
 
     let source_path = source.to_fs_path(&repo_root);
-    let dvc::DvcPointer {
-        output: dvc::DvcOutput::File { md5, .. },
-        path: dvc_out_path,
+    let dvc::LenientPointer {
+        pointer:
+            dvc::DvcPointer {
+                output: dvc::DvcOutput::File { md5, .. },
+                path: dvc_out_path,
+            },
+        isexec,
     } = dvc::DvcPointer::load_lenient(&source_path)?
     else {
         anyhow::bail!("{source} is a .dir .dvc file — use `git bigstore import-dvc-dir` instead");
@@ -486,7 +490,12 @@ fn cmd_ref(source: &RepoPath, dest: &RepoPath) -> Result<()> {
 
     // Write the real content; the clean filter turns it into the pointer on `git add`.
     let cache_path = cache::object_path(&git_dir, pointer.hexdigest());
-    cache::copy_to_worktree(&cache_path, &dest.to_fs_path(&repo_root))?;
+    let mode = if isexec {
+        WorktreeMode::Executable
+    } else {
+        WorktreeMode::Regular
+    };
+    cache::copy_to_worktree(&cache_path, &dest.to_fs_path(&repo_root), mode)?;
 
     eprintln!("Created: {dest} (content restored from cache)");
     eprintln!("  Source: {source} (md5:{})", pointer.hexdigest());
@@ -600,8 +609,13 @@ fn cmd_import_dvc_dir(
         }
 
         // Write the real content; the clean filter turns it into a pointer on `git add`.
+        // A `.dir` manifest records no file modes, so DVC restores none.
         let dest = dest.to_fs_path(&repo_root);
-        cache::copy_to_worktree(&cache::object_path(&git_dir, &entry.md5), &dest)?;
+        cache::copy_to_worktree(
+            &cache::object_path(&git_dir, &entry.md5),
+            &dest,
+            WorktreeMode::Regular,
+        )?;
     }
 
     let total = imported + cached;
@@ -641,7 +655,8 @@ fn resolve_dir_manifest(
     dvc_cache_root: &Path,
     source_path: &Path,
 ) -> Result<(Hexdigest, Vec<dvc::ManifestEntry>)> {
-    let dvc::DvcOutput::Dir { manifest, .. } = dvc::DvcPointer::load_lenient(source_path)?.output
+    let dvc::DvcOutput::Dir { manifest, .. } =
+        dvc::DvcPointer::load_lenient(source_path)?.pointer.output
     else {
         anyhow::bail!(
             "{} is a single-file .dvc — use `git bigstore ref` instead",

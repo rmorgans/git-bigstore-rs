@@ -243,10 +243,12 @@ struct DvcFileOut {
     etag: Option<IgnoredAny>,
     checksum: Option<IgnoredAny>,
     version_id: Option<IgnoredAny>,
+    /// DVC's mark for an executable file output (it checks the file out
+    /// with the execute bit set).
+    isexec: Option<bool>,
     // Neither changes which bytes the output holds nor where DVC caches
-    // them: the file mode, pipeline and push settings, annotations, and the
-    // per-remote ids of a cloud-versioned remote.
-    isexec: Option<IgnoredAny>,
+    // them: pipeline and push settings, annotations, and the per-remote ids
+    // of a cloud-versioned remote.
     persist: Option<IgnoredAny>,
     remote: Option<IgnoredAny>,
     push: Option<IgnoredAny>,
@@ -297,10 +299,11 @@ impl DvcFileOut {
     }
 }
 
-/// A `.dvc` file's output, and the fields it has that
-/// [`DvcPointer::to_yaml`] would not write back.
+/// A `.dvc` file's output, whether DVC marked it executable, and the fields
+/// it has that [`DvcPointer::to_yaml`] would not write back.
 struct ParsedDvcFile {
     pointer: DvcPointer,
+    isexec: bool,
     extra_fields: Vec<&'static str>,
 }
 
@@ -370,6 +373,7 @@ impl ParsedDvcFile {
                 output,
                 path: name.clone(),
             },
+            isexec: out.isexec.unwrap_or(false),
             extra_fields: file.extra_fields().chain(out.extra_fields()).collect(),
         })
     }
@@ -406,6 +410,7 @@ impl DvcPointer {
         let ParsedDvcFile {
             pointer,
             extra_fields,
+            ..
         } = ParsedDvcFile::parse(text)?;
         anyhow::ensure!(
             extra_fields.is_empty(),
@@ -427,11 +432,22 @@ impl DvcPointer {
     /// downloaded, etag/version_id-only cloud outputs, and a `wdir:` that
     /// moves the output. For reading only: [`Self::to_yaml`] would drop the
     /// extra fields.
-    pub fn load_lenient(path: &Path) -> Result<Self> {
+    pub fn load_lenient(path: &Path) -> Result<LenientPointer> {
         ParsedDvcFile::parse(&read_dvc_file(path)?)
-            .map(|parsed| parsed.pointer)
+            .map(|parsed| LenientPointer {
+                pointer: parsed.pointer,
+                isexec: parsed.isexec,
+            })
             .with_context(|| format!("failed to parse {}", path.display()))
     }
+}
+
+/// What [`DvcPointer::load_lenient`] reads.
+#[derive(Debug)]
+pub struct LenientPointer {
+    pub pointer: DvcPointer,
+    /// DVC's `isexec: true`: the output is a file DVC restores executable.
+    pub isexec: bool,
 }
 
 fn read_dvc_file(path: &Path) -> Result<String> {
@@ -571,9 +587,10 @@ mod tests {
             ),
         ] {
             let at = Path::new(STAGE_FIELDS).join(name);
-            let pointer = DvcPointer::load_lenient(&at).unwrap();
-            assert_eq!(pointer.output, output, "{name}");
-            assert_eq!(pointer.path, path, "{name}");
+            let read = DvcPointer::load_lenient(&at).unwrap();
+            assert_eq!(read.pointer.output, output, "{name}");
+            assert_eq!(read.pointer.path, path, "{name}");
+            assert_eq!(read.isexec, name == "run.sh.dvc", "{name}");
             let err = format!("{:#}", DvcPointer::load(&at).unwrap_err());
             assert!(
                 err.ends_with(&format!("bigstore does not write: {extras}")),

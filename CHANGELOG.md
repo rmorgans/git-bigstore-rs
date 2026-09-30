@@ -87,6 +87,10 @@
   saying why (`cache: false`, not yet downloaded, etag/version_id only), as
   is a `wdir:` other than `.`. `folder push` still refuses to overwrite such
   a file, now naming the fields it would drop.
+- `ref` of a `.dvc` with `isexec: true` (DVC's mark for an executable
+  file) wrote the file without its execute bit. On unix it is now written
+  0777 minus umask, as git checks out an executable; DVC's `.dir`
+  manifests record no modes, so `import-dvc-dir` is unchanged.
 - On Windows, `import-dvc-dir`, `folder pull` and every other path bigstore
   writes refuse names Windows cannot create before writing anything, naming
   the path: device names (`CON`, `nul.txt`, `com1.log`, `con .txt`,
