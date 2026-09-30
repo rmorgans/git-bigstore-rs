@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
 use object_store::ObjectStoreExt;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -104,20 +103,17 @@ where
     F: Fn(&'a Object) -> Fut,
     Fut: Future<Output = Result<Outcome>> + 'a,
 {
-    let pb = progress_bar(objects.len() as u64);
+    let progress = Progress::new(objects.len());
     let results: Vec<(&Object, Result<Outcome>)> = stream::iter(objects)
         .map(|obj| {
             let fut = op(obj);
             async move { (obj, fut.await) }
         })
         .buffer_unordered(jobs)
-        .inspect(|(obj, _)| {
-            pb.set_message(obj.paths[0].to_string());
-            pb.inc(1);
-        })
+        .inspect(|(obj, _)| progress.advance(&obj.paths[0]))
         .collect()
         .await;
-    pb.finish_and_clear();
+    progress.finish();
 
     let mut report = Report {
         direction,
@@ -540,12 +536,45 @@ fn write_journal<'a>(journal: &Path, paths: impl Iterator<Item = &'a RepoPath>) 
     Ok(())
 }
 
-fn progress_bar(total: u64) -> ProgressBar {
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} [{bar:30.cyan/blue}] {pos}/{len} {msg}")
+/// A bar on stderr counting finished objects, with the `progress` feature;
+/// nothing without it.
+#[cfg(feature = "progress")]
+struct Progress(indicatif::ProgressBar);
+
+#[cfg(feature = "progress")]
+impl Progress {
+    fn new(total: usize) -> Self {
+        let pb = indicatif::ProgressBar::new(total as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{spinner:.green} [{bar:30.cyan/blue}] {pos}/{len} {msg}",
+            )
             .expect("progress template is valid")
             .progress_chars("#>-"),
-    );
-    pb
+        );
+        Self(pb)
+    }
+
+    fn advance(&self, path: &RepoPath) {
+        self.0.set_message(path.to_string());
+        self.0.inc(1);
+    }
+
+    fn finish(self) {
+        self.0.finish_and_clear();
+    }
+}
+
+#[cfg(not(feature = "progress"))]
+struct Progress;
+
+#[cfg(not(feature = "progress"))]
+impl Progress {
+    fn new(_total: usize) -> Self {
+        Self
+    }
+
+    fn advance(&self, _path: &RepoPath) {}
+
+    fn finish(self) {}
 }

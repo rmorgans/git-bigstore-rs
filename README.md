@@ -30,6 +30,37 @@ cargo install --path .
 The binary is called `git-bigstore`. Git discovers it automatically as a
 subcommand (`git bigstore ...`).
 
+### Cargo features
+
+The defaults build the binary with everything. A library user (the crate is
+`bigstore`) turns them off with `default-features = false` and picks what it
+needs:
+
+| Feature | Default | Enables |
+|---------|---------|---------|
+| `cli` | yes | The `git-bigstore` binary (clap, tracing-subscriber) and everything below |
+| `progress` | via `cli` | Progress bars on stderr during `bigstore::transfer` push and pull |
+| `gcp` | via `cli` | `gs://` remotes (Google Cloud Storage) |
+| `azure` | via `cli` | `az://` remotes (Azure Blob Storage) |
+| `aws-lc-rs` | via `cli` | aws-lc-rs as the crypto for TLS and request signing |
+| `ring` | no | ring as the crypto for TLS and request signing |
+
+`s3://` (and R2, Tigris), `local://` and `rclone://` are always built in. A
+URL whose backend is left out fails with an error naming the feature.
+
+Cloud remotes (`s3://`, `gs://`, `az://`) need one crypto provider:
+`aws-lc-rs` or `ring`. With neither they fail with an error, and only
+`local://` and `rclone://` work. With both, aws-lc-rs is used. An application
+already built on ring (the folder-mode library, S3 only):
+
+```toml
+bigstore = { package = "git-bigstore-rs", git = "…", rev = "…", default-features = false, features = ["ring"] }
+```
+
+With `ring`, bigstore installs ring as the process's default rustls
+`CryptoProvider` when it builds its first cloud client, unless the
+application installed one already.
+
 ## Quick start
 
 ```bash
@@ -468,7 +499,9 @@ add` gives the same `.dir` md5 as `folder push` (CI checks this).
 Do not run `dvc gc --cloud` against this remote: DVC only knows the latest
 `.dvc` files, and would delete the objects of older versions.
 
-As a library (`default-features = false` drops the CLI's dependencies):
+As a library (`default-features = false, features = ["ring"]` or
+`["aws-lc-rs"]` drops the CLI's dependencies and keeps S3; see
+[Cargo features](#cargo-features)):
 
 ```rust
 use bigstore::folder::{self, Credentials, Excludes, HistoryKey, PushOptions, Remote, RemoteConfig};
