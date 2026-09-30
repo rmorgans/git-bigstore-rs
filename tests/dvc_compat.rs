@@ -6,9 +6,10 @@
 //! DVC runs with its global/system/site config redirected into the test's
 //! temp dir, so it never reads or writes the user's DVC cache or config.
 
+use bigstore::dvc::DvcPointer;
 use bigstore::folder::{
-    self, Credentials, HistoryKey, Overwrite, PointerSource, PullOptions, PushOptions, Remote,
-    RemoteConfig,
+    self, Credentials, Excludes, HistoryKey, Overwrite, PointerSource, PullOptions, PushOptions,
+    Remote, RemoteConfig, DEFAULT_EXCLUDES,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -93,7 +94,6 @@ fn populate(out: &Path) {
         ("crlf.txt", b"a\r\nb\r\n"),
         ("with space.json", b"{}"),
         ("~tilde.txt", b"t"),
-        (".DS_Store", b"x"),
     ] {
         write(&out.join(rel), content);
     }
@@ -123,6 +123,7 @@ fn dvc_pulls_and_verifies_what_bigstore_pushed() {
         &PushOptions {
             history: HistoryKey::new("ds/host=xenoglossicist").unwrap(),
             jobs: 4,
+            exclude: Excludes::default(),
         },
     )
     .unwrap();
@@ -196,6 +197,7 @@ fn bigstore_pulls_what_dvc_pushed_and_repushes_identically() {
         &PushOptions {
             history: HistoryKey::new("ds/views").unwrap(),
             jobs: 4,
+            exclude: Excludes::default(),
         },
     )
     .unwrap();
@@ -206,4 +208,63 @@ fn bigstore_pulls_what_dvc_pushed_and_repushes_identically() {
     );
     // Only the history record is new.
     assert_eq!(tree(&store).len(), before + 1);
+}
+
+/// The README's recipe: with [`DEFAULT_EXCLUDES`] (and any custom patterns,
+/// anchored ones prefixed with the output's path) in the project's
+/// `.dvcignore`, `dvc add` records exactly the manifest bigstore pushes.
+#[test]
+#[ignore = "needs a pinned DVC (dvc-compat CI job)"]
+fn dvc_add_with_the_documented_dvcignore_matches_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dvc = Dvc::new(tmp.path());
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    dvc.run(&project, &["init", "--no-scm", "-q"]);
+    let views = project.join("views");
+    populate(&views);
+    for junk in [
+        ".DS_Store",
+        "a/.DS_Store",
+        "._a.txt",
+        "a/b/._c.txt",
+        "Thumbs.db",
+        "site=s1/desktop.ini",
+        "x.tmp",
+        "a/y.tmp",
+        "cache/big.bin",
+        "scratch/s.bin",
+        "a/scratch/s.bin",
+    ] {
+        write(&views.join(junk), junk.as_bytes());
+    }
+    // Not excluded: `/cache` is anchored to the output, `scratch/` matches
+    // directories only.
+    write(&views.join("a/cache/kept.bin"), b"kept");
+    write(&views.join("b/scratch"), b"a file");
+
+    let mut ignore = std::fs::read_to_string(project.join(".dvcignore")).unwrap();
+    for line in DEFAULT_EXCLUDES
+        .iter()
+        .chain(&["*.tmp", "/views/cache", "scratch/"])
+    {
+        ignore.push_str(line);
+        ignore.push('\n');
+    }
+    std::fs::write(project.join(".dvcignore"), ignore).unwrap();
+    dvc.run(&project, &["add", "-q", "views"]);
+    let by_dvc = DvcPointer::load(&project.join("views.dvc")).unwrap();
+
+    let report = folder::push(
+        &local_remote(&tmp.path().join("remote")),
+        &views,
+        &PushOptions {
+            history: HistoryKey::new("ds/views").unwrap(),
+            jobs: 4,
+            exclude: Excludes::new(["*.tmp", "/cache", "scratch/"]).unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(report.pointer, by_dvc);
+    assert_eq!(report.files, 13, "populate's 11 files and the 2 kept");
 }

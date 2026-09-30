@@ -162,6 +162,11 @@ enum FolderCommand {
         remote: RemoteArgs,
         #[arg(short, long)]
         jobs: Option<NonZeroUsize>,
+        /// Also skip entries matching this .gitignore-style pattern, relative
+        /// to the directory (repeatable). .DS_Store, ._*, Thumbs.db and
+        /// desktop.ini are always skipped.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
     },
     /// Restore from a .dvc file, or from history with --history
     Pull {
@@ -694,6 +699,7 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
             history,
             remote,
             jobs,
+            exclude,
         } => {
             let remote = open_folder_remote(&remote)?;
             let r = folder::push(
@@ -702,6 +708,7 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                 &folder::PushOptions {
                     history: HistoryKey::new(&history)?,
                     jobs: resolve_jobs(jobs)?.get(),
+                    exclude: folder::Excludes::new(&exclude)?,
                 },
             )?;
             for w in &r.warnings {

@@ -26,6 +26,7 @@ use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath, PortableRelPath};
 pub use error::{Error, Refusal};
+pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
 use snapshot::{Snapshot, SnapshotError};
 use walk::WalkError;
@@ -273,6 +274,9 @@ pub struct PushOptions {
     pub history: HistoryKey,
     /// Concurrent uploads (at least 1).
     pub jobs: usize,
+    /// Entries of a directory output to skip; always includes
+    /// [`DEFAULT_EXCLUDES`]. Not applied to a single-file output.
+    pub exclude: Excludes,
 }
 
 #[derive(Debug)]
@@ -319,7 +323,7 @@ async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Resul
     let mut last_change = String::new();
     for _ in 0..PUSH_ATTEMPTS {
         let attempt = if meta.is_dir() {
-            snapshot_dir(output, tmp.path())
+            snapshot_dir(output, tmp.path(), &opts.exclude)
         } else if meta.is_file() {
             snapshot_file(output, tmp.path())
         } else {
@@ -383,8 +387,8 @@ fn warn_unterminated(relpath: &str, s: &Snapshot, warnings: &mut Vec<String>) {
     }
 }
 
-fn snapshot_dir(dir: &Path, tmp: &Path) -> std::result::Result<Staged, Retry> {
-    let walk = match walk::walk(dir) {
+fn snapshot_dir(dir: &Path, tmp: &Path, excludes: &Excludes) -> std::result::Result<Staged, Retry> {
+    let walk = match walk::walk(dir, excludes) {
         Ok(w) => w,
         Err(WalkError::Changed(m)) => return Err(Retry::Changed(m)),
         Err(e) => return Err(Retry::Fatal(e.into())),

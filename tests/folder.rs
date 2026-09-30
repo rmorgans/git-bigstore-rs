@@ -3,8 +3,8 @@
 
 use bigstore::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use bigstore::folder::{
-    self, Credentials, Error as FolderError, HistoryKey, Overwrite, PointerSource, PullOptions,
-    PushOptions, Refusal, Remote, RemoteConfig, Selector,
+    self, Credentials, Error as FolderError, Excludes, HistoryKey, Overwrite, PointerSource,
+    PullOptions, PushOptions, Refusal, Remote, RemoteConfig, Selector,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
@@ -63,6 +63,7 @@ fn opts(key: &str) -> PushOptions {
     PushOptions {
         history: HistoryKey::new(key).unwrap(),
         jobs: 4,
+        exclude: Excludes::default(),
     }
 }
 
@@ -1360,4 +1361,83 @@ fn an_output_that_never_stops_changing_is_typed() {
     );
     assert!(!e.data.join("growing.bin.dvc").exists());
     assert!(remote_keys(&e.store).is_empty());
+}
+
+/// Finder writes `.DS_Store` just by showing a folder, and Explorer and
+/// non-Mac volumes add their own files. None of it is data: a push after
+/// they appear is a no-op.
+#[test]
+fn os_junk_appearing_is_not_a_new_version() {
+    let e = env();
+    let w = writer_dir(&e);
+    let first = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let pointer = std::fs::read(&first.pointer_path).unwrap();
+    for junk in [
+        ".DS_Store",
+        "site=s1/.DS_Store",
+        "site=s1/date=2026-09-02/src_02/._labels.jsonl",
+        "Thumbs.db",
+        "site=s1/desktop.ini",
+    ] {
+        write(&w.join(junk), b"junk");
+    }
+    let again = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    assert_eq!(again.pointer.output, first.pointer.output);
+    assert_eq!((again.files, again.uploaded), (first.files, 0));
+    assert!(again.history_record.is_none(), "junk made a new version");
+    assert_eq!(std::fs::read(&again.pointer_path).unwrap(), pointer);
+    let versions = folder::log(&e.remote, &HistoryKey::new(KEY).unwrap()).unwrap();
+    assert_eq!(versions.len(), 1);
+}
+
+#[test]
+fn custom_excludes_follow_gitignore_rules_relative_to_the_output() {
+    let e = env();
+    let out = e.data.join("out");
+    for rel in [
+        "keep.txt",
+        "x.tmp",
+        "a/y.tmp",
+        "cache/big.bin",
+        "a/cache/kept.bin",
+        "scratch/s.bin",
+        "a/scratch/s.bin",
+        "a/b/only.log",
+        "b/scratch",
+    ] {
+        write(&out.join(rel), rel.as_bytes());
+    }
+    let report = folder::push(
+        &e.remote,
+        &out,
+        &PushOptions {
+            exclude: Excludes::new(["*.tmp", "/cache", "scratch/", "a/b/*.log"]).unwrap(),
+            ..opts("ds/out")
+        },
+    )
+    .unwrap();
+    let restore = e.data.parent().unwrap().join("restore");
+    folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path),
+        &pull_opts(Some(restore.clone())),
+    )
+    .unwrap();
+    let kept: Vec<String> = tree(&restore).into_iter().map(|(k, _)| k).collect();
+    // `/cache` is anchored to the output; `scratch/` matches directories
+    // only, at any depth.
+    assert_eq!(kept, ["a/cache/kept.bin", "b/scratch", "keep.txt"]);
+    // `a/b` held only an excluded file, so DVC would see it empty too.
+    assert_eq!(report.empty_dirs, 1);
+}
+
+#[test]
+fn an_invalid_exclude_pattern_is_typed() {
+    for bad in ["!keep.txt", "a[", "/", ""] {
+        let err = Excludes::new([bad]).unwrap_err();
+        assert!(
+            matches!(folder_error(&err), FolderError::InvalidExclude { pattern } if pattern == bad),
+            "{bad:?}: {err:#}"
+        );
+    }
 }

@@ -429,6 +429,31 @@ What it guarantees:
   differ only by case are refused everywhere.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
+- **Skips OS junk.** `.DS_Store` (Finder writes one just by showing a
+  folder), `._*` (AppleDouble files macOS writes beside files on FAT,
+  exFAT and network volumes), `Thumbs.db` and `desktop.ini` are never backed
+  up, at any depth, so opening a folder never makes a new version. Add more
+  with `--exclude PATTERN` (repeatable; `PushOptions::exclude` in the
+  library), using `.gitignore` rules relative to the pushed directory: `*.tmp`
+  matches at any depth, `/cache` only at the top, `scratch/` only
+  directories; `!` is not supported. A directory holding only skipped files
+  counts as empty. Pull is unaffected: it never deletes local files.
+
+Push records exactly what DVC 3 would, so if you also run `dvc add` on the
+same folder, DVC must ignore the same files. Add these lines to the DVC
+project's `.dvcignore`:
+
+```gitignore
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+```
+
+plus any `--exclude` patterns: unanchored ones (`*.tmp`, `scratch/`) as they
+are, and anchored ones prefixed with the folder's path from the project root
+(`--exclude /cache` on `data/views` is `/data/views/cache`). With that, `dvc
+add` gives the same `.dir` md5 as `folder push` (CI checks this).
 
 Do not run `dvc gc --cloud` against this remote: DVC only knows the latest
 `.dvc` files, and would delete the objects of older versions.
@@ -436,7 +461,7 @@ Do not run `dvc gc --cloud` against this remote: DVC only knows the latest
 As a library (`default-features = false` drops the CLI's dependencies):
 
 ```rust
-use bigstore::folder::{self, Credentials, HistoryKey, PushOptions, Remote, RemoteConfig};
+use bigstore::folder::{self, Credentials, Excludes, HistoryKey, PushOptions, Remote, RemoteConfig};
 
 let remote = Remote::open(&RemoteConfig {
     url: "s3://my-bucket/dvc".into(),
@@ -447,6 +472,7 @@ let remote = Remote::open(&RemoteConfig {
 let report = folder::push(&remote, dir, &PushOptions {
     history: HistoryKey::new("ST032/Beatons/annotations/reviewer=rick/host=mac")?,
     jobs: 8,
+    exclude: Excludes::default(), // or Excludes::new(["*.tmp", "/cache/"])?
 })?;
 ```
 
@@ -469,6 +495,7 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `InvalidVersionId { prefix }`, `InvalidTime { time }` | a `Selector::Id` that is not 8+ hex characters; a `Selector::AtOrBefore` that is not RFC 3339 |
 | `EndpointRequired` | an `s3://` remote without an endpoint |
 | `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
+| `InvalidExclude { pattern }` | an exclude pattern that does not compile (or uses `!`) |
 
 | `folder::Refusal` | Refused by | `path` is |
 | --- | --- | --- |

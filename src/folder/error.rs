@@ -52,6 +52,10 @@ pub enum Error {
     /// An `s3://` remote without an endpoint: folder mode never defaults to
     /// AWS.
     EndpointRequired,
+    /// An exclude pattern that cannot be compiled (see
+    /// [`Excludes`](super::Excludes)). The reason is the next error in the
+    /// chain.
+    InvalidExclude { pattern: String },
     /// A remote URL folder mode does not support (only `s3://`, `local://`
     /// and `rclone://`).
     UnsupportedRemote { url: String },
@@ -161,6 +165,7 @@ impl fmt::Display for Error {
                 "S3 remote needs an endpoint (e.g. https://s3.ap-southeast-2.wasabisys.com); \
                  folder mode never defaults to AWS",
             ),
+            Self::InvalidExclude { pattern } => write!(f, "invalid exclude pattern {pattern:?}"),
             Self::UnsupportedRemote { url } => write!(
                 f,
                 "folder mode supports s3://, local:// and rclone:// remotes, not {url}"

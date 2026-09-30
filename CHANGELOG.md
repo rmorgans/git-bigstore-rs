@@ -58,6 +58,13 @@
   versions reject the `%f` now on the clean command); otherwise every
   checkout, `git add` and `git status` of a tracked file fails (nothing is
   corrupted).
+- **`folder push` skips OS junk**: `.DS_Store`, `._*` (AppleDouble),
+  `Thumbs.db` and `desktop.ini`, at any depth. Finder writes `.DS_Store` just
+  by showing a folder, which made the next push a new manifest and history
+  record. `--exclude PATTERN` (`PushOptions::exclude`, `folder::Excludes`)
+  skips more, with `.gitignore` rules relative to the pushed directory.
+  Anyone also running `dvc add` on the folder needs the same patterns in
+  `.dvcignore`; the README gives the lines.
 
 ### Fixed
 
