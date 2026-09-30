@@ -433,6 +433,10 @@ git bigstore folder push ds/store.toml --history ST032/Beatons/store.toml --remo
 # Every version ever pushed, oldest first.
 git bigstore folder log ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
 
+# Every history key, or those under a prefix (whole path components):
+# here, every reviewer and host that pushed annotations.
+git bigstore folder keys ST032/Beatons/annotations --remote $R
+
 # Restore: from a .dvc file, or any version from history.
 git bigstore folder pull ds/store.toml.dvc --remote $R
 git bigstore folder pull --history ST032/Beatons/annotations/reviewer=rick/host=mac \
@@ -519,6 +523,20 @@ let report = folder::push(&remote, dir, &PushOptions {
     jobs: 8,
     exclude: Excludes::default(), // or Excludes::new(["*.tmp", "/cache/"])?
 })?;
+```
+
+History, from the library:
+
+```rust
+// Other writers' outputs, without holding any pointer: every key equal to
+// or below the prefix (`None` lists all). One listing, no record fetched.
+let under = HistoryKey::new("ST032/Beatons/annotations")?;
+for key in folder::keys(&remote, Some(&under))? {
+    // Every version of it, oldest first, records fetched 8 at a time.
+    for v in folder::log(&remote, &key, 8)? {
+        println!("{}  {}  {}", key.as_str(), v.time, v.id());
+    }
+}
 ```
 
 The functions block and run their own tokio runtime. Calling them from inside

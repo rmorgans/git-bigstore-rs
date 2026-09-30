@@ -42,6 +42,11 @@
   (`default-features = false, features = ["ring"]`) no longer builds
   aws-lc-rs. With neither, cloud URLs fail with an error naming both
   features; `local://` and `rclone://` still work.
+- `folder::keys(&remote, under)` and `git bigstore folder keys [PREFIX]` list
+  the history keys on a remote (all, or those equal to or below a prefix, by
+  whole path components), so a host can find other writers' outputs without
+  a pointer. One listing; nested keys (`k` and `k/sub`) are both reported and
+  objects that are not records are ignored.
 
 ### Security
 

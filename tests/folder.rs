@@ -1468,3 +1468,65 @@ fn a_record_whose_name_and_pointer_disagree_is_refused() {
     let err = folder::log(&e.remote, &HistoryKey::new("k").unwrap(), 4).unwrap_err();
     assert!(format!("{err:#}").contains(&named), "{err:#}");
 }
+
+#[test]
+fn keys_lists_every_history_key_under_a_prefix() {
+    let e = env();
+    let md5 = |c: char| c.to_string().repeat(32);
+    let time = "20260901T000000.000000000Z";
+    for (key, c) in [
+        ("s/annotations/reviewer=rick/host=a", 'a'),
+        ("s/annotations/reviewer=rick/host=a/sub", 'b'),
+        ("s/annotations/reviewer=ann/host=b", 'c'),
+        ("s/annotations/reviewer=rickard/host=c", 'd'),
+        ("t/store.toml", 'e'),
+    ] {
+        write_record(&e, key, time, &md5(c));
+    }
+    // Not records: no key is made of them.
+    write(&e.store.join("bigstore-history/s/README.txt"), b"notes");
+    write(
+        &e.store.join("bigstore-history/s/stray/not-a-time.dvc"),
+        b"x",
+    );
+    write(
+        &e.store
+            .join(format!("bigstore-history/{time}-{}.dvc", md5('f'))),
+        b"x",
+    );
+
+    let keys = |prefix: Option<&str>| -> Vec<String> {
+        let prefix = prefix.map(|p| HistoryKey::new(p).unwrap());
+        folder::keys(&e.remote, prefix.as_ref())
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect()
+    };
+    assert_eq!(
+        keys(None),
+        [
+            "s/annotations/reviewer=ann/host=b",
+            "s/annotations/reviewer=rick/host=a",
+            "s/annotations/reviewer=rick/host=a/sub",
+            "s/annotations/reviewer=rickard/host=c",
+            "t/store.toml",
+        ]
+    );
+    // A prefix matches whole path components.
+    assert_eq!(
+        keys(Some("s/annotations/reviewer=rick")),
+        [
+            "s/annotations/reviewer=rick/host=a",
+            "s/annotations/reviewer=rick/host=a/sub",
+        ]
+    );
+    assert_eq!(
+        keys(Some("s/annotations/reviewer=rick/host=a")),
+        [
+            "s/annotations/reviewer=rick/host=a",
+            "s/annotations/reviewer=rick/host=a/sub",
+        ]
+    );
+    assert!(keys(Some("nothing/here")).is_empty());
+}

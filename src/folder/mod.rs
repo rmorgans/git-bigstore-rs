@@ -27,7 +27,7 @@ use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath};
 pub use error::{Error, Refusal};
-pub use history::{log, HistoryKey, HistoryRecord, Selector};
+pub use history::{keys, log, HistoryKey, HistoryRecord, Selector};
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
 use snapshot::{Snapshot, SnapshotError};

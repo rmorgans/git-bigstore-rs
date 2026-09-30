@@ -19,7 +19,7 @@ const RECORD_TIME: &str = "%Y%m%dT%H%M%S%.9fZ";
 
 /// Identifies an output across hosts and time, e.g.
 /// `ST032_Warrawoona/BeatonsCreek_dataset1_September2026/annotations/reviewer=rick/host=xenoglossicist`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HistoryKey(PortableRelPath);
 
 impl HistoryKey {
@@ -153,6 +153,29 @@ async fn fetch_all<'a>(
 /// record fetched, `jobs` at a time.
 pub fn log(remote: &Remote, key: &HistoryKey, jobs: usize) -> Result<Vec<HistoryRecord>> {
     block_on(async { fetch_all(remote, &list(remote, key).await?, jobs).await })?
+}
+
+/// Every history key holding at least one version, sorted: all of them, or
+/// `under` and the keys below it (`a/b` matches `a/b` and `a/b/c`, not
+/// `a/bc`). One listing; no record is fetched. Objects that are not records
+/// are ignored.
+pub fn keys(remote: &Remote, under: Option<&HistoryKey>) -> Result<Vec<HistoryKey>> {
+    let root = remote.key("bigstore-history/");
+    let prefix = match under {
+        Some(key) => history_prefix(remote, key),
+        None => root.clone(),
+    };
+    let mut keys: Vec<HistoryKey> = block_on(backend::list(&remote.backend, &prefix))??
+        .iter()
+        .filter_map(|object| {
+            let (key, name) = object.strip_prefix(&root)?.rsplit_once('/')?;
+            parse_record_name(name)?;
+            HistoryKey::new(key).ok()
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 /// A [`Selector`] checked before anything is listed.

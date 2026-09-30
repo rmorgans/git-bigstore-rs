@@ -197,6 +197,13 @@ enum FolderCommand {
         #[arg(short, long)]
         jobs: Option<NonZeroUsize>,
     },
+    /// List the history keys on the remote, optionally only those under PREFIX
+    Keys {
+        /// Only keys equal to or below this one, e.g. <survey>/<dataset>/annotations
+        prefix: Option<String>,
+        #[command(flatten)]
+        remote: RemoteArgs,
+    },
 }
 
 fn main() -> Result<()> {
@@ -794,6 +801,13 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                     r.time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     r.id()
                 );
+            }
+        }
+        FolderCommand::Keys { prefix, remote } => {
+            let remote = open_folder_remote(&remote)?;
+            let prefix = prefix.as_deref().map(HistoryKey::new).transpose()?;
+            for key in folder::keys(&remote, prefix.as_ref())? {
+                println!("{}", key.as_str());
             }
         }
     }
