@@ -154,6 +154,9 @@
   closing the `git cat-file` helper waited for it to exit while it was still
   blocked writing the rest of a blob over 64 KiB. Its output pipe is now closed
   first, so it exits.
+- A malformed packet inside a file's content no longer lets the filter
+  process answer `status=error` and carry on, reading payload bytes as packet
+  headers. It now exits with the error, and git starts a fresh filter.
 
 ### Changed
 

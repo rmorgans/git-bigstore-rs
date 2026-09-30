@@ -766,4 +766,22 @@ mod tests {
             [Reply::Rejected, Reply::Success(ptr.encode())]
         );
     }
+
+    /// A framing error is not a per-file failure: past it, payload bytes
+    /// could pass for packets, so no reply is safe.
+    #[test]
+    fn a_framing_error_inside_content_ends_the_process_without_a_reply() {
+        let mut f = fixture();
+        let mut input = git_handshake();
+        input.extend(list(&["command=clean", "pathname=a.bin"]));
+        // Past the pointer-sized head, then a bad header, then bytes that
+        // read as a flush if the reader resynchronised on them.
+        input.extend(pkt(&[b'a'; 4000]));
+        input.extend(b"zzzz0000");
+        input.extend(request("smudge", "b.bin", b"plain"));
+        let (result, out) = serve_bytes(&mut f.handler, input);
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("zzzz"), "{err:#}");
+        assert_eq!(out, REPLY);
+    }
 }

@@ -106,7 +106,7 @@ impl<R: Read> PktReader<R> {
             reader: self,
             pos: 0,
             len: 0,
-            done: false,
+            state: State::Reading,
         }
     }
 
@@ -161,12 +161,22 @@ fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 /// The payload of data packets up to a flush, as a [`Read`] stream that
-/// returns 0 at the flush. Framing errors surface as `InvalidData`.
+/// returns 0 at the flush. Framing errors surface as `InvalidData`, and
+/// every read after an error fails the same way: past a bad packet, payload
+/// bytes could pass for headers, so the stream never resynchronises.
 pub struct Content<'r, R> {
     reader: &'r mut PktReader<R>,
     pos: usize,
     len: usize,
-    done: bool,
+    state: State,
+}
+
+enum State {
+    Reading,
+    /// The flush was read.
+    Done,
+    /// Reading failed; `io::Error` is not `Clone`, so its parts are kept.
+    Failed(io::ErrorKind, String),
 }
 
 impl<R: Read> Content<'_, R> {
@@ -175,27 +185,45 @@ impl<R: Read> Content<'_, R> {
     pub fn drain(&mut self) -> io::Result<()> {
         io::copy(self, &mut io::sink()).map(drop)
     }
+
+    /// The next frame, or the error that ends this content for good.
+    fn next_frame(&mut self) -> io::Result<Frame> {
+        let failure = match self.reader.read_packet() {
+            Ok(Some(frame)) => return Ok(frame),
+            Ok(None) => PktError::Truncated,
+            Err(e) => e,
+        };
+        let err = io::Error::from(failure);
+        self.state = State::Failed(err.kind(), err.to_string());
+        Err(err)
+    }
 }
 
 impl<R: Read> Read for Content<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        while !self.done && !out.is_empty() {
+        loop {
+            match &self.state {
+                State::Reading => {}
+                State::Done => return Ok(0),
+                State::Failed(kind, message) => return Err(io::Error::new(*kind, message.clone())),
+            }
+            if out.is_empty() {
+                return Ok(0);
+            }
             if self.pos < self.len {
                 let n = out.len().min(self.len - self.pos);
                 out[..n].copy_from_slice(&self.reader.buf[self.pos..self.pos + n]);
                 self.pos += n;
                 return Ok(n);
             }
-            match self.reader.read_packet()? {
-                None => return Err(PktError::Truncated.into()),
-                Some(Frame::Flush) => self.done = true,
-                Some(Frame::Data) => {
+            match self.next_frame()? {
+                Frame::Flush => self.state = State::Done,
+                Frame::Data => {
                     self.pos = 0;
                     self.len = self.reader.buf.len();
                 }
             }
         }
-        Ok(0)
     }
 }
 
