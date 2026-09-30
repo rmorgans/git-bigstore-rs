@@ -106,12 +106,15 @@ impl Manifest {
     }
 
     /// Parse manifest bytes read from a local DVC cache, where the file name
-    /// is the id but DVC may have stored it in a different formatting.
+    /// is the id but DVC may have stored it in a different formatting. An
+    /// entry marked executable is refused as [`ExecutableEntry`].
     pub fn parse_unverified(raw: &[u8]) -> Result<Self> {
         #[derive(Deserialize)]
         struct RawEntry {
             md5: String,
             relpath: String,
+            #[serde(default)]
+            isexec: bool,
         }
         let raw: Vec<RawEntry> =
             serde_json::from_slice(raw).context("manifest is not a JSON list")?;
@@ -120,6 +123,9 @@ impl Manifest {
             .map(|e| {
                 let relpath = ManifestPath::new(&e.relpath)
                     .context("manifest relpath must be a relative path inside the directory")?;
+                if e.isexec {
+                    return Err(ExecutableEntry(relpath).into());
+                }
                 let md5 =
                     md5(&e.md5).with_context(|| format!("invalid md5 for {:?}", e.relpath))?;
                 Ok(ManifestEntry { relpath, md5 })
@@ -128,6 +134,26 @@ impl Manifest {
         Self::from_entries(entries)
     }
 }
+
+/// A `.dir` manifest entry DVC marked executable (`"isexec": true`). Only
+/// manifests hashed with per-file metadata have one (`dvc add` writes
+/// none). Nothing that reads a manifest restores modes, so parsing refuses
+/// the entry rather than drop the mark.
+#[derive(Debug)]
+pub struct ExecutableEntry(pub ManifestPath);
+
+impl std::fmt::Display for ExecutableEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "manifest marks {:?} executable (`isexec`), a mode bigstore does not restore \
+             from a directory manifest",
+            self.0.as_str()
+        )
+    }
+}
+
+impl std::error::Error for ExecutableEntry {}
 
 /// CPython `json.dumps` string escaping with `ensure_ascii=True`.
 fn json_escape_ascii(out: &mut String, s: &str) {
@@ -243,10 +269,12 @@ struct DvcFileOut {
     etag: Option<IgnoredAny>,
     checksum: Option<IgnoredAny>,
     version_id: Option<IgnoredAny>,
+    /// DVC's mark for an executable file output (it checks the file out
+    /// with the execute bit set).
+    isexec: Option<bool>,
     // Neither changes which bytes the output holds nor where DVC caches
-    // them: the file mode, pipeline and push settings, annotations, and the
-    // per-remote ids of a cloud-versioned remote.
-    isexec: Option<IgnoredAny>,
+    // them: pipeline and push settings, annotations, and the per-remote ids
+    // of a cloud-versioned remote.
     persist: Option<IgnoredAny>,
     remote: Option<IgnoredAny>,
     push: Option<IgnoredAny>,
@@ -297,10 +325,11 @@ impl DvcFileOut {
     }
 }
 
-/// A `.dvc` file's output, and the fields it has that
-/// [`DvcPointer::to_yaml`] would not write back.
+/// A `.dvc` file's output, whether DVC marked it executable, and the fields
+/// it has that [`DvcPointer::to_yaml`] would not write back.
 struct ParsedDvcFile {
     pointer: DvcPointer,
+    isexec: bool,
     extra_fields: Vec<&'static str>,
 }
 
@@ -370,6 +399,7 @@ impl ParsedDvcFile {
                 output,
                 path: name.clone(),
             },
+            isexec: out.isexec.unwrap_or(false),
             extra_fields: file.extra_fields().chain(out.extra_fields()).collect(),
         })
     }
@@ -406,6 +436,7 @@ impl DvcPointer {
         let ParsedDvcFile {
             pointer,
             extra_fields,
+            ..
         } = ParsedDvcFile::parse(text)?;
         anyhow::ensure!(
             extra_fields.is_empty(),
@@ -427,11 +458,22 @@ impl DvcPointer {
     /// downloaded, etag/version_id-only cloud outputs, and a `wdir:` that
     /// moves the output. For reading only: [`Self::to_yaml`] would drop the
     /// extra fields.
-    pub fn load_lenient(path: &Path) -> Result<Self> {
+    pub fn load_lenient(path: &Path) -> Result<LenientPointer> {
         ParsedDvcFile::parse(&read_dvc_file(path)?)
-            .map(|parsed| parsed.pointer)
+            .map(|parsed| LenientPointer {
+                pointer: parsed.pointer,
+                isexec: parsed.isexec,
+            })
             .with_context(|| format!("failed to parse {}", path.display()))
     }
+}
+
+/// What [`DvcPointer::load_lenient`] reads.
+#[derive(Debug)]
+pub struct LenientPointer {
+    pub pointer: DvcPointer,
+    /// DVC's `isexec: true`: the output is a file DVC restores executable.
+    pub isexec: bool,
 }
 
 fn read_dvc_file(path: &Path) -> Result<String> {
@@ -571,9 +613,10 @@ mod tests {
             ),
         ] {
             let at = Path::new(STAGE_FIELDS).join(name);
-            let pointer = DvcPointer::load_lenient(&at).unwrap();
-            assert_eq!(pointer.output, output, "{name}");
-            assert_eq!(pointer.path, path, "{name}");
+            let read = DvcPointer::load_lenient(&at).unwrap();
+            assert_eq!(read.pointer.output, output, "{name}");
+            assert_eq!(read.pointer.path, path, "{name}");
+            assert_eq!(read.isexec, name == "run.sh.dvc", "{name}");
             let err = format!("{:#}", DvcPointer::load(&at).unwrap_err());
             assert!(
                 err.ends_with(&format!("bigstore does not write: {extras}")),

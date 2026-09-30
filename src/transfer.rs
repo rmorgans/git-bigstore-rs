@@ -231,7 +231,7 @@ async fn download_to_cache(remote: &Remote<'_>, key: &str, expected: &Hexdigest)
     cache::ensure_cache_dir(remote.git_dir)?;
     let tmp = tempfile::NamedTempFile::new_in(cache::cache_dir(remote.git_dir))?;
 
-    let actual = match remote.store {
+    let (tmp, actual) = match remote.store {
         Backend::ObjectStore(store) => {
             let mut file = tokio::fs::File::from_std(tmp.reopen()?);
             let mut stream = store
@@ -245,12 +245,14 @@ async fn download_to_cache(remote: &Remote<'_>, key: &str, expected: &Hexdigest)
                 file.write_all(&chunk).await?;
             }
             file.flush().await?;
-            hasher.finalize()
+            (tmp, hasher.finalize())
         }
-        Backend::Rclone(_) => {
-            backend::download(remote.store, key, tmp.path()).await?;
+        Backend::Rclone(r) => {
+            let tmp = backend::rclone_into(r, key, tmp).await?;
             let (path, hash_fn) = (tmp.path().to_path_buf(), expected.hash_fn());
-            tokio::task::spawn_blocking(move || hash::hash_file(&path, hash_fn)).await??
+            let actual =
+                tokio::task::spawn_blocking(move || hash::hash_file(&path, hash_fn)).await??;
+            (tmp, actual)
         }
     };
 

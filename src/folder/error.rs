@@ -25,7 +25,8 @@ pub enum Error {
     /// published (push) or written (pull).
     Refused {
         /// Entries inside a pushed directory, and manifest entries refused by
-        /// pull ([`Refusal::CaseCollision`], [`Refusal::UnwritableName`]),
+        /// pull ([`Refusal::CaseCollision`], [`Refusal::UnwritableName`],
+        /// [`Refusal::ExecutableInDirectory`]),
         /// are relative to the output and `/`-separated. Anything else is the
         /// filesystem path as given or derived from the caller's arguments.
         path: PathBuf,
@@ -59,6 +60,18 @@ pub enum Error {
     /// A remote URL folder mode does not support (only `s3://`, `local://`
     /// and `rclone://`).
     UnsupportedRemote { url: String },
+    /// A [`HistoryKey`](super::HistoryKey) that is not a relative,
+    /// `/`-separated path of portable names. The reason is the next error in
+    /// the chain.
+    InvalidHistoryKey { key: String },
+    /// A pull from history without [`PullOptions::into`](super::PullOptions::into):
+    /// there is no `.dvc` to restore beside.
+    DestinationRequired,
+    /// The caller's [`CancelToken`](super::CancelToken) was cancelled. A
+    /// push published no `.dvc` and no history record (objects already
+    /// uploaded stay: they are content-addressed); a pull left every file
+    /// either as it was or fully restored, never partly written.
+    Cancelled,
 }
 
 /// Why a path was refused.
@@ -102,6 +115,12 @@ pub enum Refusal {
     SpecialFile,
 
     // Pull.
+    /// The `.dvc` file is not a DVC 3 pointer to one md5-addressed output
+    /// (not YAML, several outputs, `cache: false`, an etag-only cloud
+    /// output, a `wdir:`…), so there is nothing to restore. Stage fields
+    /// and annotations are fine. The parse error is the next error in the
+    /// chain.
+    UnrestorablePointer,
     /// The `.dvc` file names an output that is not one file or directory
     /// name on this OS (`..`, an absolute path, `a/b`), so it could restore
     /// outside its own directory.
@@ -120,12 +139,19 @@ pub enum Refusal {
     /// A manifest name this OS would read as a different path (`\` or `:`
     /// on Windows). The next error in the chain says why.
     UnwritableName,
-    /// Two manifest names differ only by ASCII case and would collide on
-    /// macOS and Windows.
+    /// Two manifest names differ only by case (any script, not just ASCII)
+    /// or by Unicode normalization (NFC vs NFD), and would be one file on
+    /// macOS and Windows. Refused on every OS.
     CaseCollision {
         /// The other name.
         other: String,
     },
+    /// DVC marks a file inside a directory output executable (`isexec` on a
+    /// `.dir` manifest entry, which only manifests hashed with per-file
+    /// metadata carry), or the directory output itself in its `.dvc`. Pull
+    /// restores modes only for a single-file output, so it refuses rather
+    /// than drop the mark. `path` is the manifest name, or the `.dvc`.
+    ExecutableInDirectory,
     /// A file appeared at a path while pulling; it was left untouched.
     AppearedWhilePulling,
 }
@@ -170,6 +196,11 @@ impl fmt::Display for Error {
                 f,
                 "folder mode supports s3://, local:// and rclone:// remotes, not {url}"
             ),
+            Self::InvalidHistoryKey { key } => write!(f, "invalid history key {key:?}"),
+            Self::DestinationRequired => {
+                f.write_str("pulling from history needs a destination (`into`)")
+            }
+            Self::Cancelled => f.write_str("cancelled"),
         }
     }
 }
@@ -210,6 +241,10 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
         ),
         Refusal::BrokenSymlink => write!(f, "{p}: broken symlink"),
         Refusal::SpecialFile => write!(f, "{p}: not a regular file"),
+        Refusal::UnrestorablePointer => write!(
+            f,
+            "{p} is not a DVC 3 pointer to one md5-addressed output; nothing to restore"
+        ),
         Refusal::PointerPathEscapes { output } => write!(
             f,
             "{p} names its output {output:?}, which is not a single file or directory \
@@ -224,10 +259,16 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
         Refusal::UnwritableName => write!(f, "cannot restore {:?}", path.to_string_lossy()),
         Refusal::CaseCollision { other } => write!(
             f,
-            "{other:?} and {:?} differ only by case and would collide on this filesystem",
+            "{other:?} and {:?} differ only by case or Unicode normalization and would be \
+             one file on macOS and Windows",
             path.to_string_lossy()
         ),
         Refusal::AppearedWhilePulling => write!(f, "{p} appeared while pulling; left untouched"),
+        Refusal::ExecutableInDirectory => write!(
+            f,
+            "{p} is marked executable (`isexec`) inside a directory output; pull restores \
+             modes only for a single-file output, so it refuses rather than drop the mark"
+        ),
     }
 }
 

@@ -3,12 +3,14 @@
 
 use bigstore::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use bigstore::folder::{
-    self, Credentials, Error as FolderError, Excludes, HistoryKey, Overwrite, PointerSource,
-    PullOptions, PushOptions, Refusal, Remote, RemoteConfig, Selector,
+    self, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey, HistoryRecord,
+    LogOptions, Overwrite, Phase, PointerSource, Progress, ProgressEvent, PullOptions, PushOptions,
+    Refusal, Remote, RemoteConfig, Selector, SyncState,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// The typed refusal in `err`'s chain.
 #[track_caller]
@@ -61,18 +63,26 @@ fn write(path: &Path, content: &[u8]) {
 
 fn opts(key: &str) -> PushOptions {
     PushOptions {
-        history: HistoryKey::new(key).unwrap(),
         jobs: 4,
-        exclude: Excludes::default(),
+        ..PushOptions::new(HistoryKey::new(key).unwrap())
     }
 }
 
 fn pull_opts(into: Option<PathBuf>) -> PullOptions {
     PullOptions {
         into,
-        overwrite: Overwrite::Refuse,
         jobs: 4,
+        ..PullOptions::default()
     }
+}
+
+/// `key`'s versions on `e`'s remote.
+fn history_log(e: &Env, key: &str) -> anyhow::Result<Vec<HistoryRecord>> {
+    folder::log(
+        &e.remote,
+        &HistoryKey::new(key).unwrap(),
+        &LogOptions::default(),
+    )
 }
 
 /// All regular files under `dir`, relative, with contents.
@@ -219,7 +229,7 @@ fn changing_one_file_uploads_one_object_and_adds_one_version() {
     let second = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     assert_eq!(second.uploaded, 1);
     let key = HistoryKey::new(KEY).unwrap();
-    let versions = folder::log(&e.remote, &key).unwrap();
+    let versions = folder::log(&e.remote, &key, &LogOptions::default()).unwrap();
     assert_eq!(versions.len(), 2);
     // Pushed within the same second: order is push order, not id order.
     assert_eq!(versions[0].pointer.output, first.pointer.output);
@@ -590,6 +600,52 @@ fn cli_works_without_git_on_path() {
     assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1);
 }
 
+/// Bare relative arguments, run from the parent directory: `dataset`'s and
+/// `store.toml.dvc`'s parent is the empty path, which must mean the current
+/// directory (on Windows it once failed after uploading everything).
+#[test]
+fn cli_accepts_bare_relative_paths_in_the_current_directory() {
+    let e = env();
+    writer_dir(&e);
+    let parent = e.data.parent().unwrap();
+    write(&parent.join("store.toml"), b"[store]\nurl = \"x\"\n");
+    let remote = format!("local://{}", e.store.display());
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_git-bigstore"))
+            .args(args)
+            .args(["--remote", &remote])
+            .current_dir(parent)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    run(&["folder", "push", "dataset", "--history", "ds/dir"]);
+    assert!(DvcPointer::load(&parent.join("dataset.dvc")).is_ok());
+    let log = run(&["folder", "log", "ds/dir"]);
+    assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1);
+
+    run(&["folder", "push", "store.toml", "--history", "ds/store"]);
+    std::fs::remove_file(parent.join("store.toml")).unwrap();
+    run(&["folder", "pull", "store.toml.dvc"]);
+    let want = b"[store]\nurl = \"x\"\n";
+    assert_eq!(std::fs::read(parent.join("store.toml")).unwrap(), want);
+
+    run(&[
+        "folder",
+        "pull",
+        "--history",
+        "ds/store",
+        "--into",
+        "out.bin",
+    ]);
+    assert_eq!(std::fs::read(parent.join("out.bin")).unwrap(), want);
+}
+
 /// Open files must be bounded by `--jobs`, not by the number of files: a
 /// launchd service gets 256 descriptors by default. The limit is lowered
 /// for the child process only.
@@ -744,7 +800,7 @@ fn at_or_before_restores_the_version_in_force_at_that_time() {
     folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     std::fs::write(&labels, b"{\"t\":4}\n").unwrap();
     folder::push(&e.remote, &w, &opts(KEY)).unwrap();
-    let log = folder::log(&e.remote, &HistoryKey::new(KEY).unwrap()).unwrap();
+    let log = history_log(&e, KEY).unwrap();
     let [v1, v2] = &log[..] else {
         panic!("{log:?}")
     };
@@ -799,7 +855,7 @@ fn history_holds_only_its_own_outputs_records() {
     write(&e.store.join("bigstore-history/k/not-a-time.dvc"), b"x");
 
     let ids = |key: &str| -> Vec<String> {
-        folder::log(&e.remote, &HistoryKey::new(key).unwrap())
+        history_log(&e, key)
             .unwrap()
             .iter()
             .map(|r| r.id().to_string())
@@ -940,8 +996,15 @@ fn a_refused_pull_lists_every_differing_file_and_writes_nothing() {
     let e = env();
     let w = writer_dir(&e);
     let report = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
-    let a = w.join("site=s1/date=2026-09-01/src_01/labels.jsonl");
-    let b = w.join("site=s1/date=2026-09-02/src_02/labels.jsonl");
+    // Pull reports the destination as given, then the file's relative path
+    // with the native separator (`\` on Windows).
+    let under = |rel: &str| {
+        let mut p = w.clone();
+        p.extend(rel.split('/'));
+        p
+    };
+    let a = under("site=s1/date=2026-09-01/src_01/labels.jsonl");
+    let b = under("site=s1/date=2026-09-02/src_02/labels.jsonl");
     std::fs::write(&a, b"edit a\n").unwrap();
     std::fs::write(&b, b"edit b\n").unwrap();
     std::fs::remove_file(w.join("site=s1/date=2026-09-01/src_01/regions.jsonl")).unwrap();
@@ -958,7 +1021,9 @@ fn a_refused_pull_lists_every_differing_file_and_writes_nothing() {
     assert_eq!(paths, &[a.clone(), b.clone()]);
     let shown = err.to_string();
     assert!(shown.starts_with("2 local file(s) differ"), "{shown}");
-    assert!(shown.contains(&a.display().to_string()) && shown.contains(&b.display().to_string()));
+    for p in paths {
+        assert!(shown.contains(&p.display().to_string()), "{shown}");
+    }
     // Refusal is all or nothing: the missing file was not restored either.
     assert!(!w
         .join("site=s1/date=2026-09-01/src_01/regions.jsonl")
@@ -1080,13 +1145,13 @@ fn a_corrupt_history_record_fails_log_and_names_the_record() {
     let dir = e.store.join("bigstore-history/k");
     let not_utf8 = "20260901T000000.000000000Z-a.dvc";
     write(&dir.join(not_utf8), b"\xff\xfe");
-    let err = folder::log(&e.remote, &HistoryKey::new("k").unwrap()).unwrap_err();
+    let err = history_log(&e, "k").unwrap_err();
     assert!(format!("{err:#}").contains(not_utf8), "{err:#}");
 
     std::fs::remove_file(dir.join(not_utf8)).unwrap();
     let not_a_pointer = "20260901T000000.000000000Z-b.dvc";
     write(&dir.join(not_a_pointer), b"outs: []\n");
-    let err = folder::log(&e.remote, &HistoryKey::new("k").unwrap()).unwrap_err();
+    let err = history_log(&e, "k").unwrap_err();
     assert!(format!("{err:#}").contains(not_a_pointer), "{err:#}");
 }
 
@@ -1097,7 +1162,7 @@ fn records_pushed_in_the_same_nanosecond_have_a_stable_latest() {
     let (a, b) = ("a".repeat(32), "b".repeat(32));
     write_record(&e, "k", time, &b);
     write_record(&e, "k", time, &a);
-    let log = folder::log(&e.remote, &HistoryKey::new("k").unwrap()).unwrap();
+    let log = history_log(&e, "k").unwrap();
     let ids: Vec<String> = log.iter().map(|r| r.id().to_string()).collect();
     assert_eq!(ids, [a, b], "ties are ordered by record key");
 }
@@ -1386,7 +1451,7 @@ fn os_junk_appearing_is_not_a_new_version() {
     assert_eq!((again.files, again.uploaded), (first.files, 0));
     assert!(again.history_record.is_none(), "junk made a new version");
     assert_eq!(std::fs::read(&again.pointer_path).unwrap(), pointer);
-    let versions = folder::log(&e.remote, &HistoryKey::new(KEY).unwrap()).unwrap();
+    let versions = history_log(&e, KEY).unwrap();
     assert_eq!(versions.len(), 1);
 }
 
@@ -1440,4 +1505,660 @@ fn an_invalid_exclude_pattern_is_typed() {
             "{bad:?}: {err:#}"
         );
     }
+}
+
+#[test]
+fn a_record_whose_name_and_pointer_disagree_is_refused() {
+    // Versions are chosen by record name; one whose pointer holds another
+    // version must fail rather than restore the wrong one.
+    let e = env();
+    let (named, held) = ("a".repeat(32), "b".repeat(32));
+    write_record(&e, "k", "20260901T000000.000000000Z", &held);
+    let dir = e.store.join("bigstore-history/k");
+    std::fs::rename(
+        dir.join(format!("20260901T000000.000000000Z-{held}.dvc")),
+        dir.join(format!("20260901T000000.000000000Z-{named}.dvc")),
+    )
+    .unwrap();
+    for at in [Selector::Latest, Selector::Id(named[..8].into())] {
+        let err = folder::pull(
+            &e.remote,
+            &history("k", at),
+            &pull_opts(Some(e.data.join("f"))),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bad record") && msg.contains(&held), "{msg}");
+    }
+    let err = history_log(&e, "k").unwrap_err();
+    assert!(format!("{err:#}").contains(&named), "{err:#}");
+}
+
+#[test]
+fn keys_lists_every_history_key_under_a_prefix() {
+    let e = env();
+    let md5 = |c: char| c.to_string().repeat(32);
+    let time = "20260901T000000.000000000Z";
+    for (key, c) in [
+        ("s/annotations/reviewer=rick/host=a", 'a'),
+        ("s/annotations/reviewer=rick/host=a/sub", 'b'),
+        ("s/annotations/reviewer=ann/host=b", 'c'),
+        ("s/annotations/reviewer=rickard/host=c", 'd'),
+        ("t/store.toml", 'e'),
+    ] {
+        write_record(&e, key, time, &md5(c));
+    }
+    // Not records: no key is made of them.
+    write(&e.store.join("bigstore-history/s/README.txt"), b"notes");
+    write(
+        &e.store.join("bigstore-history/s/stray/not-a-time.dvc"),
+        b"x",
+    );
+    write(
+        &e.store
+            .join(format!("bigstore-history/{time}-{}.dvc", md5('f'))),
+        b"x",
+    );
+
+    let keys = |prefix: Option<&str>| -> Vec<String> {
+        let prefix = prefix.map(|p| HistoryKey::new(p).unwrap());
+        folder::keys(&e.remote, prefix.as_ref())
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect()
+    };
+    assert_eq!(
+        keys(None),
+        [
+            "s/annotations/reviewer=ann/host=b",
+            "s/annotations/reviewer=rick/host=a",
+            "s/annotations/reviewer=rick/host=a/sub",
+            "s/annotations/reviewer=rickard/host=c",
+            "t/store.toml",
+        ]
+    );
+    // A prefix matches whole path components.
+    assert_eq!(
+        keys(Some("s/annotations/reviewer=rick")),
+        [
+            "s/annotations/reviewer=rick/host=a",
+            "s/annotations/reviewer=rick/host=a/sub",
+        ]
+    );
+    assert_eq!(
+        keys(Some("s/annotations/reviewer=rick/host=a")),
+        [
+            "s/annotations/reviewer=rick/host=a",
+            "s/annotations/reviewer=rick/host=a/sub",
+        ]
+    );
+    assert!(keys(Some("nothing/here")).is_empty());
+}
+
+#[test]
+fn status_says_what_push_would_do_and_writes_nothing() {
+    let e = env();
+    let w = writer_dir(&e);
+    let parent = w.parent().unwrap().to_path_buf();
+    let listing = |dir: &Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|d| d.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    };
+    let before = (listing(&parent), tree(&w));
+
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(matches!(s.sync, SyncState::NoHistory), "{:?}", s.sync);
+    assert_eq!((s.files, s.to_upload, s.already_present), (4, 4, 0));
+    let total: u64 = tree(&w).iter().map(|(_, c)| c.len() as u64).sum();
+    assert_eq!((s.to_upload_bytes, s.already_present_bytes), (total, 0));
+    assert_eq!((listing(&parent), tree(&w)), before, "status wrote locally");
+    assert!(
+        remote_keys(&e.store).is_empty(),
+        "status wrote to the remote"
+    );
+
+    let pushed = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    assert_eq!(s.pointer, pushed.pointer, "status predicts the pointer");
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(matches!(s.sync, SyncState::InSync), "{:?}", s.sync);
+    assert_eq!((s.to_upload, s.already_present), (0, 4));
+    assert_eq!(s.already_present_bytes, total);
+    // A no-op push counts what is already there, as status does.
+    let again = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    assert_eq!((again.uploaded, again.already_present), (0, 4));
+
+    let labels = w.join("site=s1/date=2026-09-02/src_02/labels.jsonl");
+    std::fs::write(&labels, b"{\"t\":3}\n{\"t\":4}\n").unwrap();
+    let keys_before = remote_keys(&e.store);
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(matches!(s.sync, SyncState::LocalAhead), "{:?}", s.sync);
+    assert_eq!((s.to_upload, s.to_upload_bytes), (1, 16));
+    assert_eq!(remote_keys(&e.store), keys_before);
+
+    // Another host pushes a newer version; this copy is still what its
+    // .dvc records.
+    std::fs::write(&labels, b"{\"t\":3}\n").unwrap();
+    let other = e.data.parent().unwrap().join("other/host");
+    folder::pull(
+        &e.remote,
+        &history(KEY, Selector::Latest),
+        &pull_opts(Some(other.clone())),
+    )
+    .unwrap();
+    std::fs::write(other.join("new.jsonl"), b"{}\n").unwrap();
+    let newer = folder::push(&e.remote, &other, &opts(KEY)).unwrap();
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    let SyncState::RemoteAhead { latest } = &s.sync else {
+        panic!("{:?}", s.sync)
+    };
+    assert_eq!(latest.pointer.output, newer.pointer.output);
+
+    // Both changed since the .dvc.
+    std::fs::write(&labels, b"{\"t\":5}\n").unwrap();
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(matches!(s.sync, SyncState::Diverged { .. }), "{:?}", s.sync);
+}
+
+#[track_caller]
+fn assert_cancelled(err: &anyhow::Error) {
+    assert!(
+        matches!(folder_error(err), FolderError::Cancelled),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn a_cancelled_push_publishes_nothing() {
+    let e = env();
+    let w = writer_dir(&e);
+    let pointer_path =
+        w.with_file_name(format!("{}.dvc", w.file_name().unwrap().to_str().unwrap()));
+    let cancelled = || {
+        let o = opts(KEY);
+        o.cancel.cancel();
+        o
+    };
+
+    let err = folder::push(&e.remote, &w, &cancelled()).unwrap_err();
+    assert_cancelled(&err);
+    assert!(!pointer_path.exists(), "a .dvc was written");
+    assert!(remote_keys(&e.store).is_empty(), "something was published");
+
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let pointer = std::fs::read(&pointer_path).unwrap();
+    let keys = remote_keys(&e.store);
+    write(&w.join("new.jsonl"), b"{}\n");
+    let err = folder::push(&e.remote, &w, &cancelled()).unwrap_err();
+    assert_cancelled(&err);
+    assert_eq!(std::fs::read(&pointer_path).unwrap(), pointer);
+    assert_eq!(remote_keys(&e.store), keys, "history or objects changed");
+    let err = folder::status(&e.remote, &w, &cancelled()).unwrap_err();
+    assert_cancelled(&err);
+}
+
+#[test]
+fn a_cancelled_pull_writes_nothing() {
+    let e = env();
+    let w = writer_dir(&e);
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let into = e.data.parent().unwrap().join("restore");
+    let o = PullOptions {
+        into: Some(into.clone()),
+        ..PullOptions::default()
+    };
+    o.cancel.cancel();
+    let err = folder::pull(&e.remote, &history(KEY, Selector::Latest), &o).unwrap_err();
+    assert_cancelled(&err);
+    assert!(tree(&into).is_empty(), "{:?}", tree(&into));
+}
+
+/// A progress callback recording every event, and the events so far.
+fn recorder() -> (Progress, Arc<Mutex<Vec<ProgressEvent>>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    (Progress::new(move |e| sink.lock().unwrap().push(e)), events)
+}
+
+/// Files and bytes advanced in `phase`, and the totals it started with.
+fn phase_sums(events: &[ProgressEvent], phase: Phase) -> ((u64, Option<u64>), (u64, u64)) {
+    let mut started = None;
+    let mut done = (0, 0);
+    for e in events {
+        match *e {
+            ProgressEvent::Started {
+                phase: p,
+                files,
+                bytes,
+            } if p == phase => {
+                started = Some((files, bytes));
+                done = (0, 0);
+            }
+            ProgressEvent::Advanced {
+                phase: p,
+                files,
+                bytes,
+            } if p == phase => {
+                done = (done.0 + files, done.1 + bytes);
+            }
+            _ => {}
+        }
+    }
+    (
+        started.unwrap_or_else(|| panic!("{phase:?} never started: {events:?}")),
+        done,
+    )
+}
+
+#[test]
+fn push_and_pull_report_progress_per_file_and_byte() {
+    let e = env();
+    let w = writer_dir(&e);
+    let total: u64 = tree(&w).iter().map(|(_, c)| c.len() as u64).sum();
+    let (progress, events) = recorder();
+    folder::push(
+        &e.remote,
+        &w,
+        &PushOptions {
+            progress,
+            ..opts(KEY)
+        },
+    )
+    .unwrap();
+    let events = std::mem::take(&mut *events.lock().unwrap());
+    assert_eq!(
+        phase_sums(&events, Phase::Hashing),
+        ((4, Some(total)), (4, total))
+    );
+    assert_eq!(
+        phase_sums(&events, Phase::Uploading),
+        ((4, Some(total)), (4, total))
+    );
+
+    let into = e.data.parent().unwrap().join("restore");
+    let (progress, events) = recorder();
+    folder::pull(
+        &e.remote,
+        &history(KEY, Selector::Latest),
+        &PullOptions {
+            progress,
+            ..pull_opts(Some(into))
+        },
+    )
+    .unwrap();
+    let events = std::mem::take(&mut *events.lock().unwrap());
+    assert_eq!(phase_sums(&events, Phase::Hashing).1 .0, 4, "{events:?}");
+    assert_eq!(
+        phase_sums(&events, Phase::Downloading),
+        ((4, None), (4, total))
+    );
+}
+
+/// `n` files of distinct content under `dir`.
+fn many_files(dir: &Path, n: usize) -> u64 {
+    for i in 0..n {
+        write(
+            &dir.join(format!("f{i:03}.txt")),
+            format!("file {i}\n").as_bytes(),
+        );
+    }
+    tree(dir).iter().map(|(_, c)| c.len() as u64).sum()
+}
+
+#[test]
+fn a_push_cancelled_mid_upload_leaves_history_and_pointer_alone() {
+    let e = env();
+    let out = e.data.join("out");
+    many_files(&out, 20);
+    let cancel = CancelToken::new();
+    let trigger = cancel.clone();
+    let o = PushOptions {
+        jobs: 1,
+        cancel,
+        progress: Progress::new(move |e| {
+            if let ProgressEvent::Advanced {
+                phase: Phase::Uploading,
+                ..
+            } = e
+            {
+                trigger.cancel();
+            }
+        }),
+        ..opts("ds/out")
+    };
+    let err = folder::push(&e.remote, &out, &o).unwrap_err();
+    assert_cancelled(&err);
+    let keys = remote_keys(&e.store);
+    let objects = keys.iter().filter(|k| k.starts_with("files/")).count();
+    assert!((1..20).contains(&objects), "{keys:?}");
+    assert!(
+        !keys.iter().any(|k| k.ends_with(".dir")),
+        "manifest uploaded"
+    );
+    assert!(!keys.iter().any(|k| k.starts_with("bigstore-history/")));
+    assert!(!e.data.join("out.dvc").exists());
+
+    // The next push completes, skipping what is already there.
+    let r = folder::push(&e.remote, &out, &opts("ds/out")).unwrap();
+    assert_eq!((r.uploaded, r.already_present), (20 - objects, objects));
+}
+
+#[test]
+fn a_pull_cancelled_mid_download_leaves_only_whole_files() {
+    let e = env();
+    let out = e.data.join("out");
+    many_files(&out, 20);
+    folder::push(&e.remote, &out, &opts("ds/out")).unwrap();
+    let into = e.data.parent().unwrap().join("restore");
+    let cancel = CancelToken::new();
+    let trigger = cancel.clone();
+    let o = PullOptions {
+        jobs: 1,
+        cancel,
+        progress: Progress::new(move |e| {
+            if let ProgressEvent::Advanced {
+                phase: Phase::Downloading,
+                ..
+            } = e
+            {
+                trigger.cancel();
+            }
+        }),
+        ..pull_opts(Some(into.clone()))
+    };
+    let err = folder::pull(&e.remote, &history("ds/out", Selector::Latest), &o).unwrap_err();
+    assert_cancelled(&err);
+    let restored = tree(&into);
+    assert!((1..20).contains(&restored.len()), "{restored:?}");
+    let original: std::collections::BTreeMap<_, _> = tree(&out).into_iter().collect();
+    for (name, content) in &restored {
+        assert_eq!(
+            original.get(name),
+            Some(content),
+            "{name} is not a whole file"
+        );
+    }
+}
+
+#[test]
+fn names_differing_only_by_normalization_or_unicode_case_are_refused() {
+    // APFS and HFS+ treat each pair as one name (NFC vs NFD `é`; `Ä` vs
+    // `ä`), so restoring both would leave one file holding either content.
+    let nfd = "cafe\u{301}.txt";
+    let nfc = "caf\u{e9}.txt";
+    for (first, second) in [(nfd, nfc), ("\u{c4}rger.txt", "\u{e4}rger.txt")] {
+        let e = env();
+        let pointer = dvc_pushed_dir(&e, &[(first, b"1"), (second, b"2")]);
+        let err =
+            folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap_err();
+        let (path, reason) = refused(&err);
+        let names = [first, second];
+        let Refusal::CaseCollision { other } = reason else {
+            panic!("{err:#}")
+        };
+        assert!(
+            names.contains(&path.to_str().unwrap()) && names.contains(&other.as_str()),
+            "{err:#}"
+        );
+        assert_ne!(path.to_str().unwrap(), other, "{err:#}");
+        assert!(!e.data.join("out").exists());
+    }
+
+    // Different letters are different names.
+    let e = env();
+    let pointer = dvc_pushed_dir(&e, &[(nfc, b"1"), ("cafe.txt", b"2")]);
+    folder::pull(&e.remote, &PointerSource::File(pointer), &pull_opts(None)).unwrap();
+}
+
+#[test]
+fn pull_restores_from_a_dvc_file_with_stage_fields_and_types_unreadable_ones() {
+    // `dvc import-url` writes deps, frozen and a stage md5; `dvc add --desc`
+    // writes annotations. Pull only reads the output, so both restore.
+    let e = env();
+    let plain = dvc_pushed_dir(&e, &[("a.txt", b"a"), ("b/c.txt", b"c")]);
+    let DvcOutput::Dir { manifest, .. } = DvcPointer::load(&plain).unwrap().output else {
+        panic!("a directory pointer")
+    };
+    std::fs::remove_file(&plain).unwrap();
+    for (fixture, dir) in [
+        ("imported_dir.dvc", "5b94ef7ba4840901cc23311660411a1d"),
+        ("annotated.dvc", "c1aa8378201c5b38b6b109d77fbf79bc"),
+    ] {
+        let text = std::fs::read_to_string(format!("{GOLDEN}/stage_fields/{fixture}")).unwrap();
+        let name = fixture.trim_end_matches(".dvc");
+        let text = text.replace(dir, &manifest.to_string());
+        let dvc = e.data.join(fixture);
+        write(&dvc, text.as_bytes());
+        let r = folder::pull(
+            &e.remote,
+            &PointerSource::File(dvc.clone()),
+            &pull_opts(None),
+        )
+        .unwrap_or_else(|err| panic!("{fixture}: {err:#}"));
+        assert_eq!(r.written, 2, "{fixture}");
+        assert_eq!(
+            std::fs::read(e.data.join(name).join("b/c.txt")).unwrap(),
+            b"c"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dvc).unwrap(),
+            text,
+            "pull rewrote it"
+        );
+    }
+
+    // What names no md5-addressed output is refused, typed.
+    for fixture in ["uncached.bin.dvc", "etag_only.bin.dvc"] {
+        let dvc = e.data.join(fixture);
+        std::fs::copy(format!("{GOLDEN}/stage_fields/{fixture}"), &dvc).unwrap();
+        let err = folder::pull(
+            &e.remote,
+            &PointerSource::File(dvc.clone()),
+            &pull_opts(None),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused(&err),
+            (dvc.as_path(), &Refusal::UnrestorablePointer)
+        );
+    }
+}
+
+#[test]
+fn an_invalid_history_key_and_a_history_pull_without_a_destination_are_typed() {
+    for key in ["", "/abs", "a/../b", "a/nul", "a:b"] {
+        let err = HistoryKey::new(key).unwrap_err();
+        assert!(
+            matches!(folder_error(&err), FolderError::InvalidHistoryKey { key: k } if k == key),
+            "{key:?}: {err:#}"
+        );
+    }
+
+    let e = env();
+    let w = writer_dir(&e);
+    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let err =
+        folder::pull(&e.remote, &history(KEY, Selector::Latest), &pull_opts(None)).unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::DestinationRequired),
+        "{err:#}"
+    );
+    assert!(format!("{err:#}").contains("into"), "{err:#}");
+}
+
+// ── Edges: long paths ───────────────────────────────
+
+/// `n` directory levels of 62 characters each, `/`-joined.
+fn deep(tag: &str, n: usize) -> String {
+    (0..n)
+        .map(|i| format!("{tag}{i}_{}", "x".repeat(58)))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Everything past Windows' 260-character `MAX_PATH`: the output's own
+/// path (so its `.dvc` too), each file's path inside it (~250 characters,
+/// like asset-store's deepest), and the pull destination. On Windows this
+/// only passes because every path handed to tempfile's raw `MoveFileExW`
+/// is verbatim; the paths push and pull report stay as the caller gave them.
+#[test]
+fn outputs_and_files_beyond_max_path_push_and_pull() {
+    let e = env();
+    let output = e.data.join(deep("out", 4)).join("host=h");
+    let rel = format!(
+        "site=s1/date=2026-09-01/{}/src_0001_camera_left/gt_geometry/tracks.parquet",
+        deep("src", 3)
+    );
+    let twin = format!("site=s1/date=2026-09-02/{}/labels.jsonl", deep("src", 3));
+    assert!(rel.len() >= 250, "{}", rel.len());
+    assert!(output.join(&rel).as_os_str().len() > 300);
+    write(&output.join(&rel), b"PAR1 geometry");
+    write(&output.join(&twin), b"{\"t\":1}\n");
+    // Same content under another long path: one download, one copy.
+    write(
+        &output.join(format!("{}/copy.jsonl", deep("dup", 4))),
+        b"{\"t\":1}\n",
+    );
+
+    let report = folder::push(&e.remote, &output, &opts("ds/long")).unwrap();
+    assert_eq!(report.files, 3);
+    let pointer = output.parent().unwrap().join("host=h.dvc");
+    assert_eq!(report.pointer_path.as_os_str(), pointer.as_os_str());
+    assert!(pointer.is_file());
+
+    let restore = e.data.parent().unwrap().join(deep("in", 4));
+    let pulled = folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path.clone()),
+        &pull_opts(Some(restore.clone())),
+    )
+    .unwrap();
+    assert_eq!(pulled.written, 3);
+    assert_eq!(tree(&restore), tree(&output));
+
+    // A conflict names the file in the caller's form, then force replaces.
+    // Caller's root as given, then the relative path with native separators.
+    let mut target = restore.clone();
+    target.extend(rel.split('/'));
+    std::fs::write(&target, b"local edit").unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path.clone()),
+        &pull_opts(Some(restore.clone())),
+    )
+    .unwrap_err();
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].as_os_str(), target.as_os_str());
+    let forced = folder::pull(
+        &e.remote,
+        &PointerSource::File(report.pointer_path),
+        &PullOptions {
+            overwrite: Overwrite::Force,
+            ..pull_opts(Some(restore.clone()))
+        },
+    )
+    .unwrap();
+    assert_eq!(forced.written, 1);
+    assert_eq!(std::fs::read(&target).unwrap(), b"PAR1 geometry");
+}
+
+// ── Edges: executable outputs ───────────────────────
+
+/// What `dvc add` writes for a 0755 `#!/bin/sh\n` (as in the fixture
+/// `stage_fields/run.sh.dvc`), naming `path`.
+#[cfg(unix)]
+fn isexec_pointer(path: &str) -> String {
+    format!(
+        "outs:\n- md5: 3e2b31c72181b87149ff995e7202c0e3\n  size: 10\n  isexec: true\n  \
+         hash: md5\n  path: {path}\n"
+    )
+}
+
+/// A `.dvc` DVC wrote for an executable file (`isexec: true`) restores it
+/// executable, and makes an identical local copy executable without
+/// rewriting it. History records come from push, which records no mode.
+#[cfg(unix)]
+#[test]
+fn pull_of_an_isexec_pointer_restores_an_executable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode();
+    let e = env();
+    let tool = e.data.join("tool.sh");
+    write(&tool, b"#!/bin/sh\n");
+    let report = folder::push(&e.remote, &tool, &opts("ds/tool")).unwrap();
+    std::fs::write(&report.pointer_path, isexec_pointer("tool.sh")).unwrap();
+    let from_dvc = PointerSource::File(report.pointer_path.clone());
+
+    std::fs::remove_file(&tool).unwrap();
+    let pulled = folder::pull(&e.remote, &from_dvc, &pull_opts(None)).unwrap();
+    assert_eq!(pulled.written, 1);
+    assert_eq!(mode(&tool) & 0o100, 0o100, "{:o}", mode(&tool));
+
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let again = folder::pull(&e.remote, &from_dvc, &pull_opts(None)).unwrap();
+    assert_eq!((again.written, again.unchanged), (0, 1));
+    assert_eq!(mode(&tool) & 0o100, 0o100, "{:o}", mode(&tool));
+
+    let restored = e.data.join("from-history");
+    folder::pull(
+        &e.remote,
+        &history("ds/tool", Selector::Latest),
+        &pull_opts(Some(restored.clone())),
+    )
+    .unwrap();
+    assert_eq!(mode(&restored) & 0o111, 0, "{:o}", mode(&restored));
+}
+
+/// DVC 3 `.dir` manifests carry no modes (`dvc add` of a directory holding
+/// a 0755 file records none), but a manifest hashed with per-file metadata
+/// can mark a file `isexec`. Pull refuses it by name before writing
+/// anything rather than restore the file without its mode; the same for a
+/// directory output marked `isexec` in its `.dvc`.
+#[test]
+fn pull_refuses_an_executable_mark_inside_a_directory() {
+    let e = env();
+    let tool = e.data.join("tool.sh");
+    write(&tool, b"#!/bin/sh\n");
+    folder::push(&e.remote, &tool, &opts("ds/tool")).unwrap();
+    let raw = br#"[{"isexec": true, "md5": "3e2b31c72181b87149ff995e7202c0e3", "relpath": "sub/run.sh"}]"#;
+    let id = hash_reader(&mut &raw[..], HashFunction::Md5).unwrap();
+    let id = id.to_string();
+    write(
+        &e.store
+            .join(format!("files/md5/{}/{}.dir", &id[..2], &id[2..])),
+        raw,
+    );
+    let dvc = e.data.join("out.dvc");
+    let dir_pointer =
+        format!("outs:\n- md5: {id}.dir\n  size: 10\n  nfiles: 1\n  hash: md5\n  path: out\n");
+    std::fs::write(&dvc, &dir_pointer).unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(dvc.clone()),
+        &pull_opts(None),
+    )
+    .unwrap_err();
+    let (path, reason) = refused(&err);
+    assert_eq!(path, Path::new("sub/run.sh"));
+    assert!(matches!(reason, Refusal::ExecutableInDirectory), "{err:#}");
+    assert!(!e.data.join("out").exists(), "nothing written");
+
+    let marked = dir_pointer.replace("  hash: md5", "  isexec: true\n  hash: md5");
+    std::fs::write(&dvc, marked).unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(dvc.clone()),
+        &pull_opts(None),
+    )
+    .unwrap_err();
+    let (path, reason) = refused(&err);
+    assert_eq!(path, dvc);
+    assert!(matches!(reason, Refusal::ExecutableInDirectory), "{err:#}");
 }

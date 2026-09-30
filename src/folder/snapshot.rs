@@ -61,9 +61,13 @@ const ATTEMPTS: usize = 3;
 
 /// Copy `path` into a temp file in `tmp_dir`, hashing the same bytes as they
 /// are written. The file's length and mtime are checked before and after:
-/// if either changed (append, truncation, replacement) the copy is retried,
-/// and after [`ATTEMPTS`] tries it is reported as [`SnapshotError::Changed`].
-/// Every snapshot returned is a state the file really was in.
+/// if either changed (append, truncation, replacement), or fewer or more
+/// bytes were read than the file ends with, the copy is retried, and after
+/// [`ATTEMPTS`] tries it is reported as [`SnapshotError::Changed`].
+///
+/// The digest always describes the copy. The copy is a state the file really
+/// was in unless a change that keeps the length lands within one tick of
+/// the filesystem's mtime (2 s on FAT): appends always change the length.
 pub fn snapshot(path: &Path, tmp_dir: &Path) -> std::result::Result<Snapshot, SnapshotError> {
     for _ in 0..ATTEMPTS {
         match try_snapshot(path, tmp_dir)? {
@@ -178,59 +182,121 @@ mod tests {
         assert!(matches!(err, SnapshotError::Changed(_)), "{err}");
     }
 
-    /// A writer appends and occasionally truncates (as Track Inspector cuts a
-    /// torn line) while snapshots run. Every snapshot's digest must describe
-    /// its own bytes, and every snapshot must be a state the file was in:
-    /// some prefix of lines the writer produced.
+    /// The writer's `i`th change, applied to `content`: the byte range to
+    /// write out at its offset, or `None` to truncate the file to
+    /// `content.len()`.
+    fn change(i: u64, content: &mut Vec<u8>) -> Option<std::ops::Range<usize>> {
+        if i % 7 == 6 {
+            // Cut a torn tail, as Track Inspector does.
+            content.truncate(content.len().saturating_sub(3));
+            None
+        } else if i % 11 == 10 {
+            // `{"old":0}` <-> `{"new":0}` in place: the length stays the
+            // same, so only the mtime shows this change.
+            let word: &[u8] = if &content[2..5] == b"old" {
+                b"new"
+            } else {
+                b"old"
+            };
+            content[2..5].copy_from_slice(word);
+            Some(2..5)
+        } else {
+            let start = content.len();
+            content.extend_from_slice(format!("{{\"row\":{i}}}\n").as_bytes());
+            Some(start..content.len())
+        }
+    }
+
+    /// A writer appends, cuts torn tails and rewrites the first line in
+    /// place while snapshots run. Every snapshot's digest must describe its
+    /// own bytes, and every snapshot must be a state the file was in: one of
+    /// the states the writer's changes produce, never a splice of two (say,
+    /// the first line from before a rewrite with a tail appended after it).
     #[test]
-    fn concurrent_append_and_truncate_never_yield_an_inconsistent_snapshot() {
+    fn concurrent_changes_never_yield_an_inconsistent_snapshot() {
+        use std::collections::HashSet;
+        use std::io::{Seek, SeekFrom};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        let digest = |bytes: &[u8]| {
+            let mut h = Hasher::new(HashFunction::Md5);
+            h.update(bytes);
+            h.finalize()
+        };
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("labels.jsonl");
-        std::fs::write(&src, b"").unwrap();
+        // Several copy buffers long, so a snapshot takes several reads and a
+        // change between them could splice two states.
+        let initial: Vec<u8> = (0..12_000)
+            .flat_map(|r| format!("{{\"old\":{r}}}\n").into_bytes())
+            .collect();
+        std::fs::write(&src, &initial).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
-            let (src, stop) = (src.clone(), stop.clone());
+            let (src, stop, mut content) = (src.clone(), stop.clone(), initial.clone());
             std::thread::spawn(move || {
                 let mut i = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    // Like Track Inspector: open for write, cut a torn tail
-                    // or seek to the end and append. (Windows refuses
-                    // set_len on an append-only handle.)
+                    // Open for write, like Track Inspector (Windows refuses
+                    // set_len on an append-only handle). Each change is one
+                    // call, so the file goes from one state to the next.
                     let mut f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
-                    if i % 7 == 6 {
-                        let len = f.metadata().unwrap().len();
-                        f.set_len(len.saturating_sub(3)).unwrap();
-                    } else {
-                        use std::io::Seek;
-                        f.seek(std::io::SeekFrom::End(0)).unwrap();
-                        writeln!(f, "{{\"row\":{i}}}").unwrap();
+                    match change(i, &mut content) {
+                        None => f.set_len(content.len() as u64).unwrap(),
+                        Some(r) => {
+                            f.seek(SeekFrom::Start(r.start as u64)).unwrap();
+                            f.write_all(&content[r]).unwrap();
+                        }
                     }
                     i += 1;
-                    // Real appends are sporadic; a writer that never pauses
-                    // would (correctly) make every snapshot "kept changing".
-                    std::thread::sleep(std::time::Duration::from_micros(200));
+                    // Bursts of changes, then quiet: a writer that never
+                    // pauses would (correctly) make every snapshot "kept
+                    // changing".
+                    let pause = if i.is_multiple_of(5) { 15_000 } else { 100 };
+                    std::thread::sleep(std::time::Duration::from_micros(pause));
                 }
+                i
             })
         };
-        let mut ok = 0;
+        let mut taken = Vec::new();
         for _ in 0..200 {
             match snapshot(&src, dir.path()) {
                 Ok(s) => {
-                    assert_eq!(
-                        *s.md5(),
-                        hash::hash_file(s.path(), HashFunction::Md5).unwrap()
-                    );
-                    assert_eq!(std::fs::metadata(s.path()).unwrap().len(), s.size());
-                    ok += 1;
+                    let bytes = std::fs::read(s.path()).unwrap();
+                    assert_eq!(*s.md5(), digest(&bytes));
+                    assert_eq!(bytes.len() as u64, s.size());
+                    taken.push((s.size(), s.md5().clone()));
                 }
                 Err(SnapshotError::Changed(_)) => {}
                 Err(SnapshotError::Io(e)) => panic!("{e:#}"),
             }
         }
         stop.store(true, Ordering::Relaxed);
-        writer.join().unwrap();
-        assert!(ok > 0, "no snapshot ever succeeded");
+        let changes = writer.join().unwrap();
+        assert!(!taken.is_empty(), "no snapshot ever succeeded");
+        assert!(
+            taken.iter().any(|(size, _)| *size != initial.len() as u64),
+            "every snapshot was of the file before any change"
+        );
+
+        // Replay the writer; digest only states of a length some snapshot has.
+        let sizes: HashSet<u64> = taken.iter().map(|(size, _)| *size).collect();
+        let mut content = initial;
+        let mut states = HashSet::new();
+        for i in 0..=changes {
+            if i > 0 {
+                change(i - 1, &mut content);
+            }
+            let len = content.len() as u64;
+            if sizes.contains(&len) {
+                states.insert((len, digest(&content)));
+            }
+        }
+        for (size, md5) in &taken {
+            assert!(
+                states.contains(&(*size, md5.clone())),
+                "snapshot of {size} bytes ({md5}) is no state the writer produced"
+            );
+        }
     }
 }

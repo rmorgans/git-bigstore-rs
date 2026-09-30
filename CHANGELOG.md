@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-09-30
 
 ### Added
 
@@ -13,7 +13,8 @@
   with no AWS/IMDS fallback, and a blocking API for sync callers.
 - `cli` cargo feature (default). `default-features = false` builds only the
   library.
-- Windows CI job that builds and uploads `git-bigstore.exe`.
+- Windows CI job that builds and uploads `git-bigstore.exe`, and runs the
+  folder-mode tests, including the round trip through an rclone remote.
 - `bigstore::folder::Error` (with `folder::Refusal`): every folder-mode
   refusal is typed, so library callers can `downcast_ref` and match instead
   of parsing messages: `Refused { path, reason }` (symlinks, special files,
@@ -42,12 +43,58 @@
   (`default-features = false, features = ["ring"]`) no longer builds
   aws-lc-rs. With neither, cloud URLs fail with an error naming both
   features; `local://` and `rclone://` still work.
+- `folder::keys(&remote, under)` and `git bigstore folder keys [PREFIX]` list
+  the history keys on a remote (all, or those equal to or below a prefix, by
+  whole path components), so a host can find other writers' outputs without
+  a pointer. One listing; nested keys (`k` and `k/sub`) are both reported and
+  objects that are not records are ignored, as are keys `HistoryKey::new`
+  rejects (left out silently).
+- `folder::status(&remote, output, &push_options)` and `git bigstore folder
+  status` (push's arguments): what a push would upload (distinct contents and
+  bytes, and what the remote already has), the pointer it would write, and
+  `SyncState` against the latest history version (`NoHistory`, `InSync`,
+  `LocalAhead`, `RemoteAhead`, `Diverged`, judged by the `.dvc` beside the
+  output). It shares push's walk, snapshot and hashing, refuses what push
+  refuses, and writes nothing to the remote or beside the output. `InSync`
+  means no new version; push may still rewrite a missing or stale `.dvc`.
+- `PushReport::already_present` counts what the remote already had when its
+  manifest was there too; a push of an unchanged directory used to report
+  `0 uploaded, 0 already on the remote`.
+- Cancellation for folder mode: `folder::CancelToken` (cloneable, shared
+  flag), as `PushOptions::cancel`, `PullOptions::cancel` and
+  `LogOptions::cancel`, checked between files and between objects by push,
+  status and pull, and between record fetches by log; the call returns
+  `folder::Error::Cancelled`. A cancelled push writes no `.dvc` and no
+  history record; a cancelled pull leaves no partly written file.
+  `git bigstore folder push|status|pull|log` cancel this way on the first
+  Ctrl-C. `PushOptions::new(history)`, `PullOptions::default()` and
+  `LogOptions::default()` give the defaults (8 jobs), so new options fields
+  no longer break struct literals written as
+  `PushOptions { jobs: 4, ..PushOptions::new(key) }`.
+- Progress for folder mode: `folder::Progress::new(|event| …)` as
+  `PushOptions::progress` and `PullOptions::progress` receives
+  `ProgressEvent::Started { phase, files, bytes }` and
+  `Advanced { phase, files, bytes }` per finished file, for the phases
+  `Hashing`, `Uploading` and `Downloading`. The callback is `Send + Sync`,
+  usable from sync callers, and free when unset; the library needs no
+  `indicatif`. `git bigstore folder push|status|pull` draw a bar per phase
+  on a terminal.
+- `folder pull` refuses, as `Refusal::CaseCollision`, manifest names that
+  differ only by Unicode normalization (NFC `é` vs NFD `e` + accent) or by
+  non-ASCII case (`Ä`/`ä`), on every OS, before writing anything. Only ASCII
+  case was folded before, so on macOS such a pair restored one file and then
+  failed with "appeared while pulling". New dependency:
+  `unicode-normalization` (std has no NFC).
 
 ### Security
 
 - On Windows, `RepoPath` rejects `\` and `:`. Before this, a hostile DVC
   manifest could make `import-dvc-dir` write outside the repository via
   `a\..\..\x` or a drive-relative `C:x`.
+- `folder push` and `folder status` create their snapshot temp directory
+  mode 0700 on unix; it was 0755 under the usual umask. The copies inside
+  were already 0600; now other users cannot list or enter the directory
+  either.
 
 ### Changed
 
@@ -73,12 +120,40 @@
   `Thumbs.db` and `desktop.ini`, at any depth. Finder writes `.DS_Store` just
   by showing a folder, which made the next push a new manifest and history
   record. `--exclude PATTERN` (`PushOptions::exclude`, `folder::Excludes`)
-  skips more, with `.gitignore` rules relative to the pushed directory.
+  skips more, with `.gitignore` rules relative to the pushed directory; a
+  directory-only pattern (`scratch/`) also skips a symlink to a directory,
+  as `.dvcignore` does, instead of refusing it, and never follows it.
   Anyone also running `dvc add` on the folder needs the same patterns in
   `.dvcignore`; the README gives the lines.
+- **Folder history is read by listing.** A record's name holds its time and
+  id, so `folder push` and `folder pull --history` now fetch only the one
+  record they need instead of every record of the key (a push onto 50
+  versions made 50 GETs; now 1). `folder::log(&remote, &key, &LogOptions)`
+  takes options like push and pull (`jobs`, `cancel`) and fetches records
+  `jobs` at a time (`folder log -j`). A record whose
+  pointer is not the version its name says is refused as a bad record, and
+  a malformed `--at` is refused before the remote is contacted.
+- **`folder pull` reads any single-output DVC 3 `.dvc`**, ignoring stage
+  fields and annotations (`dvc import-url`'s `deps`/`frozen`/`md5`,
+  `dvc add --desc`), since it never rewrites the file; before, it refused
+  them ("has fields bigstore does not write"). A `.dvc` with nothing to
+  restore (`cache: false`, etag-only, several outputs, `wdir:`) is now the
+  typed `Refusal::UnrestorablePointer`, the parse error below it.
+- An invalid `HistoryKey` is `folder::Error::InvalidHistoryKey { key }` and
+  a history pull without `into` is `folder::Error::DestinationRequired`;
+  both were untyped. Messages are unchanged apart from naming the key.
 
 ### Fixed
 
+- Downloads from an `rclone://` remote failed on Windows ("Access is
+  denied"): bigstore kept its temp file open while rclone renamed its
+  partial download over it, which Windows refuses. The temp file is now
+  closed while rclone writes (folder pull and history, and git-mode pull).
+  The Windows CI job now runs the rclone round trip.
+- On Windows, paths bigstore builds from a repository or manifest path
+  (pull reports and conflicts, restore targets) used `/` inside an
+  otherwise `\`-separated path. They now use `\` throughout; the
+  destination you passed is still shown as given.
 - `ref`, `dvc-ls` and `import-dvc-dir` refused legal DVC 3 `.dvc` files
   with fields beyond the output's hash (a regression since 0.1.0):
   `dvc import-url`'s `md5:`/`frozen:`/`deps:`, `meta:`/`desc:` annotations,
@@ -87,12 +162,40 @@
   saying why (`cache: false`, not yet downloaded, etag/version_id only), as
   is a `wdir:` other than `.`. `folder push` still refuses to overwrite such
   a file, now naming the fields it would drop.
+- `ref` of a `.dvc` with `isexec: true` (DVC's mark for an executable
+  file) wrote the file without its execute bit. On unix it is now written
+  0777 minus umask, as git checks out an executable; DVC's `.dir`
+  manifests record no modes, so `import-dvc-dir` is unchanged.
+- `folder pull` of such a `.dvc` (a single-file output) dropped the mark
+  the same way. It now restores the file executable on unix, and makes an
+  identical copy already in place executable instead of leaving it as it
+  was. A `.dir` manifest entry marked `isexec` (only manifests hashed with
+  per-file metadata have one; `dvc add` writes none) is refused instead of
+  restored without its mode: `folder pull` says so as
+  `Refusal::ExecutableInDirectory`, as it does for a directory output
+  marked `isexec` in its `.dvc`, and `import-dvc-dir` and `dvc-ls` fail
+  naming the entry (`dvc::ExecutableEntry`).
 - On Windows, `import-dvc-dir`, `folder pull` and every other path bigstore
   writes refuse names Windows cannot create before writing anything, naming
   the path: device names (`CON`, `nul.txt`, `com1.log`, `con .txt`,
   `CONIN$`), a trailing `.` or space, `* ? " < > |` and control characters.
   Before, such a name from a manifest made on Unix failed at the final
   rename. Folder push's portability check refuses the same device names.
+  Only paths about to be created are checked (manifest entries, `ref`'s
+  destination, `import-dvc-dir`'s destination root): paths git reports
+  are read as before, so `log` of a history that once held `docs/aux.md`
+  works on Windows.
+- On Windows, `folder pull` into a path past the 260-character `MAX_PATH`,
+  and `folder push` of an output whose `.dvc` lands past it, failed at the
+  final rename unless both the machine (`LongPathsEnabled`) and the program
+  (its manifest) opted into long paths: std lifts the limit for its own
+  calls, but tempfile's `persist` hands paths to `MoveFileExW` as they are.
+  Those renames and their temp files now use verbatim `\\?\` paths, so any
+  depth works on any machine; paths in reports and errors stay as given. CI
+  checks it on Windows with `LongPathsEnabled` off. Bare relative arguments
+  (`folder push data`, `folder pull store.toml.dvc`, `--into out.bin`, run
+  from the directory holding them) still work: their parent, the empty
+  path, is the current directory.
 - `pull` no longer overwrites uncommitted edits. It fills the cache, then
   replaces only files that are still the index's pointer, via
   `git checkout-index`: restored files keep their committed mode (executables

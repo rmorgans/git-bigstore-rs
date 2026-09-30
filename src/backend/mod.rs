@@ -81,14 +81,15 @@ pub async fn get_bytes(backend: &Backend, key: &str, limit: u64) -> Result<Optio
             if !r.exists(key).await? {
                 return Ok(None);
             }
-            let tmp = tempfile::NamedTempFile::new()?;
-            r.download(key, tmp.path()).await?;
-            let len = tokio::fs::metadata(tmp.path()).await?.len();
+            // No handle open while rclone writes: see `rclone_into`.
+            let path = tempfile::NamedTempFile::new()?.into_temp_path();
+            r.download(key, &path).await?;
+            let len = tokio::fs::metadata(&path).await?.len();
             anyhow::ensure!(
                 len <= limit,
                 "{key} is {len} bytes, over the {limit}-byte limit"
             );
-            Ok(Some(tokio::fs::read(tmp.path()).await?))
+            Ok(Some(tokio::fs::read(&path).await?))
         }
     }
 }
@@ -123,7 +124,7 @@ pub async fn download_verified(
     use tokio::io::AsyncWriteExt;
 
     let tmp = tempfile::NamedTempFile::new_in(dir)?;
-    let actual = match backend {
+    let (tmp, actual) = match backend {
         Backend::ObjectStore(store) => {
             use futures::StreamExt;
             let mut file = tokio::fs::File::from_std(tmp.reopen()?);
@@ -138,12 +139,15 @@ pub async fn download_verified(
                 file.write_all(&chunk).await?;
             }
             file.flush().await?;
-            hasher.finalize()
+            (tmp, hasher.finalize())
         }
         Backend::Rclone(r) => {
-            r.download(key, tmp.path()).await?;
+            let tmp = rclone_into(r, key, tmp).await?;
             let (path, hash_fn) = (tmp.path().to_path_buf(), expected.hash_fn());
-            tokio::task::spawn_blocking(move || crate::hash::hash_file(&path, hash_fn)).await??
+            let actual =
+                tokio::task::spawn_blocking(move || crate::hash::hash_file(&path, hash_fn))
+                    .await??;
+            (tmp, actual)
         }
     };
     anyhow::ensure!(
@@ -151,6 +155,24 @@ pub async fn download_verified(
         "integrity check failed for {key}: expected {expected}, got {actual}"
     );
     Ok(tmp)
+}
+
+/// Have rclone write `key` to `tmp`'s path. rclone replaces the file by
+/// renaming its own partial download over it, which Windows refuses while any
+/// handle to the file is open ("Access is denied"), so ours is closed for the
+/// download and the file reopened afterwards.
+pub(crate) async fn rclone_into(
+    r: &rclone::RcloneBackend,
+    key: &str,
+    tmp: tempfile::NamedTempFile,
+) -> Result<tempfile::NamedTempFile> {
+    let path = tmp.into_temp_path();
+    r.download(key, &path).await?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    Ok(tempfile::NamedTempFile::from_parts(file, path))
 }
 
 /// Upload a local file to the remote. Streams — does not buffer the entire file.

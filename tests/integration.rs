@@ -2795,6 +2795,34 @@ fn ref_reads_a_dvc_import_url_file_with_stage_fields() {
     assert_eq!(t.read_file("imported.txt"), b"hello\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn ref_restores_an_executable_output_as_executable() {
+    // `dvc add` of a 0755 file records `isexec: true`; DVC checks it out +x.
+    use std::os::unix::fs::PermissionsExt;
+    let t = TestRepo::new();
+    copy_stage_fixture(&t, "run.sh.dvc");
+    put_in_dvc_cache(&t, b"#!/bin/sh\n");
+
+    bigstore_ok(&t.repo_dir, &["ref", "run.sh.dvc", "run.sh"]);
+    assert_eq!(t.read_file("run.sh"), b"#!/bin/sh\n");
+    let mode = std::fs::metadata(t.repo_dir.join("run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o100, 0o100, "run.sh is {mode:o}");
+
+    // Without `isexec`, not executable.
+    copy_stage_fixture(&t, "imported.txt.dvc");
+    put_in_dvc_cache(&t, b"hello\n");
+    bigstore_ok(&t.repo_dir, &["ref", "imported.txt.dvc", "imported.txt"]);
+    let mode = std::fs::metadata(t.repo_dir.join("imported.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0, "imported.txt is {mode:o}");
+}
+
 #[test]
 fn dvc_ls_and_import_dvc_dir_read_an_annotated_dvc_file() {
     // `dvc add` plus the top-level `desc:`/`meta:` and per-output

@@ -170,15 +170,24 @@ impl PathSyntax {
 }
 
 impl RepoPath {
-    /// Validate and normalise. Empty and `.` components are dropped, so
-    /// `./a//b/` becomes `a/b`.
+    /// Validate and normalise a path to read, e.g. one git reports. Empty
+    /// and `.` components are dropped, so `./a//b/` becomes `a/b`.
     pub fn new(s: &str) -> Result<Self> {
         Self::new_for(s, PathSyntax::HOST)
     }
 
+    /// [`Self::new`] for a path bigstore is about to create: on Windows,
+    /// every component must also be a name Windows can create.
+    pub fn new_to_create(s: &str) -> Result<Self> {
+        Self::new_to_create_for(s, PathSyntax::HOST)
+    }
+
     fn new_for(s: &str, syntax: PathSyntax) -> Result<Self> {
+        // Syntax, not the host, decides: under Windows rules the `\`/`:`
+        // refusal below already covers every absolute form (`C:\`, `C:/`,
+        // `\\server`), so `PathSyntax::Posix` means the same on every host.
         anyhow::ensure!(
-            !s.starts_with('/') && !Path::new(s).is_absolute(),
+            !s.starts_with('/'),
             "path must be relative to the repository root: {s:?}"
         );
         anyhow::ensure!(!s.contains('\0'), "path contains a NUL byte: {s:?}");
@@ -195,18 +204,24 @@ impl RepoPath {
             match part {
                 "" | "." => {}
                 ".." => anyhow::bail!("path must not contain '..': {s:?}"),
-                p => {
-                    // Refuse up front, naming the path, what Windows would
-                    // only fail to create at the final rename.
-                    if let PathSyntax::Windows = syntax {
-                        check_windows_component(p).with_context(|| format!("path {s:?}"))?;
-                    }
-                    parts.push(p);
-                }
+                p => parts.push(p),
             }
         }
         anyhow::ensure!(!parts.is_empty(), "path is empty: {s:?}");
         Ok(Self(parts.join("/")))
+    }
+
+    /// Refuse up front, naming the path, what Windows would only fail to
+    /// create at the final rename. Reading such a path (it may be in git's
+    /// history) is fine, so only paths about to be created are checked.
+    fn new_to_create_for(s: &str, syntax: PathSyntax) -> Result<Self> {
+        let path = Self::new_for(s, syntax)?;
+        if let PathSyntax::Windows = syntax {
+            for c in path.0.split('/') {
+                check_windows_component(c).with_context(|| format!("path {s:?}"))?;
+            }
+        }
+        Ok(path)
     }
 
     /// Parse a path as git prints it with `-z` (raw bytes, root-relative).
@@ -229,9 +244,13 @@ impl RepoPath {
         RepoPath(format!("{}/{}", self.0, child.0))
     }
 
-    /// The on-disk location under `repo_root`.
+    /// The on-disk location under `repo_root`, joined component by
+    /// component so it uses the native separator (`\` on Windows) rather
+    /// than keeping the stored `/`.
     pub fn to_fs_path(&self, repo_root: &Path) -> PathBuf {
-        repo_root.join(&self.0)
+        let mut path = repo_root.to_path_buf();
+        path.extend(self.0.split('/'));
+        path
     }
 }
 
@@ -271,7 +290,7 @@ impl ManifestPath {
     }
 
     pub(crate) fn to_repo_path_for(&self, syntax: PathSyntax) -> Result<RepoPath> {
-        RepoPath::new_for(&self.0, syntax)
+        RepoPath::new_to_create_for(&self.0, syntax)
             .with_context(|| format!("cannot write {:?} on this OS", self.0))
     }
 }
@@ -359,6 +378,56 @@ impl fmt::Display for PortableRelPath {
     }
 }
 
+/// `path` in the form to hand to code that calls Win32 directly: on
+/// Windows, absolute and verbatim (`\\?\C:\…`, `\\?\UNC\server\share\…`),
+/// which the OS opens without the 260-character `MAX_PATH` limit whether or
+/// not the process opted into long paths. Elsewhere `path` itself.
+///
+/// `std::fs` needs none of this (it makes every path it is given verbatim
+/// once it is long), but tempfile's `persist` passes both the temp file's
+/// path and the destination to `MoveFileExW` as they are. So a temp file
+/// that will be persisted must be created in a `long_path` directory and
+/// persisted to a `long_path` destination. Only for I/O: paths shown to
+/// users or returned to callers stay in the caller's form.
+///
+/// The empty path (the parent of a bare file name) means the current
+/// directory.
+pub(crate) fn long_path(path: &Path) -> std::io::Result<std::borrow::Cow<'_, Path>> {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let absolute = std::path::absolute(path)?;
+        let mut components = absolute.components();
+        let mut verbatim = std::ffi::OsString::from(r"\\?\");
+        match components.next() {
+            Some(Component::Prefix(p)) => match p.kind() {
+                Prefix::Disk(_) => verbatim.push(p.as_os_str()),
+                Prefix::UNC(server, share) => {
+                    verbatim.push(r"UNC\");
+                    verbatim.push(server);
+                    verbatim.push(r"\");
+                    verbatim.push(share);
+                }
+                // Already verbatim, or a device path.
+                _ => return Ok(absolute.into()),
+            },
+            _ => return Ok(absolute.into()),
+        }
+        // Pushing onto a verbatim path joins with `\` (a `/` would be
+        // taken literally) and drops `.`/`..`, which `absolute` resolved.
+        let mut long = PathBuf::from(verbatim);
+        long.extend(components);
+        Ok(long.into())
+    }
+    #[cfg(not(windows))]
+    Ok(path.into())
+}
+
 /// A validated storage layout template. Guarantees:
 /// - Contains `{prefix}` and `{rest}` placeholders
 /// - Produces deterministic, safe object keys
@@ -432,6 +501,39 @@ impl<'de> Deserialize<'de> for Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every form a root can take comes out absolute, verbatim and with `\`
+    /// only (a verbatim path takes `/` literally), naming the same place.
+    #[cfg(windows)]
+    #[test]
+    fn long_path_is_absolute_verbatim_and_backslashed() {
+        let long = |p: &str| {
+            long_path(Path::new(p))
+                .unwrap()
+                .into_owned()
+                .into_os_string()
+        };
+        assert_eq!(long(r"C:/data/./x/../y/z"), r"\\?\C:\data\y\z");
+        assert_eq!(long(r"\\srv\share/a/b"), r"\\?\UNC\srv\share\a\b");
+        assert_eq!(long(r"\\?\C:\a\b"), r"\\?\C:\a\b");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            long("rel/dir"),
+            format!(r"\\?\{}\rel\dir", cwd.display()).as_str()
+        );
+        // `Path::new("data.dvc").parent()` is `""`: the current directory.
+        assert_eq!(long(""), format!(r"\\?\{}", cwd.display()).as_str());
+    }
+
+    /// A bare file name's parent is the empty path; it must name the
+    /// current directory, not fail (`std::path::absolute("")` is an error).
+    #[test]
+    fn long_path_of_an_empty_path_is_the_current_directory() {
+        let empty = Path::new("data.dvc").parent().unwrap();
+        assert_eq!(empty, Path::new(""));
+        let long = long_path(empty).unwrap();
+        assert!(long.is_dir(), "{}", long.display());
+    }
 
     #[test]
     fn hexdigest_valid_sha256() {
@@ -615,6 +717,8 @@ mod tests {
     /// Names Windows cannot create (device names, trailing `.`/space,
     /// `*?"<>|`, control characters) are valid on Unix but refused before
     /// writing on Windows, naming the path, instead of failing at rename.
+    /// Parsing one (a path git reports, e.g. `docs/aux.md` in `log`) still
+    /// works: only creating it is refused.
     #[test]
     fn windows_refuses_names_it_cannot_create_and_names_the_path() {
         for name in [
@@ -634,6 +738,7 @@ mod tests {
             "star*",
             "q\"uote.txt",
             "tab\there.txt",
+            "docs/aux.md",
         ] {
             let p = ManifestPath::new(name).unwrap();
             assert_eq!(
@@ -642,10 +747,14 @@ mod tests {
             );
             let err = p.to_repo_path_for(PathSyntax::Windows).unwrap_err();
             assert!(format!("{err:#}").contains(&format!("{name:?}")), "{err:#}");
-            assert!(
-                RepoPath::new_for(name, PathSyntax::Windows).is_err(),
-                "{name:?}"
+            assert_eq!(
+                RepoPath::new_for(name, PathSyntax::Windows)
+                    .unwrap()
+                    .as_str(),
+                name
             );
+            let err = RepoPath::new_to_create_for(name, PathSyntax::Windows).unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("{name:?}")), "{err:#}");
         }
         for ok in [
             "console.txt",
@@ -657,7 +766,7 @@ mod tests {
             "a/./b",
             "caf\u{e9}.txt",
         ] {
-            RepoPath::new_for(ok, PathSyntax::Windows).unwrap();
+            RepoPath::new_to_create_for(ok, PathSyntax::Windows).unwrap();
         }
     }
 
