@@ -430,8 +430,17 @@ git bigstore folder push ds/annotations/reviewer=rick/host=mac \
     --history ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
 git bigstore folder push ds/store.toml --history ST032/Beatons/store.toml --remote $R
 
+# What push would upload, and whether this is the latest version; writes
+# nothing (same arguments as push).
+git bigstore folder status ds/annotations/reviewer=rick/host=mac \
+    --history ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
+
 # Every version ever pushed, oldest first.
 git bigstore folder log ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
+
+# Every history key, or those under a prefix (whole path components):
+# here, every reviewer and host that pushed annotations.
+git bigstore folder keys ST032/Beatons/annotations --remote $R
 
 # Restore: from a .dvc file, or any version from history.
 git bigstore folder pull ds/store.toml.dvc --remote $R
@@ -452,7 +461,9 @@ What it guarantees:
 - **History without git.** Every push that changes an output appends its
   pointer to `bigstore-history/<key>/` on the remote. A push that changes
   nothing adds nothing. Versions are ordered by push time; each record is a
-  valid `.dvc` file.
+  valid `.dvc` file, named `<time>-<id>.dvc`, so push and pull pick a
+  version from one listing and fetch only that record, however long the
+  history.
 - **Pull never destroys local work.** It refuses to replace a file that
   differs unless forced, never deletes files missing from the version, never
   writes through a symlink, and writes via temp file plus rename (never a
@@ -467,7 +478,10 @@ What it guarantees:
   them where the OS allows it; on Windows it refuses by name, before writing
   anything, `\` and `:` (they would change the path) and names Windows
   cannot create (`nul.txt`, `com1`, a trailing `.` or space, `*?"<>|`).
-  Names that differ only by case are refused everywhere.
+  Names that differ only by case (`Ä`/`ä` as well as `A`/`a`) or by Unicode
+  normalization (`é` as one code point or as `e` plus an accent, as macOS
+  and Linux may each write it) are refused everywhere, before anything is
+  written: macOS and Windows would store them as one file.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
 - **Skips OS junk.** `.DS_Store` (Finder writes one just by showing a
@@ -504,7 +518,10 @@ As a library (`default-features = false, features = ["ring"]` or
 [Cargo features](#cargo-features)):
 
 ```rust
-use bigstore::folder::{self, Credentials, Excludes, HistoryKey, PushOptions, Remote, RemoteConfig};
+use bigstore::folder::{
+    self, Credentials, Excludes, HistoryKey, PointerSource, PullOptions, PushOptions, Remote,
+    RemoteConfig,
+};
 
 let remote = Remote::open(&RemoteConfig {
     url: "s3://my-bucket/dvc".into(),
@@ -512,11 +529,96 @@ let remote = Remote::open(&RemoteConfig {
     region: Some("ap-southeast-2".into()),
     credentials: Credentials::Static { access_key_id, secret_access_key },
 })?;
+let key = HistoryKey::new("ST032/Beatons/annotations/reviewer=rick/host=mac")?;
 let report = folder::push(&remote, dir, &PushOptions {
-    history: HistoryKey::new("ST032/Beatons/annotations/reviewer=rick/host=mac")?,
-    jobs: 8,
-    exclude: Excludes::default(), // or Excludes::new(["*.tmp", "/cache/"])?
+    exclude: Excludes::new(["*.tmp", "/cache/"])?, // default: Excludes::default()
+    ..PushOptions::new(key) // 8 jobs, default excludes, never cancelled
 })?;
+let pulled = folder::pull(&remote, &PointerSource::File(dvc_file), &PullOptions::default())?;
+```
+
+Build options from `PushOptions::new(history)` or `PullOptions::default()`
+and override fields with `..`, as above: options added later get their
+defaults there, so a caller pinned to a revision keeps compiling when it
+moves to the next one. A struct literal naming every field does not.
+
+Cancelling from another thread (a request handler, a UI button): every
+clone of a `CancelToken` shares one flag. Push, status and pull check it
+between files and between objects; whatever is being hashed, uploaded or
+downloaded at that moment finishes first. The call then returns
+`folder::Error::Cancelled`. A cancelled push has written no `.dvc` and no
+history record (objects already uploaded stay; they are content-addressed,
+and the next push skips them); the check before the `.dvc` is written is
+the last, after which the push completes. A cancelled pull leaves every file
+as it was or fully restored, never partly written, and no temp files.
+`git bigstore folder` cancels this way on the first Ctrl-C (a second one
+exits at once).
+
+```rust
+let cancel = folder::CancelToken::new();
+let opts = PushOptions { cancel: cancel.clone(), ..PushOptions::new(key) };
+std::thread::spawn(move || { /* later */ cancel.cancel() });
+match folder::push(&remote, dir, &opts) {
+    Err(e) if matches!(e.downcast_ref(), Some(folder::Error::Cancelled)) => { /* nothing published */ }
+    other => { other?; }
+}
+```
+
+Progress, for a bar or a job status: a `Progress` callback gets
+`ProgressEvent::Started { phase, files, bytes }` when a phase begins
+(`Phase::Hashing`, `Uploading` or `Downloading`; `bytes` is `None` when the
+size is unknown up front, as for a directory's download) and
+`Advanced { phase, files, bytes }` per finished file. It is called from
+worker threads, possibly concurrently, so it must be `Send + Sync`; the
+default does nothing and costs nothing. The library does not depend on
+`indicatif`; the CLI draws its bars from these events.
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+let done = std::sync::Arc::new(AtomicU64::new(0));
+let seen = done.clone();
+let opts = PushOptions {
+    progress: folder::Progress::new(move |event| {
+        if let folder::ProgressEvent::Advanced { phase: folder::Phase::Uploading, bytes, .. } = event {
+            seen.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }),
+    ..PushOptions::new(key)
+};
+```
+
+History, from the library:
+
+```rust
+// Other writers' outputs, without holding any pointer: every key equal to
+// or below the prefix (`None` lists all). One listing, no record fetched.
+let under = HistoryKey::new("ST032/Beatons/annotations")?;
+for key in folder::keys(&remote, Some(&under))? {
+    // Every version of it, oldest first, records fetched 8 at a time.
+    for v in folder::log(&remote, &key, 8)? {
+        println!("{}  {}  {}", key.as_str(), v.time, v.id());
+    }
+}
+```
+
+Dry run: `folder::status` walks, snapshots and hashes the output exactly as
+`push` does (and refuses what push refuses), asks the remote which contents
+it has and fetches the latest history record, and writes nothing, on the
+remote or beside the output. Snapshots go to a private temp directory one
+file at a time. `sync` compares the output with the latest version, using
+the `.dvc` beside it as the version it was last pushed or pulled as:
+
+```rust
+let s = folder::status(&remote, dir, &opts)?; // the PushOptions push would get
+println!("{} to upload ({} bytes)", s.to_upload, s.to_upload_bytes);
+match s.sync {
+    folder::SyncState::NoHistory => {}           // never pushed
+    folder::SyncState::InSync => {}              // push would add no version
+    folder::SyncState::LocalAhead => {}          // changed since its .dvc: push
+    folder::SyncState::RemoteAhead { latest } => {} // newer version elsewhere: pull
+    folder::SyncState::Diverged { latest } => {} // both changed (or no .dvc)
+    _ => {}                                      // #[non_exhaustive]
+}
 ```
 
 The functions block and run their own tokio runtime. Calling them from inside
@@ -539,6 +641,9 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `EndpointRequired` | an `s3://` remote without an endpoint |
 | `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
 | `InvalidExclude { pattern }` | an exclude pattern that does not compile (or uses `!`) |
+| `InvalidHistoryKey { key }` | `HistoryKey::new` of a key that is not a relative `/`-separated path of portable names |
+| `DestinationRequired` | a pull from history without `PullOptions::into` |
+| `Cancelled` | the caller's `CancelToken` was cancelled; a push published no `.dvc` or history record, a pull wrote no partial file |
 
 | `folder::Refusal` | Refused by | `path` is |
 | --- | --- | --- |
@@ -546,6 +651,7 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `ForeignPointer` (not a plain DVC 3 pointer), `PointerForOtherOutput { other }` | push, the `.dvc` beside the output | the `.dvc` |
 | `ControlFile` (`.git`, `.hg`, `.dvc`, `.dvcignore`, `*.dvc`), `SymlinkToDirectory`, `BrokenSymlink`, `SpecialFile`, `NonPortableName { detail }`, `NotUtf8Name` | push, inside a directory | relative to the output, `/`-separated |
 | `PointerPathEscapes { output }` | pull, a `.dvc` naming an output outside its directory | the `.dvc` |
+| `UnrestorablePointer` (not a DVC 3 pointer to one md5-addressed output: `cache: false`, etag-only, several outputs, `wdir:`…; stage fields and annotations are fine) | pull, the `.dvc` | the `.dvc` |
 | `SymlinkedOutput`, `NotADirectory`, `NotRegularFile`, `AppearedWhilePulling` | pull, the destination | the filesystem path |
 | `CaseCollision { other }`, `UnwritableName` (`\` or `:` on Windows) | pull, the manifest | the manifest name |
 

@@ -42,12 +42,54 @@
   (`default-features = false, features = ["ring"]`) no longer builds
   aws-lc-rs. With neither, cloud URLs fail with an error naming both
   features; `local://` and `rclone://` still work.
+- `folder::keys(&remote, under)` and `git bigstore folder keys [PREFIX]` list
+  the history keys on a remote (all, or those equal to or below a prefix, by
+  whole path components), so a host can find other writers' outputs without
+  a pointer. One listing; nested keys (`k` and `k/sub`) are both reported and
+  objects that are not records are ignored.
+- `folder::status(&remote, output, &push_options)` and `git bigstore folder
+  status` (push's arguments): what a push would upload (distinct contents and
+  bytes, and what the remote already has), the pointer it would write, and
+  `SyncState` against the latest history version (`NoHistory`, `InSync`,
+  `LocalAhead`, `RemoteAhead`, `Diverged`, judged by the `.dvc` beside the
+  output). It shares push's walk, snapshot and hashing, refuses what push
+  refuses, and writes nothing to the remote or beside the output.
+- `PushReport::already_present` counts what the remote already had when its
+  manifest was there too; a push of an unchanged directory used to report
+  `0 uploaded, 0 already on the remote`.
+- Cancellation for folder mode: `folder::CancelToken` (cloneable, shared
+  flag), as `PushOptions::cancel` and `PullOptions::cancel`, checked between
+  files and between objects by push, status and pull; the call returns
+  `folder::Error::Cancelled`. A cancelled push writes no `.dvc` and no
+  history record; a cancelled pull leaves no partly written file.
+  `git bigstore folder push|status|pull` cancel this way on the first Ctrl-C.
+  `PushOptions::new(history)` and `PullOptions::default()` give the defaults
+  (8 jobs), so new options fields no longer break struct literals written
+  as `PushOptions { jobs: 4, ..PushOptions::new(key) }`.
+- Progress for folder mode: `folder::Progress::new(|event| …)` as
+  `PushOptions::progress` and `PullOptions::progress` receives
+  `ProgressEvent::Started { phase, files, bytes }` and
+  `Advanced { phase, files, bytes }` per finished file, for the phases
+  `Hashing`, `Uploading` and `Downloading`. The callback is `Send + Sync`,
+  usable from sync callers, and free when unset; the library needs no
+  `indicatif`. `git bigstore folder push|status|pull` draw a bar per phase
+  on a terminal.
+- `folder pull` refuses, as `Refusal::CaseCollision`, manifest names that
+  differ only by Unicode normalization (NFC `é` vs NFD `e` + accent) or by
+  non-ASCII case (`Ä`/`ä`), on every OS, before writing anything. Only ASCII
+  case was folded before, so on macOS such a pair restored one file and then
+  failed with "appeared while pulling". New dependency:
+  `unicode-normalization` (std has no NFC).
 
 ### Security
 
 - On Windows, `RepoPath` rejects `\` and `:`. Before this, a hostile DVC
   manifest could make `import-dvc-dir` write outside the repository via
   `a\..\..\x` or a drive-relative `C:x`.
+- `folder push` and `folder status` create their snapshot temp directory
+  mode 0700 on unix; it was 0755 under the usual umask. The copies inside
+  were already 0600; now other users cannot list or enter the directory
+  either.
 
 ### Changed
 
@@ -76,6 +118,22 @@
   skips more, with `.gitignore` rules relative to the pushed directory.
   Anyone also running `dvc add` on the folder needs the same patterns in
   `.dvcignore`; the README gives the lines.
+- **Folder history is read by listing.** A record's name holds its time and
+  id, so `folder push` and `folder pull --history` now fetch only the one
+  record they need instead of every record of the key (a push onto 50
+  versions made 50 GETs; now 1). `folder::log` takes a `jobs` argument and
+  fetches records that many at a time (`folder log -j`). A record whose
+  pointer is not the version its name says is refused as a bad record, and
+  a malformed `--at` is refused before the remote is contacted.
+- **`folder pull` reads any single-output DVC 3 `.dvc`**, ignoring stage
+  fields and annotations (`dvc import-url`'s `deps`/`frozen`/`md5`,
+  `dvc add --desc`), since it never rewrites the file; before, it refused
+  them ("has fields bigstore does not write"). A `.dvc` with nothing to
+  restore (`cache: false`, etag-only, several outputs, `wdir:`) is now the
+  typed `Refusal::UnrestorablePointer`, the parse error below it.
+- An invalid `HistoryKey` is `folder::Error::InvalidHistoryKey { key }` and
+  a history pull without `into` is `folder::Error::DestinationRequired`;
+  both were untyped. Messages are unchanged apart from naming the key.
 
 ### Fixed
 

@@ -149,25 +149,122 @@ struct RemoteArgs {
     region: Option<String>,
 }
 
+/// What `folder push` backs up, and how; `folder status` takes the same.
+#[derive(clap::Args)]
+struct FolderPushArgs {
+    /// Directory or file to back up
+    path: PathBuf,
+    /// History key, e.g. <survey>/<dataset>/<output path>
+    #[arg(long)]
+    history: String,
+    #[command(flatten)]
+    remote: RemoteArgs,
+    #[arg(short, long)]
+    jobs: Option<NonZeroUsize>,
+    /// Also skip entries matching this .gitignore-style pattern, relative
+    /// to the directory (repeatable). .DS_Store, ._*, Thumbs.db and
+    /// desktop.ini are always skipped.
+    #[arg(long, value_name = "PATTERN")]
+    exclude: Vec<String>,
+}
+
+impl FolderPushArgs {
+    fn open(&self) -> Result<(bigstore::folder::Remote, bigstore::folder::PushOptions)> {
+        use bigstore::folder::{Excludes, HistoryKey, PushOptions};
+        let opts = PushOptions {
+            jobs: resolve_jobs(self.jobs)?.get(),
+            exclude: Excludes::new(&self.exclude)?,
+            cancel: cancel_on_ctrl_c()?,
+            progress: progress_bars(),
+            ..PushOptions::new(HistoryKey::new(&self.history)?)
+        };
+        Ok((open_folder_remote(&self.remote)?, opts))
+    }
+}
+
+/// One bar on stderr per phase of a folder command, in bytes when the
+/// phase's size is known and in files otherwise. Nothing is drawn when
+/// stderr is not a terminal; the last bar is cleared when the options
+/// holding it are dropped.
+fn progress_bars() -> bigstore::folder::Progress {
+    use bigstore::folder::{Phase, Progress, ProgressEvent};
+    use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
+    // The bar, and whether it counts bytes (else files).
+    let current = std::sync::Mutex::new(None::<(ProgressBar, bool)>);
+    Progress::new(move |event| {
+        let mut current = current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match event {
+            ProgressEvent::Started {
+                phase,
+                files,
+                bytes,
+            } => {
+                if let Some((done, _)) = current.take() {
+                    done.finish_and_clear();
+                }
+                let label = match phase {
+                    Phase::Hashing => "hashing",
+                    Phase::Uploading => "uploading",
+                    Phase::Downloading => "downloading",
+                    _ => "working",
+                };
+                let (len, counts, by_bytes) = match bytes {
+                    Some(b) => (b, "{bytes}/{total_bytes}", true),
+                    None => (files, "{pos}/{len} files", false),
+                };
+                let style = ProgressStyle::with_template(&format!(
+                    "{{prefix:>11}} [{{bar:30.cyan/blue}}] {counts}"
+                ))
+                .expect("progress template is valid")
+                .progress_chars("#>-");
+                let bar = ProgressBar::new(len)
+                    .with_style(style)
+                    .with_prefix(label)
+                    .with_finish(ProgressFinish::AndClear);
+                *current = Some((bar, by_bytes));
+            }
+            ProgressEvent::Advanced { files, bytes, .. } => {
+                if let Some((bar, by_bytes)) = &*current {
+                    bar.inc(if *by_bytes { bytes } else { files });
+                }
+            }
+            _ => {}
+        }
+    })
+}
+
+/// A token the first Ctrl-C cancels, so a folder command stops cleanly
+/// (a push publishes nothing); a second Ctrl-C exits at once.
+fn cancel_on_ctrl_c() -> Result<bigstore::folder::CancelToken> {
+    let token = bigstore::folder::CancelToken::new();
+    let cancel = token.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the Ctrl-C watcher")?;
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("cancelling; Ctrl-C again to stop at once");
+                cancel.cancel();
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    std::process::exit(130);
+                }
+            }
+        })
+    });
+    Ok(token)
+}
+
 #[derive(Subcommand)]
 enum FolderCommand {
     /// Back up a directory or file; writes <name>.dvc beside it
-    Push {
-        /// Directory or file to back up
-        path: PathBuf,
-        /// History key, e.g. <survey>/<dataset>/<output path>
-        #[arg(long)]
-        history: String,
-        #[command(flatten)]
-        remote: RemoteArgs,
-        #[arg(short, long)]
-        jobs: Option<NonZeroUsize>,
-        /// Also skip entries matching this .gitignore-style pattern, relative
-        /// to the directory (repeatable). .DS_Store, ._*, Thumbs.db and
-        /// desktop.ini are always skipped.
-        #[arg(long, value_name = "PATTERN")]
-        exclude: Vec<String>,
-    },
+    Push(FolderPushArgs),
+    /// Say what push would upload and whether the output is the latest
+    /// version in its history, without writing anything
+    Status(FolderPushArgs),
     /// Restore from a .dvc file, or from history with --history
     Pull {
         /// The .dvc file to restore (omit with --history)
@@ -192,6 +289,15 @@ enum FolderCommand {
     /// List the versions of a history key
     Log {
         history: String,
+        #[command(flatten)]
+        remote: RemoteArgs,
+        #[arg(short, long)]
+        jobs: Option<NonZeroUsize>,
+    },
+    /// List the history keys on the remote, optionally only those under PREFIX
+    Keys {
+        /// Only keys equal to or below this one, e.g. <survey>/<dataset>/annotations
+        prefix: Option<String>,
         #[command(flatten)]
         remote: RemoteArgs,
     },
@@ -695,23 +801,11 @@ fn open_folder_remote(args: &RemoteArgs) -> Result<bigstore::folder::Remote> {
 fn cmd_folder(cmd: FolderCommand) -> Result<()> {
     use bigstore::folder::{self, HistoryKey, Overwrite, PointerSource, Selector};
     match cmd {
-        FolderCommand::Push {
-            path,
-            history,
-            remote,
-            jobs,
-            exclude,
-        } => {
-            let remote = open_folder_remote(&remote)?;
-            let r = folder::push(
-                &remote,
-                &path,
-                &folder::PushOptions {
-                    history: HistoryKey::new(&history)?,
-                    jobs: resolve_jobs(jobs)?.get(),
-                    exclude: folder::Excludes::new(&exclude)?,
-                },
-            )?;
+        FolderCommand::Push(args) => {
+            let r = {
+                let (remote, opts) = args.open()?;
+                folder::push(&remote, &args.path, &opts)?
+            };
             for w in &r.warnings {
                 eprintln!("warning: {w}");
             }
@@ -730,6 +824,46 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                     " (unchanged since the last version)"
                 }
             );
+        }
+        FolderCommand::Status(args) => {
+            let s = {
+                let (remote, opts) = args.open()?;
+                folder::status(&remote, &args.path, &opts)?
+            };
+            for w in &s.warnings {
+                eprintln!("warning: {w}");
+            }
+            if s.empty_dirs > 0 {
+                eprintln!(
+                    "{} empty dir(s) would not be recorded (DVC cannot)",
+                    s.empty_dirs
+                );
+            }
+            println!(
+                "{} file(s): {} to upload ({} bytes), {} already on the remote ({} bytes)",
+                s.files, s.to_upload, s.to_upload_bytes, s.already_present, s.already_present_bytes
+            );
+            let when = |r: &folder::HistoryRecord| {
+                r.time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            };
+            match &s.sync {
+                folder::SyncState::NoHistory => println!("no version in history yet"),
+                folder::SyncState::InSync => println!("in sync: this is the latest version"),
+                folder::SyncState::LocalAhead => {
+                    println!("changed since the latest version; push to record it")
+                }
+                folder::SyncState::RemoteAhead { latest } => println!(
+                    "history has a newer version, {} pushed {}; pull to update",
+                    latest.id(),
+                    when(latest)
+                ),
+                folder::SyncState::Diverged { latest } => println!(
+                    "diverged: changed locally, and history has another version, {} pushed {}",
+                    latest.id(),
+                    when(latest)
+                ),
+                _ => println!("unknown sync state"),
+            }
         }
         FolderCommand::Pull {
             pointer,
@@ -766,6 +900,8 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                         Overwrite::Refuse
                     },
                     jobs: resolve_jobs(jobs)?.get(),
+                    cancel: cancel_on_ctrl_c()?,
+                    progress: progress_bars(),
                 },
             )?;
             eprintln!(
@@ -773,9 +909,14 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                 r.written, r.unchanged, r.extra_local
             );
         }
-        FolderCommand::Log { history, remote } => {
+        FolderCommand::Log {
+            history,
+            remote,
+            jobs,
+        } => {
             let remote = open_folder_remote(&remote)?;
-            for r in folder::log(&remote, &HistoryKey::new(&history)?)? {
+            let key = HistoryKey::new(&history)?;
+            for r in folder::log(&remote, &key, resolve_jobs(jobs)?.get())? {
                 let (kind, detail) = match &r.pointer.output {
                     dvc::DvcOutput::Dir { size, nfiles, .. } => {
                         ("dir", format!("{nfiles} files, {size} bytes"))
@@ -787,6 +928,13 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                     r.time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     r.id()
                 );
+            }
+        }
+        FolderCommand::Keys { prefix, remote } => {
+            let remote = open_folder_remote(&remote)?;
+            let prefix = prefix.as_deref().map(HistoryKey::new).transpose()?;
+            for key in folder::keys(&remote, prefix.as_ref())? {
+                println!("{}", key.as_str());
             }
         }
     }

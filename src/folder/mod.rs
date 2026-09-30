@@ -12,6 +12,7 @@
 //! Nothing here calls git.
 
 mod error;
+mod history;
 mod snapshot;
 mod walk;
 
@@ -19,13 +20,16 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub use crate::backend::store::Credentials;
 use crate::backend::{self, Backend};
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
-use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath, PortableRelPath};
+use crate::types::{check_portable_component, Hexdigest, Layout, ManifestPath};
 pub use error::{Error, Refusal};
+pub use history::{keys, log, HistoryKey, HistoryRecord, Selector};
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
 use snapshot::{Snapshot, SnapshotError};
@@ -33,8 +37,6 @@ use walk::WalkError;
 
 /// Largest `.dir` manifest pull will fetch into memory.
 const MAX_MANIFEST_BYTES: u64 = 64 << 20;
-/// Largest history record pull will fetch.
-const MAX_RECORD_BYTES: u64 = 64 << 10;
 /// How often push restarts when files change under it.
 const PUSH_ATTEMPTS: usize = 3;
 
@@ -129,146 +131,110 @@ fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output> {
 }
 
 // ──────────────────────────────────────────────────
-// History
+// Cancellation
 // ──────────────────────────────────────────────────
 
-/// Identifies an output across hosts and time, e.g.
-/// `ST032_Warrawoona/BeatonsCreek_dataset1_September2026/annotations/reviewer=rick/host=xenoglossicist`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryKey(PortableRelPath);
+/// Stops a push, status or pull from another thread. Clones share one flag;
+/// the default token is never cancelled (nobody else holds it). Checked
+/// between files and between objects: a file being hashed, uploaded or
+/// downloaded when it is cancelled is finished first. A cancelled call
+/// returns [`Error::Cancelled`].
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
 
-impl HistoryKey {
-    pub fn new(key: &str) -> Result<Self> {
-        Ok(Self(
-            PortableRelPath::new(key).context("invalid history key")?,
-        ))
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
+    /// Cancel every call holding a clone of this token. Idempotent.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
     }
-}
 
-/// One pushed version of an output.
-#[derive(Debug, Clone)]
-pub struct HistoryRecord {
-    /// Remote key of the record.
-    pub key: String,
-    /// When it was pushed (UTC), as recorded in the key.
-    pub time: chrono::DateTime<chrono::Utc>,
-    pub pointer: DvcPointer,
-}
-
-/// Record key time format: fixed width, so key order is time order.
-const RECORD_TIME: &str = "%Y%m%dT%H%M%S%.9fZ";
-
-impl HistoryRecord {
-    /// The id this version is addressed by: manifest id or file md5.
-    pub fn id(&self) -> &Hexdigest {
-        output_id(&self.pointer.output)
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
-}
 
-fn output_id(output: &DvcOutput) -> &Hexdigest {
-    match output {
-        DvcOutput::Dir { manifest, .. } => manifest,
-        DvcOutput::File { md5, .. } => md5,
-    }
-}
-
-/// Which version to restore.
-#[derive(Debug, Clone)]
-pub enum Selector {
-    Latest,
-    /// An id prefix of at least 8 hex characters; must match one version.
-    Id(String),
-    /// The newest version pushed at or before this time (RFC 3339).
-    AtOrBefore(String),
-}
-
-fn history_prefix(remote: &Remote, key: &HistoryKey) -> String {
-    remote.key(&format!("bigstore-history/{}/", key.as_str()))
-}
-
-async fn read_history(remote: &Remote, key: &HistoryKey) -> Result<Vec<HistoryRecord>> {
-    let prefix = history_prefix(remote, key);
-    let mut records = Vec::new();
-    for object in backend::list(&remote.backend, &prefix).await? {
-        let Some(name) = object.strip_prefix(&prefix) else {
-            continue;
-        };
-        // Records sit directly under the prefix; deeper keys are other outputs.
-        if name.contains('/') || !name.ends_with(".dvc") {
-            continue;
+    fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            return Err(Error::Cancelled.into());
         }
-        let Some(time) = name
-            .split_once('-')
-            .and_then(|(t, _)| chrono::NaiveDateTime::parse_from_str(t, RECORD_TIME).ok())
-        else {
-            continue; // not a record this version wrote
-        };
-        let time = time.and_utc();
-        let bytes = backend::get_bytes(&remote.backend, &object, MAX_RECORD_BYTES)
-            .await?
-            .with_context(|| format!("history record {object} vanished"))?;
-        let text = String::from_utf8(bytes).with_context(|| format!("{object} is not UTF-8"))?;
-        let pointer = DvcPointer::parse(&text).with_context(|| format!("bad record {object}"))?;
-        records.push(HistoryRecord {
-            key: object,
-            time,
-            pointer,
-        });
+        Ok(())
     }
-    records.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.key.cmp(&b.key)));
-    Ok(records)
 }
 
-/// Every pushed version of `key`, oldest first.
-pub fn log(remote: &Remote, key: &HistoryKey) -> Result<Vec<HistoryRecord>> {
-    block_on(read_history(remote, key))?
+// ──────────────────────────────────────────────────
+// Progress
+// ──────────────────────────────────────────────────
+
+/// A stretch of work a progress display can show as one bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Phase {
+    /// Push and status: snapshotting and hashing the output. Pull: hashing
+    /// the local files it may replace.
+    Hashing,
+    /// Push: uploading contents the remote lacks.
+    Uploading,
+    /// Pull: downloading and placing files.
+    Downloading,
 }
 
-fn select<'a>(records: &'a [HistoryRecord], at: &Selector) -> Result<&'a HistoryRecord> {
-    let found = match at {
-        Selector::Latest => records.last(),
-        Selector::Id(prefix) => {
-            if prefix.len() < 8 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(Error::InvalidVersionId {
-                    prefix: prefix.clone(),
-                }
-                .into());
-            }
-            let prefix = prefix.to_ascii_lowercase();
-            let matches: Vec<&HistoryRecord> = records
-                .iter()
-                .filter(|r| r.id().to_string().starts_with(&prefix))
-                .collect();
-            match matches.as_slice() {
-                [] => None,
-                [one] => Some(*one),
-                many => {
-                    return Err(Error::AmbiguousId {
-                        prefix,
-                        candidates: many.iter().map(|r| (*r).clone()).collect(),
-                    }
-                    .into())
-                }
-            }
+/// What [`Progress`] is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProgressEvent {
+    /// A phase starts, with its totals: files, and bytes when known up
+    /// front (a directory's download size is not). A push that restarts
+    /// because files changed under it starts [`Phase::Hashing`] again.
+    Started {
+        phase: Phase,
+        files: u64,
+        bytes: Option<u64>,
+    },
+    /// Files finished in a phase, and their size. Uploads count distinct
+    /// contents; a download counts every file written from one object.
+    Advanced {
+        phase: Phase,
+        files: u64,
+        bytes: u64,
+    },
+}
+
+/// A progress callback for push, status and pull: one event per phase
+/// start and per finished file. It runs on worker threads, possibly several
+/// at once, so it must be `Send + Sync`, and should return quickly. The
+/// default reports nothing and costs nothing.
+#[derive(Clone, Default)]
+pub struct Progress(Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>);
+
+impl Progress {
+    pub fn new(report: impl Fn(ProgressEvent) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(report)))
+    }
+
+    /// Report `event()`, built only if anyone is listening.
+    fn emit(&self, event: impl FnOnce() -> ProgressEvent) {
+        if let Some(report) = &self.0 {
+            report(event());
         }
-        Selector::AtOrBefore(when) => {
-            let when = chrono::DateTime::parse_from_rfc3339(when)
-                .with_context(|| Error::InvalidTime { time: when.clone() })?
-                .with_timezone(&chrono::Utc);
-            records.iter().rev().find(|r| r.time <= when)
-        }
-    };
-    found.ok_or_else(|| Error::NoSuchVersion.into())
+    }
+}
+
+impl std::fmt::Debug for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = if self.0.is_some() { "set" } else { "none" };
+        write!(f, "Progress({state})")
+    }
 }
 
 // ──────────────────────────────────────────────────
 // Push
 // ──────────────────────────────────────────────────
 
+/// How to push. Build with [`PushOptions::new`] and set what differs:
+/// `PushOptions { jobs: 16, ..PushOptions::new(key) }`.
 #[derive(Debug, Clone)]
 pub struct PushOptions {
     pub history: HistoryKey,
@@ -277,6 +243,23 @@ pub struct PushOptions {
     /// Entries of a directory output to skip; always includes
     /// [`DEFAULT_EXCLUDES`]. Not applied to a single-file output.
     pub exclude: Excludes,
+    /// Stops the push before it writes the `.dvc`; after that it completes.
+    pub cancel: CancelToken,
+    pub progress: Progress,
+}
+
+impl PushOptions {
+    /// Push to `history` with 8 jobs, the default excludes, a token nobody
+    /// else can cancel and no progress reports.
+    pub fn new(history: HistoryKey) -> Self {
+        Self {
+            history,
+            jobs: crate::transfer::DEFAULT_CONCURRENCY,
+            exclude: Excludes::default(),
+            cancel: CancelToken::default(),
+            progress: Progress::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -285,7 +268,9 @@ pub struct PushReport {
     /// The `.dvc` file written (or already identical) next to the output.
     pub pointer_path: PathBuf,
     pub files: usize,
+    /// Distinct contents uploaded (files with the same content count once).
     pub uploaded: usize,
+    /// Distinct contents the remote already had.
     pub already_present: usize,
     /// Empty directories, which DVC cannot record.
     pub empty_dirs: usize,
@@ -313,40 +298,142 @@ pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushRe
 }
 
 async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
+    let (name, pointer_path, _) = locate(output)?;
+    let tmp = snapshot_tmpdir()?;
+    let staged = stage(output, &name, tmp.path(), opts, |s| s)?;
+    let jobs = opts.jobs.max(1);
+    let plan = plan(remote, &staged, jobs).await?;
+
+    upload_all(remote, &plan.upload, opts).await?;
+    if let Some(manifest) = plan.manifest {
+        opts.cancel.check()?;
+        let key = remote.manifest_key(staged.id());
+        backend::put_bytes(&remote.backend, &key, manifest.to_bytes()).await?;
+    }
+    // The last point to stop: past it, the .dvc and history must agree.
+    opts.cancel.check()?;
+    write_pointer_file(&pointer_path, &staged.pointer)?;
+    let history_record = history::append(remote, &opts.history, &staged.pointer).await?;
+
+    Ok(PushReport {
+        uploaded: plan.upload.len(),
+        already_present: plan.present.len(),
+        pointer: staged.pointer,
+        pointer_path,
+        files: staged.files,
+        empty_dirs: staged.empty_dirs,
+        warnings: staged.warnings,
+        history_record,
+    })
+}
+
+/// What [`status`] found: what [`push`] would do with the same arguments.
+#[derive(Debug)]
+pub struct StatusReport {
+    /// The pointer push would write.
+    pub pointer: DvcPointer,
+    pub files: usize,
+    /// Distinct contents push would upload (files with the same content count
+    /// once), and their total size.
+    pub to_upload: usize,
+    pub to_upload_bytes: u64,
+    /// Distinct contents the remote already has, and their total size.
+    pub already_present: usize,
+    pub already_present_bytes: u64,
+    /// Empty directories, which DVC cannot record.
+    pub empty_dirs: usize,
+    /// Non-fatal observations, as push would report them.
+    pub warnings: Vec<String>,
+    /// How the output relates to the latest version in its history.
+    pub sync: SyncState,
+}
+
+/// How a local output relates to the latest version in its history, judged
+/// by the `.dvc` beside it (the version it was last pushed or pulled as).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SyncState {
+    /// The history is empty: push would record the first version.
+    NoHistory,
+    /// The output is the latest version: push would add none.
+    InSync,
+    /// The output changed since the latest version, which its `.dvc`
+    /// records: push would add a version.
+    LocalAhead,
+    /// The history has a newer version than the one the `.dvc` records, and
+    /// the output has not changed since: pull to catch up. A push would
+    /// record the older content as the newest version.
+    RemoteAhead { latest: HistoryRecord },
+    /// The output changed and so did the history since its `.dvc` (or there
+    /// is no `.dvc` to tell): a pull or a push would set one side aside.
+    Diverged { latest: HistoryRecord },
+}
+
+/// What [`push`] would do, without doing it: `output` is walked, snapshotted
+/// and hashed exactly as push does, and the remote is asked which contents
+/// it has and what the latest version is (one history record fetched).
+/// Nothing is written to the remote or beside the output; snapshots go to a
+/// private temp directory, one file at a time. Refuses whatever push
+/// refuses.
+pub fn status(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
+    block_on(status_async(remote, output, opts))?
+}
+
+async fn status_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
+    let (name, _, local) = locate(output)?;
+    let tmp = snapshot_tmpdir()?;
+    let staged = stage(output, &name, tmp.path(), opts, |s| Hashed {
+        md5: s.md5().clone(),
+        size: s.size(),
+    })?;
+    let plan = plan(remote, &staged, opts.jobs.max(1)).await?;
+    let output = &staged.pointer.output;
+    let sync = match history::latest(remote, &opts.history).await? {
+        None => SyncState::NoHistory,
+        Some(latest) if latest.pointer.output == *output => SyncState::InSync,
+        Some(latest) => match local {
+            Some(p) if p.output == latest.pointer.output => SyncState::LocalAhead,
+            Some(p) if p.output == *output => SyncState::RemoteAhead { latest },
+            _ => SyncState::Diverged { latest },
+        },
+    };
+    let bytes = |cs: &[&Hashed]| cs.iter().map(|c| c.size).sum();
+    Ok(StatusReport {
+        to_upload: plan.upload.len(),
+        to_upload_bytes: bytes(&plan.upload),
+        already_present: plan.present.len(),
+        already_present_bytes: bytes(&plan.present),
+        pointer: staged.pointer,
+        files: staged.files,
+        empty_dirs: staged.empty_dirs,
+        warnings: staged.warnings,
+        sync,
+    })
+}
+
+/// A private temp directory for snapshots: on unix only the owner may enter
+/// it (the copies hold whatever the output holds); elsewhere the per-user
+/// temp directory already is private.
+fn snapshot_tmpdir() -> Result<tempfile::TempDir> {
+    #[cfg(unix)]
+    let dir = {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    };
+    #[cfg(not(unix))]
+    let dir = tempfile::tempdir();
+    dir.context("failed to create a temp dir")
+}
+
+/// The output's name, its `.dvc` path, and the pointer already there (push
+/// refuses to replace anything else).
+fn locate(output: &Path) -> Result<(String, PathBuf, Option<DvcPointer>)> {
     let name = output_name(output)?;
     let pointer_path = pointer_path_for(output)?;
-    check_existing_pointer(&pointer_path, &name)?;
-    let meta = std::fs::symlink_metadata(output)
-        .with_context(|| format!("failed to stat {}", output.display()))?;
-    let tmp = tempfile::tempdir().context("failed to create a temp dir")?;
-
-    let mut last_change = String::new();
-    for _ in 0..PUSH_ATTEMPTS {
-        let attempt = if meta.is_dir() {
-            snapshot_dir(output, tmp.path(), &opts.exclude)
-        } else if meta.is_file() {
-            snapshot_file(output, tmp.path())
-        } else {
-            return Err(Error::Refused {
-                path: output.to_path_buf(),
-                reason: Refusal::NotFileOrDirectory,
-            }
-            .into());
-        };
-        let staged = match attempt {
-            Ok(s) => s,
-            Err(Retry::Changed(msg)) => {
-                last_change = msg;
-                continue;
-            }
-            Err(Retry::Fatal(e)) => return Err(e),
-        };
-        return publish(remote, staged, name, pointer_path, opts).await;
-    }
-    Err(Error::OutputChanged {
-        detail: last_change,
-    }
-    .into())
+    let existing = check_existing_pointer(&pointer_path, &name)?;
+    Ok((name, pointer_path, existing))
 }
 
 enum Retry {
@@ -363,20 +450,94 @@ impl From<SnapshotError> for Retry {
     }
 }
 
-/// An output fully snapshotted, ready to upload.
-struct Staged {
-    kind: StagedKind,
+/// One distinct content of a staged output.
+trait Content {
+    fn md5(&self) -> &Hexdigest;
+}
+
+impl Content for Snapshot {
+    fn md5(&self) -> &Hexdigest {
+        Snapshot::md5(self)
+    }
+}
+
+/// A snapshot's digest and size, the copy itself already deleted: all
+/// status needs.
+struct Hashed {
+    md5: Hexdigest,
+    size: u64,
+}
+
+impl Content for Hashed {
+    fn md5(&self) -> &Hexdigest {
+        &self.md5
+    }
+}
+
+/// An output fully snapshotted and hashed: what push publishes.
+struct Staged<C> {
+    pointer: DvcPointer,
+    /// A directory output's manifest.
+    manifest: Option<Manifest>,
+    /// Distinct contents, by md5.
+    contents: Vec<C>,
+    files: usize,
     warnings: Vec<String>,
     empty_dirs: usize,
 }
 
-enum StagedKind {
-    Dir {
-        manifest: Manifest,
-        snapshots: BTreeMap<Hexdigest, Snapshot>,
-        size: u64,
-    },
-    File(Snapshot),
+impl<C> Staged<C> {
+    /// The version's id: manifest id or file md5.
+    fn id(&self) -> &Hexdigest {
+        match &self.pointer.output {
+            DvcOutput::Dir { manifest, .. } => manifest,
+            DvcOutput::File { md5, .. } => md5,
+        }
+    }
+}
+
+/// Snapshot `output` (named `name`) into `tmp`, restarting while files
+/// change under it; `keep` turns each snapshot into what the caller holds.
+fn stage<C>(
+    output: &Path,
+    name: &str,
+    tmp: &Path,
+    opts: &PushOptions,
+    keep: fn(Snapshot) -> C,
+) -> Result<Staged<C>> {
+    let meta = std::fs::symlink_metadata(output)
+        .with_context(|| format!("failed to stat {}", output.display()))?;
+    let mut last_change = String::new();
+    for _ in 0..PUSH_ATTEMPTS {
+        let attempt = if meta.is_dir() {
+            snapshot_dir(output, name, tmp, opts, keep)
+        } else if meta.is_file() {
+            snapshot_file(output, name, tmp, opts, keep)
+        } else {
+            return Err(Error::Refused {
+                path: output.to_path_buf(),
+                reason: Refusal::NotFileOrDirectory,
+            }
+            .into());
+        };
+        match attempt {
+            Ok(staged) => return Ok(staged),
+            Err(Retry::Changed(msg)) => last_change = msg,
+            Err(Retry::Fatal(e)) => return Err(e),
+        }
+    }
+    Err(Error::OutputChanged {
+        detail: last_change,
+    }
+    .into())
+}
+
+fn hashed(s: &Snapshot) -> ProgressEvent {
+    ProgressEvent::Advanced {
+        phase: Phase::Hashing,
+        files: 1,
+        bytes: s.size(),
+    }
 }
 
 fn warn_unterminated(relpath: &str, s: &Snapshot, warnings: &mut Vec<String>) {
@@ -387,161 +548,171 @@ fn warn_unterminated(relpath: &str, s: &Snapshot, warnings: &mut Vec<String>) {
     }
 }
 
-fn snapshot_dir(dir: &Path, tmp: &Path, excludes: &Excludes) -> std::result::Result<Staged, Retry> {
-    let walk = match walk::walk(dir, excludes) {
+fn snapshot_dir<C>(
+    dir: &Path,
+    name: &str,
+    tmp: &Path,
+    opts: &PushOptions,
+    keep: fn(Snapshot) -> C,
+) -> std::result::Result<Staged<C>, Retry> {
+    let walk = match walk::walk(dir, &opts.exclude) {
         Ok(w) => w,
         Err(WalkError::Changed(m)) => return Err(Retry::Changed(m)),
         Err(e) => return Err(Retry::Fatal(e.into())),
     };
-    let mut entries = Vec::with_capacity(walk.files.len());
-    let mut snapshots = BTreeMap::new();
+    let files = walk.files.len();
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Hashing,
+        files: files as u64,
+        bytes: Some(
+            walk.files
+                .iter()
+                .map(|f| std::fs::metadata(&f.path).map_or(0, |m| m.len()))
+                .sum(),
+        ),
+    });
+    let mut entries = Vec::with_capacity(files);
+    let mut contents = BTreeMap::new();
     let mut warnings = Vec::new();
     let mut size = 0;
     for f in walk.files {
+        opts.cancel.check().map_err(Retry::Fatal)?;
         let s = snapshot::snapshot(&f.path, tmp)?;
         warn_unterminated(f.relpath.as_str(), &s, &mut warnings);
+        opts.progress.emit(|| hashed(&s));
         size += s.size();
         entries.push(ManifestEntry {
             relpath: f.relpath.to_manifest_path(),
             md5: s.md5().clone(),
         });
-        snapshots.entry(s.md5().clone()).or_insert(s);
+        if !contents.contains_key(s.md5()) {
+            contents.insert(s.md5().clone(), keep(s));
+        }
     }
     let manifest = Manifest::from_entries(entries).map_err(Retry::Fatal)?;
     Ok(Staged {
-        kind: StagedKind::Dir {
-            manifest,
-            snapshots,
-            size,
+        pointer: DvcPointer {
+            output: DvcOutput::Dir {
+                manifest: manifest.id(),
+                size,
+                nfiles: files as u64,
+            },
+            path: name.to_string(),
         },
+        manifest: Some(manifest),
+        contents: contents.into_values().collect(),
+        files,
         warnings,
         empty_dirs: walk.empty_dirs,
     })
 }
 
-fn snapshot_file(file: &Path, tmp: &Path) -> std::result::Result<Staged, Retry> {
+fn snapshot_file<C>(
+    file: &Path,
+    name: &str,
+    tmp: &Path,
+    opts: &PushOptions,
+    keep: fn(Snapshot) -> C,
+) -> std::result::Result<Staged<C>, Retry> {
+    opts.cancel.check().map_err(Retry::Fatal)?;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Hashing,
+        files: 1,
+        bytes: std::fs::metadata(file).ok().map(|m| m.len()),
+    });
     let s = snapshot::snapshot(file, tmp)?;
+    opts.progress.emit(|| hashed(&s));
     let mut warnings = Vec::new();
     warn_unterminated(&file.to_string_lossy(), &s, &mut warnings);
     Ok(Staged {
-        kind: StagedKind::File(s),
+        pointer: DvcPointer {
+            output: DvcOutput::File {
+                md5: s.md5().clone(),
+                size: s.size(),
+            },
+            path: name.to_string(),
+        },
+        manifest: None,
+        contents: vec![keep(s)],
+        files: 1,
         warnings,
         empty_dirs: 0,
     })
 }
 
-async fn publish(
+/// Which of a staged output's contents the remote lacks.
+struct Plan<'a, C> {
+    upload: Vec<&'a C>,
+    present: Vec<&'a C>,
+    /// The manifest to upload after the objects; `None` for a file output
+    /// or a manifest already on the remote.
+    manifest: Option<&'a Manifest>,
+}
+
+async fn plan<'a, C: Content + Sync>(
     remote: &Remote,
-    staged: Staged,
-    name: String,
-    pointer_path: PathBuf,
-    opts: &PushOptions,
-) -> Result<PushReport> {
-    let (pointer, files, uploads, manifest_bytes) = match staged.kind {
-        StagedKind::Dir {
-            manifest,
-            snapshots,
-            size,
-        } => {
-            let id = manifest.id();
-            let pointer = DvcPointer {
-                output: DvcOutput::Dir {
-                    manifest: id.clone(),
-                    size,
-                    nfiles: manifest.entries().len() as u64,
-                },
-                path: name,
-            };
-            // A manifest already on the remote means all its objects are
-            // (DVC's own invariant, and ours: it is uploaded last).
-            let complete = backend::exists(&remote.backend, &remote.manifest_key(&id)).await?;
-            let uploads: Vec<Snapshot> = if complete {
-                Vec::new()
-            } else {
-                snapshots.into_values().collect()
-            };
-            let bytes = (!complete).then(|| manifest.to_bytes());
-            (pointer, manifest.entries().len(), uploads, bytes)
-        }
-        StagedKind::File(s) => {
-            let pointer = DvcPointer {
-                output: DvcOutput::File {
-                    md5: s.md5().clone(),
-                    size: s.size(),
-                },
-                path: name,
-            };
-            (pointer, 1, vec![s], None)
-        }
-    };
-
-    let (uploaded, already_present) = upload_all(remote, &uploads, opts.jobs.max(1)).await?;
-    if let (DvcOutput::Dir { manifest, .. }, Some(bytes)) = (&pointer.output, manifest_bytes) {
-        backend::put_bytes(&remote.backend, &remote.manifest_key(manifest), bytes).await?;
+    staged: &'a Staged<C>,
+    jobs: usize,
+) -> Result<Plan<'a, C>> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    // A manifest already on the remote means all its objects are (DVC's own
+    // invariant, and ours: it is uploaded last).
+    if staged.manifest.is_some()
+        && backend::exists(&remote.backend, &remote.manifest_key(staged.id())).await?
+    {
+        return Ok(Plan {
+            upload: Vec::new(),
+            present: staged.contents.iter().collect(),
+            manifest: None,
+        });
     }
-    write_pointer_file(&pointer_path, &pointer)?;
-    let history_record = append_history(remote, &opts.history, &pointer).await?;
-
-    Ok(PushReport {
-        pointer,
-        pointer_path,
-        files,
-        uploaded,
-        already_present,
-        empty_dirs: staged.empty_dirs,
-        warnings: staged.warnings,
-        history_record,
+    let there: Vec<bool> = stream::iter(&staged.contents)
+        .map(|c| async move { backend::exists(&remote.backend, &remote.object_key(c.md5())).await })
+        .buffered(jobs)
+        .try_collect()
+        .await?;
+    let (present, upload): (Vec<_>, Vec<_>) = staged
+        .contents
+        .iter()
+        .zip(there)
+        .partition(|(_, there)| *there);
+    Ok(Plan {
+        upload: upload.into_iter().map(|(c, _)| c).collect(),
+        present: present.into_iter().map(|(c, _)| c).collect(),
+        manifest: staged.manifest.as_ref(),
     })
 }
 
-/// Upload each snapshot the remote lacks. Returns (uploaded, already there).
-async fn upload_all(remote: &Remote, snaps: &[Snapshot], jobs: usize) -> Result<(usize, usize)> {
+/// Upload `snaps`, `jobs` at a time. Once `cancel` is cancelled no upload
+/// starts; those under way finish (dropping one could orphan a multipart
+/// upload) and the push stops.
+async fn upload_all(remote: &Remote, snaps: &[&Snapshot], opts: &PushOptions) -> Result<()> {
     use futures::stream::{self, StreamExt, TryStreamExt};
-    let results: Vec<bool> = stream::iter(snaps)
+    let cancel = &opts.cancel;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Uploading,
+        files: snaps.len() as u64,
+        bytes: Some(snaps.iter().map(|s| s.size()).sum()),
+    });
+    stream::iter(snaps)
         .map(|s| async move {
-            let key = remote.object_key(s.md5());
-            if backend::exists(&remote.backend, &key).await? {
-                return Ok::<_, anyhow::Error>(false);
+            if cancel.is_cancelled() {
+                return Ok(());
             }
-            backend::upload(&remote.backend, s.path(), &key)
+            backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
                 .await
                 .with_context(|| format!("upload of {} failed", s.md5()))?;
-            Ok(true)
+            opts.progress.emit(|| ProgressEvent::Advanced {
+                phase: Phase::Uploading,
+                files: 1,
+                bytes: s.size(),
+            });
+            Ok::<_, anyhow::Error>(())
         })
-        .buffer_unordered(jobs)
-        .try_collect()
+        .buffer_unordered(opts.jobs.max(1))
+        .try_collect::<()>()
         .await?;
-    let uploaded = results.iter().filter(|u| **u).count();
-    Ok((uploaded, results.len() - uploaded))
-}
-
-/// Append `pointer` to the output's history unless the latest record is the
-/// same version. Record keys are `<time>-<id>.dvc` with nanosecond time, so
-/// two hosts pushing at once never overwrite each other's record. The time
-/// is never earlier than the latest record's, so the newest push is always
-/// `Latest` even if this host's clock lags.
-async fn append_history(
-    remote: &Remote,
-    key: &HistoryKey,
-    pointer: &DvcPointer,
-) -> Result<Option<String>> {
-    let records = read_history(remote, key).await?;
-    let latest = records.last();
-    if latest.is_some_and(|r| r.pointer.output == pointer.output) {
-        return Ok(None);
-    }
-    let mut time = chrono::Utc::now();
-    if let Some(r) = latest {
-        time = time.max(r.time + chrono::Duration::nanoseconds(1));
-    }
-    let record = format!(
-        "{}{}-{}.dvc",
-        history_prefix(remote, key),
-        time.format(RECORD_TIME),
-        output_id(&pointer.output)
-    );
-    backend::put_bytes(&remote.backend, &record, pointer.to_yaml().into_bytes()).await?;
-    Ok(Some(record))
+    cancel.check()
 }
 
 /// The output's name: one portable path component.
@@ -575,12 +746,13 @@ fn pointer_path_for(output: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!("{name}.dvc")))
 }
 
-/// Refuse to replace a `.dvc` that is not a plain bigstore/DVC pointer for
-/// this output (e.g. a hand-written one with extra fields or a stage).
-fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<()> {
+/// The pointer already beside the output, if any. Refuses to replace a
+/// `.dvc` that is not a plain bigstore/DVC pointer for this output (e.g. a
+/// hand-written one with extra fields or a stage).
+fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<Option<DvcPointer>> {
     let text = match std::fs::read_to_string(pointer_path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(e).with_context(|| format!("failed to read {}", pointer_path.display()))
         }
@@ -596,7 +768,7 @@ fn check_existing_pointer(pointer_path: &Path, name: &str) -> Result<()> {
         })
         .into());
     }
-    Ok(())
+    Ok(Some(existing))
 }
 
 /// Write the pointer atomically. A file that already says the same thing is
@@ -665,6 +837,8 @@ pub enum Overwrite {
     Force,
 }
 
+/// How to pull. `PullOptions::default()` restores beside the `.dvc`,
+/// refuses to replace differing files, runs 8 jobs and cannot be cancelled.
 #[derive(Debug, Clone)]
 pub struct PullOptions {
     /// Where to restore. Defaults to the `.dvc` file's `<dir>/<path>`;
@@ -672,6 +846,22 @@ pub struct PullOptions {
     pub into: Option<PathBuf>,
     pub overwrite: Overwrite,
     pub jobs: usize,
+    /// Stops the pull between files: each file is either left as it was or
+    /// fully restored, never partly written.
+    pub cancel: CancelToken,
+    pub progress: Progress,
+}
+
+impl Default for PullOptions {
+    fn default() -> Self {
+        Self {
+            into: None,
+            overwrite: Overwrite::Refuse,
+            jobs: crate::transfer::DEFAULT_CONCURRENCY,
+            cancel: CancelToken::default(),
+            progress: Progress::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -701,20 +891,29 @@ async fn pull_async(
 ) -> Result<PullReport> {
     let (pointer, default_into) = match source {
         PointerSource::File(path) => {
-            let pointer = DvcPointer::load(path)?;
+            // Pull never rewrites the .dvc, so stage fields and annotations
+            // (`dvc import-url`, `dvc add --desc`) do not matter. A missing
+            // file is an I/O error, not a refusal.
+            std::fs::metadata(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let pointer = DvcPointer::load_lenient(path).with_context(|| Error::Refused {
+                path: path.clone(),
+                reason: Refusal::UnrestorablePointer,
+            })?;
             let into = pointer_output(path, &pointer)?;
             (pointer, Some(into))
         }
         PointerSource::History { key, at } => {
-            let records = read_history(remote, key).await?;
-            (select(&records, at)?.pointer.clone(), None)
+            let record = history::select(remote, key, at, opts.jobs.max(1)).await?;
+            (record.pointer, None)
         }
     };
     let into = opts
         .into
         .clone()
         .or(default_into)
-        .context("pulling from history needs a destination (`into`)")?;
+        .ok_or(Error::DestinationRequired)?;
+    opts.cancel.check()?;
 
     let targets: Vec<(PathBuf, Hexdigest)> = match &pointer.output {
         DvcOutput::Dir { manifest, .. } => {
@@ -755,8 +954,23 @@ async fn pull_async(
     let mut plan = Vec::new();
     let mut conflicts = Vec::new();
     let mut unchanged = 0;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Hashing,
+        files: targets.len() as u64,
+        bytes: None,
+    });
     for (path, md5) in &targets {
-        match classify_target(&into, path, md5)? {
+        opts.cancel.check()?;
+        let target = classify_target(&into, path, md5)?;
+        opts.progress.emit(|| ProgressEvent::Advanced {
+            phase: Phase::Hashing,
+            files: 1,
+            bytes: match target {
+                Target::Missing => 0,
+                Target::Same | Target::Differs => std::fs::metadata(path).map_or(0, |m| m.len()),
+            },
+        });
+        match target {
             Target::Same => unchanged += 1,
             Target::Missing => plan.push((path, md5, false)),
             Target::Differs => match opts.overwrite {
@@ -779,7 +993,15 @@ async fn pull_async(
     for (path, md5, replace) in plan {
         by_object.entry(md5).or_default().push((path, replace));
     }
-    let written = fetch_and_place(remote, by_object, opts.jobs.max(1)).await?;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Downloading,
+        files: by_object.values().map(|places| places.len() as u64).sum(),
+        bytes: match &pointer.output {
+            DvcOutput::File { size, .. } => Some(*size),
+            DvcOutput::Dir { .. } => None,
+        },
+    });
+    let written = fetch_and_place(remote, by_object, opts).await?;
 
     Ok(PullReport {
         pointer,
@@ -857,11 +1079,17 @@ fn classify_target(root: &Path, path: &Path, md5: &Hexdigest) -> Result<Target> 
     }
 }
 
-/// Entries that differ only by ASCII case would collide on macOS and Windows.
+/// Entries that differ only by case (Unicode, not just ASCII) or by Unicode
+/// normalization (`é` as one code point or as `e` + accent) would be one
+/// file on macOS (APFS, HFS+) and Windows. Refused on every OS, so a version
+/// restores the same everywhere.
 fn check_case_collisions(manifest: &Manifest) -> Result<()> {
+    use unicode_normalization::UnicodeNormalization;
     let mut seen = std::collections::HashMap::new();
     for e in manifest.entries() {
-        let folded = e.relpath.as_str().to_ascii_lowercase();
+        // Lowercasing can decompose (`İ` → `i` + dot), so normalize again.
+        let lower = e.relpath.as_str().nfc().collect::<String>().to_lowercase();
+        let folded: String = lower.nfc().collect();
         if let Some(other) = seen.insert(folded, e.relpath.as_str()) {
             return Err(Error::Refused {
                 path: PathBuf::from(e.relpath.as_str()),
@@ -885,20 +1113,28 @@ fn count_extra(root: &Path, targets: &[(PathBuf, Hexdigest)]) -> usize {
         .count()
 }
 
+/// Download each object once and place it at every path that needs it,
+/// `opts.jobs` objects at a time. Once cancelled no download starts; those
+/// under way finish and are placed whole, and the pull stops.
 async fn fetch_and_place(
     remote: &Remote,
     by_object: BTreeMap<&Hexdigest, Vec<(&PathBuf, bool)>>,
-    jobs: usize,
+    opts: &PullOptions,
 ) -> Result<usize> {
     use futures::stream::{self, StreamExt, TryStreamExt};
+    let cancel = &opts.cancel;
     let counts: Vec<usize> = stream::iter(by_object)
         .map(|(md5, places)| async move {
+            if cancel.is_cancelled() {
+                return Ok(0);
+            }
             let (first, _) = places[0];
             let dir = first.parent().context("target has no parent")?;
             std::fs::create_dir_all(dir)?;
             let tmp =
                 backend::download_verified(&remote.backend, &remote.object_key(md5), md5, dir)
                     .await?;
+            let bytes = tmp.as_file().metadata()?.len();
             // Extra copies first (from the verified temp), then move the temp.
             for (path, replace) in &places[1..] {
                 let parent = path.parent().context("target has no parent")?;
@@ -908,11 +1144,17 @@ async fn fetch_and_place(
                 place(copy, path, *replace)?;
             }
             place(tmp, first, places[0].1)?;
+            opts.progress.emit(|| ProgressEvent::Advanced {
+                phase: Phase::Downloading,
+                files: places.len() as u64,
+                bytes,
+            });
             Ok::<_, anyhow::Error>(places.len())
         })
-        .buffer_unordered(jobs)
+        .buffer_unordered(opts.jobs.max(1))
         .try_collect()
         .await?;
+    cancel.check()?;
     Ok(counts.into_iter().sum())
 }
 
@@ -943,4 +1185,19 @@ fn place(tmp: tempfile::NamedTempFile, path: &Path, replace: bool) -> Result<()>
         })?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn snapshots_go_to_a_directory_only_the_owner_can_enter() {
+        // Snapshots hold whatever the output holds; other users on the host
+        // must not read them while a push or status runs.
+        let dir = snapshot_tmpdir().unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
 }
