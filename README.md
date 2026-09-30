@@ -433,9 +433,10 @@ What it guarantees:
   cannot record them.
 - **Pull restores what this OS can create.** A manifest `dvc push` wrote may
   hold names push would refuse (`back\slash.txt`, non-ASCII). Pull restores
-  them where the OS allows it; on Windows it refuses `\` and `:` by name,
-  before writing anything, since they would change the path. Names that
-  differ only by case are refused everywhere.
+  them where the OS allows it; on Windows it refuses by name, before writing
+  anything, `\` and `:` (they would change the path) and names Windows
+  cannot create (`nul.txt`, `com1`, a trailing `.` or space, `*?"<>|`).
+  Names that differ only by case are refused everywhere.
 - **S3 needs an endpoint** (`--endpoint` or `AWS_ENDPOINT_URL`). It never
   defaults to AWS and never falls back to instance-metadata credentials.
 

@@ -52,6 +52,12 @@
   saying why (`cache: false`, not yet downloaded, etag/version_id only), as
   is a `wdir:` other than `.`. `folder push` still refuses to overwrite such
   a file, now naming the fields it would drop.
+- On Windows, `import-dvc-dir`, `folder pull` and every other path bigstore
+  writes refuse names Windows cannot create before writing anything, naming
+  the path: device names (`CON`, `nul.txt`, `com1.log`, `con .txt`,
+  `CONIN$`), a trailing `.` or space, `* ? " < > |` and control characters.
+  Before, such a name from a manifest made on Unix failed at the final
+  rename. Folder push's portability check refuses the same device names.
 - `pull` no longer overwrites uncommitted edits. It fills the cache, then
   replaces only files that are still the index's pointer, via
   `git checkout-index`: restored files keep their committed mode (executables

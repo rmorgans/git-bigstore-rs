@@ -195,7 +195,14 @@ impl RepoPath {
             match part {
                 "" | "." => {}
                 ".." => anyhow::bail!("path must not contain '..': {s:?}"),
-                p => parts.push(p),
+                p => {
+                    // Refuse up front, naming the path, what Windows would
+                    // only fail to create at the final rename.
+                    if let PathSyntax::Windows = syntax {
+                        check_windows_component(p).with_context(|| format!("path {s:?}"))?;
+                    }
+                    parts.push(p);
+                }
             }
         }
         anyhow::ensure!(!parts.is_empty(), "path is empty: {s:?}");
@@ -276,9 +283,8 @@ impl fmt::Display for ManifestPath {
 }
 
 /// Checks one path component is safe to create on Windows, macOS and Linux:
-/// printable ASCII only (which also rules out Unicode NFC/NFD twins), none of
-/// `\ / : * ? " < > |`, not a Windows device name (`CON`, `nul.txt`, `COM1`…),
-/// no trailing `.` or space, and not `.` or `..`.
+/// printable ASCII only (which also rules out Unicode NFC/NFD twins), not `.`
+/// or `..`, and nothing [`check_windows_component`] refuses.
 pub fn check_portable_component(c: &str) -> Result<()> {
     anyhow::ensure!(
         !c.is_empty() && c != "." && c != "..",
@@ -288,19 +294,36 @@ pub fn check_portable_component(c: &str) -> Result<()> {
         c.bytes().all(|b| (0x20..=0x7e).contains(&b)),
         "{c:?}: only printable ASCII names are portable"
     );
+    check_windows_component(c)
+}
+
+/// Checks Windows can create one non-empty path component: none of
+/// `\ / : * ? " < > |` or control characters, no trailing `.` or space, and
+/// not a device name (`CON`, `nul.txt`, `COM1`, `con .txt`...). The same
+/// rules as git for Windows' `is_valid_win32_path`, plus `COM0` and the
+/// superscript ports (`COM¹`, `LPT³`) Microsoft's naming rules also reserve.
+fn check_windows_component(c: &str) -> Result<()> {
     anyhow::ensure!(
-        !c.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']),
+        !c.contains(|ch: char| ch < ' ' || "\\/:*?\"<>|".contains(ch)),
         "{c:?}: contains a character Windows does not allow"
     );
     anyhow::ensure!(
         !c.ends_with(['.', ' ']),
         "{c:?}: Windows drops a trailing '.' or space"
     );
-    let stem = c.split('.').next().unwrap_or(c).to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit());
+    // Windows ignores an extension, and spaces before it, after a device name.
+    let stem = c.split('.').next().unwrap_or(c).trim_end_matches(' ');
+    let stem = stem.to_ascii_uppercase();
+    let port = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"));
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || port.is_some_and(|n| {
+        matches!(n, "\u{b9}" | "\u{b2}" | "\u{b3}")
+            || (n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+    });
     anyhow::ensure!(!reserved, "{c:?}: reserved device name on Windows");
     Ok(())
 }
@@ -589,6 +612,55 @@ mod tests {
         );
     }
 
+    /// Names Windows cannot create (device names, trailing `.`/space,
+    /// `*?"<>|`, control characters) are valid on Unix but refused before
+    /// writing on Windows, naming the path, instead of failing at rename.
+    #[test]
+    fn windows_refuses_names_it_cannot_create_and_names_the_path() {
+        for name in [
+            "CON",
+            "sub/nul.txt",
+            "Aux.tar.gz",
+            "com1",
+            "LPT9.log",
+            "con .txt",
+            "COM\u{b9}.txt",
+            "CONIN$",
+            "d/trailing.",
+            "trailing /f",
+            "q?.txt",
+            "a<b",
+            "pipe|x",
+            "star*",
+            "q\"uote.txt",
+            "tab\there.txt",
+        ] {
+            let p = ManifestPath::new(name).unwrap();
+            assert_eq!(
+                p.to_repo_path_for(PathSyntax::Posix).unwrap().as_str(),
+                name
+            );
+            let err = p.to_repo_path_for(PathSyntax::Windows).unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("{name:?}")), "{err:#}");
+            assert!(
+                RepoPath::new_for(name, PathSyntax::Windows).is_err(),
+                "{name:?}"
+            );
+        }
+        for ok in [
+            "console.txt",
+            "COM.txt",
+            "COM10",
+            "nul-ish",
+            "CONOUT",
+            ".hidden",
+            "a/./b",
+            "caf\u{e9}.txt",
+        ] {
+            RepoPath::new_for(ok, PathSyntax::Windows).unwrap();
+        }
+    }
+
     #[test]
     fn portable_rel_path_accepts_the_annotation_layout() {
         for ok in [
@@ -612,6 +684,8 @@ mod tests {
             "CON",
             "sub/nul.txt",
             "com1.log",
+            "con .txt",
+            "CONOUT$",
             "trailing.",
             "trailing ",
             "a/../b",
