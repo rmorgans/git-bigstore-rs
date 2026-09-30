@@ -25,7 +25,8 @@ pub enum Error {
     /// published (push) or written (pull).
     Refused {
         /// Entries inside a pushed directory, and manifest entries refused by
-        /// pull ([`Refusal::CaseCollision`], [`Refusal::UnwritableName`]),
+        /// pull ([`Refusal::CaseCollision`], [`Refusal::UnwritableName`],
+        /// [`Refusal::ExecutableInDirectory`]),
         /// are relative to the output and `/`-separated. Anything else is the
         /// filesystem path as given or derived from the caller's arguments.
         path: PathBuf,
@@ -145,6 +146,12 @@ pub enum Refusal {
         /// The other name.
         other: String,
     },
+    /// DVC marks a file inside a directory output executable (`isexec` on a
+    /// `.dir` manifest entry, which only manifests hashed with per-file
+    /// metadata carry), or the directory output itself in its `.dvc`. Pull
+    /// restores modes only for a single-file output, so it refuses rather
+    /// than drop the mark. `path` is the manifest name, or the `.dvc`.
+    ExecutableInDirectory,
     /// A file appeared at a path while pulling; it was left untouched.
     AppearedWhilePulling,
 }
@@ -257,6 +264,11 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
             path.to_string_lossy()
         ),
         Refusal::AppearedWhilePulling => write!(f, "{p} appeared while pulling; left untouched"),
+        Refusal::ExecutableInDirectory => write!(
+            f,
+            "{p} is marked executable (`isexec`) inside a directory output; pull restores \
+             modes only for a single-file output, so it refuses rather than drop the mark"
+        ),
     }
 }
 

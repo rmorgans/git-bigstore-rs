@@ -106,12 +106,15 @@ impl Manifest {
     }
 
     /// Parse manifest bytes read from a local DVC cache, where the file name
-    /// is the id but DVC may have stored it in a different formatting.
+    /// is the id but DVC may have stored it in a different formatting. An
+    /// entry marked executable is refused as [`ExecutableEntry`].
     pub fn parse_unverified(raw: &[u8]) -> Result<Self> {
         #[derive(Deserialize)]
         struct RawEntry {
             md5: String,
             relpath: String,
+            #[serde(default)]
+            isexec: bool,
         }
         let raw: Vec<RawEntry> =
             serde_json::from_slice(raw).context("manifest is not a JSON list")?;
@@ -120,6 +123,9 @@ impl Manifest {
             .map(|e| {
                 let relpath = ManifestPath::new(&e.relpath)
                     .context("manifest relpath must be a relative path inside the directory")?;
+                if e.isexec {
+                    return Err(ExecutableEntry(relpath).into());
+                }
                 let md5 =
                     md5(&e.md5).with_context(|| format!("invalid md5 for {:?}", e.relpath))?;
                 Ok(ManifestEntry { relpath, md5 })
@@ -128,6 +134,26 @@ impl Manifest {
         Self::from_entries(entries)
     }
 }
+
+/// A `.dir` manifest entry DVC marked executable (`"isexec": true`). Only
+/// manifests hashed with per-file metadata have one (`dvc add` writes
+/// none). Nothing that reads a manifest restores modes, so parsing refuses
+/// the entry rather than drop the mark.
+#[derive(Debug)]
+pub struct ExecutableEntry(pub ManifestPath);
+
+impl std::fmt::Display for ExecutableEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "manifest marks {:?} executable (`isexec`), a mode bigstore does not restore \
+             from a directory manifest",
+            self.0.as_str()
+        )
+    }
+}
+
+impl std::error::Error for ExecutableEntry {}
 
 /// CPython `json.dumps` string escaping with `ensure_ascii=True`.
 fn json_escape_ascii(out: &mut String, s: &str) {

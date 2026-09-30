@@ -471,7 +471,12 @@ What it guarantees:
 - **Pull never destroys local work.** It refuses to replace a file that
   differs unless forced, never deletes files missing from the version, never
   writes through a symlink, and writes via temp file plus rename (never a
-  link).
+  link). A single file DVC marked executable (`isexec: true` in its `.dvc`)
+  is restored executable on unix (0777 minus umask), and an identical copy
+  already there is made executable. Push records no modes, so a version
+  pulled from history never is. DVC's `dvc add` writes no modes into a
+  `.dir` manifest; an entry that has one (a manifest hashed with per-file
+  metadata) is refused, not restored without its mode.
 - **Refuses ambiguity instead of guessing.** Push refuses directory and
   broken symlinks, nested `.git`/`.dvc`, `*.dvc` inside an output, and names
   that aren't portable (non-ASCII, or not allowed on Windows), so anything
@@ -704,6 +709,7 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `UnrestorablePointer` (not a DVC 3 pointer to one md5-addressed output: `cache: false`, etag-only, several outputs, `wdir:`…; stage fields and annotations are fine) | pull, the `.dvc` | the `.dvc` |
 | `SymlinkedOutput`, `NotADirectory`, `NotRegularFile`, `AppearedWhilePulling` | pull, the destination | the filesystem path |
 | `CaseCollision { other }`, `UnwritableName` (`\` or `:` on Windows) | pull, the manifest | the manifest name |
+| `ExecutableInDirectory` (`isexec` on a manifest entry, or on a directory output in its `.dvc`) | pull | the manifest name, or the `.dvc` |
 
 ```rust
 match folder::pull(&remote, &source, &opts) {

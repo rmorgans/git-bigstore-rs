@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 pub use crate::backend::store::Credentials;
 use crate::backend::{self, Backend};
+use crate::cache::WorktreeMode;
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use crate::types::{check_portable_component, long_path, Hexdigest, Layout, ManifestPath};
@@ -889,25 +890,36 @@ async fn pull_async(
     source: &PointerSource,
     opts: &PullOptions,
 ) -> Result<PullReport> {
-    let (pointer, default_into) = match source {
+    // The mode restored files get. Only a `.dvc` DVC wrote can mark one
+    // (`isexec`); push records none, so history never does.
+    let (pointer, mode, default_into) = match source {
         PointerSource::File(path) => {
             // Pull never rewrites the .dvc, so stage fields and annotations
             // (`dvc import-url`, `dvc add --desc`) do not matter. A missing
             // file is an I/O error, not a refusal.
             std::fs::metadata(path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            let pointer = DvcPointer::load_lenient(path)
-                .with_context(|| Error::Refused {
-                    path: path.clone(),
-                    reason: Refusal::UnrestorablePointer,
-                })?
-                .pointer;
-            let into = pointer_output(path, &pointer)?;
-            (pointer, Some(into))
+            let read = DvcPointer::load_lenient(path).with_context(|| Error::Refused {
+                path: path.clone(),
+                reason: Refusal::UnrestorablePointer,
+            })?;
+            let mode = match (&read.pointer.output, read.isexec) {
+                (_, false) => WorktreeMode::Regular,
+                (DvcOutput::File { .. }, true) => WorktreeMode::Executable,
+                (DvcOutput::Dir { .. }, true) => {
+                    return Err(Error::Refused {
+                        path: path.clone(),
+                        reason: Refusal::ExecutableInDirectory,
+                    }
+                    .into())
+                }
+            };
+            let into = pointer_output(path, &read.pointer)?;
+            (read.pointer, mode, Some(into))
         }
         PointerSource::History { key, at } => {
             let record = history::select(remote, key, at, opts.jobs.max(1)).await?;
-            (record.pointer, None)
+            (record.pointer, WorktreeMode::Regular, None)
         }
     };
     let into = opts
@@ -936,7 +948,16 @@ async fn pull_async(
             )
             .await?
             .with_context(|| format!("manifest {manifest}.dir is not on the remote"))?;
-            let manifest = Manifest::parse(&raw, manifest)?;
+            let manifest = Manifest::parse(&raw, manifest).map_err(|e| {
+                match e.downcast::<crate::dvc::ExecutableEntry>() {
+                    Ok(entry) => Error::Refused {
+                        path: PathBuf::from(entry.0.as_str()),
+                        reason: Refusal::ExecutableInDirectory,
+                    }
+                    .into(),
+                    Err(e) => e,
+                }
+            })?;
             check_case_collisions(&manifest)?;
             manifest
                 .entries()
@@ -973,7 +994,12 @@ async fn pull_async(
             },
         });
         match target {
-            Target::Same => unchanged += 1,
+            Target::Same => {
+                unchanged += 1;
+                if mode == WorktreeMode::Executable {
+                    make_executable(path)?;
+                }
+            }
             Target::Missing => plan.push((path, md5, false)),
             Target::Differs => match opts.overwrite {
                 Overwrite::Refuse => conflicts.push(path.clone()),
@@ -1003,7 +1029,7 @@ async fn pull_async(
             DvcOutput::Dir { .. } => None,
         },
     });
-    let written = fetch_and_place(remote, by_object, opts).await?;
+    let written = fetch_and_place(remote, by_object, opts, mode).await?;
 
     Ok(PullReport {
         pointer,
@@ -1116,12 +1142,13 @@ fn count_extra(root: &Path, targets: &[(PathBuf, Hexdigest)]) -> usize {
 }
 
 /// Download each object once and place it at every path that needs it,
-/// `opts.jobs` objects at a time. Once cancelled no download starts; those
-/// under way finish and are placed whole, and the pull stops.
+/// with `mode`, `opts.jobs` objects at a time. Once cancelled no download
+/// starts; those under way finish and are placed whole, and the pull stops.
 async fn fetch_and_place(
     remote: &Remote,
     by_object: BTreeMap<&Hexdigest, Vec<(&PathBuf, bool)>>,
     opts: &PullOptions,
+    mode: WorktreeMode,
 ) -> Result<usize> {
     use futures::stream::{self, StreamExt, TryStreamExt};
     let cancel = &opts.cancel;
@@ -1147,9 +1174,9 @@ async fn fetch_and_place(
                 std::fs::create_dir_all(parent)?;
                 let mut copy = tempfile::NamedTempFile::new_in(long_path(parent)?)?;
                 std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut copy)?;
-                place(copy, path, *replace)?;
+                place(copy, path, *replace, mode)?;
             }
-            place(tmp, first, places[0].1)?;
+            place(tmp, first, places[0].1, mode)?;
             opts.progress.emit(|| ProgressEvent::Advanced {
                 phase: Phase::Downloading,
                 files: places.len() as u64,
@@ -1164,15 +1191,28 @@ async fn fetch_and_place(
     Ok(counts.into_iter().sum())
 }
 
-/// Move a verified temp file into place: never replacing a file that
-/// appeared since classification unless the caller forced replacement.
-fn place(tmp: tempfile::NamedTempFile, path: &Path, replace: bool) -> Result<()> {
+/// Move a verified temp file into place with `mode`'s permissions (the
+/// umask applies): never replacing a file that appeared since
+/// classification unless the caller forced replacement.
+fn place(
+    tmp: tempfile::NamedTempFile,
+    path: &Path,
+    replace: bool,
+    mode: WorktreeMode,
+) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let bits = match mode {
+            WorktreeMode::Regular => 0o666,
+            WorktreeMode::Executable => 0o777,
+        };
         tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o666 & !current_umask()))?;
+            .set_permissions(std::fs::Permissions::from_mode(bits & !current_umask()))?;
     }
+    // Windows has no execute bit.
+    #[cfg(not(unix))]
+    let _ = mode;
     if replace {
         tmp.persist(long_path(path)?)
             .with_context(|| format!("failed to write {}", path.display()))?;
@@ -1190,6 +1230,25 @@ fn place(tmp: tempfile::NamedTempFile, path: &Path, replace: bool) -> Result<()>
             }
         })?;
     }
+    Ok(())
+}
+
+/// Give a file already in place, which a `.dvc` marks executable, the
+/// execute bits the umask allows, as a new executable would get. No-op off
+/// unix (no execute bit) or if the owner can already execute it.
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o100 == 0 {
+            let mode = mode | (0o111 & !current_umask());
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("failed to make {} executable", path.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

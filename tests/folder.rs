@@ -2002,3 +2002,97 @@ fn outputs_and_files_beyond_max_path_push_and_pull() {
     assert_eq!(forced.written, 1);
     assert_eq!(std::fs::read(&target).unwrap(), b"PAR1 geometry");
 }
+
+// ── Edges: executable outputs ───────────────────────
+
+/// What `dvc add` writes for a 0755 `#!/bin/sh\n` (as in the fixture
+/// `stage_fields/run.sh.dvc`), naming `path`.
+#[cfg(unix)]
+fn isexec_pointer(path: &str) -> String {
+    format!(
+        "outs:\n- md5: 3e2b31c72181b87149ff995e7202c0e3\n  size: 10\n  isexec: true\n  \
+         hash: md5\n  path: {path}\n"
+    )
+}
+
+/// A `.dvc` DVC wrote for an executable file (`isexec: true`) restores it
+/// executable, and makes an identical local copy executable without
+/// rewriting it. History records come from push, which records no mode.
+#[cfg(unix)]
+#[test]
+fn pull_of_an_isexec_pointer_restores_an_executable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode();
+    let e = env();
+    let tool = e.data.join("tool.sh");
+    write(&tool, b"#!/bin/sh\n");
+    let report = folder::push(&e.remote, &tool, &opts("ds/tool")).unwrap();
+    std::fs::write(&report.pointer_path, isexec_pointer("tool.sh")).unwrap();
+    let from_dvc = PointerSource::File(report.pointer_path.clone());
+
+    std::fs::remove_file(&tool).unwrap();
+    let pulled = folder::pull(&e.remote, &from_dvc, &pull_opts(None)).unwrap();
+    assert_eq!(pulled.written, 1);
+    assert_eq!(mode(&tool) & 0o100, 0o100, "{:o}", mode(&tool));
+
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let again = folder::pull(&e.remote, &from_dvc, &pull_opts(None)).unwrap();
+    assert_eq!((again.written, again.unchanged), (0, 1));
+    assert_eq!(mode(&tool) & 0o100, 0o100, "{:o}", mode(&tool));
+
+    let restored = e.data.join("from-history");
+    folder::pull(
+        &e.remote,
+        &history("ds/tool", Selector::Latest),
+        &pull_opts(Some(restored.clone())),
+    )
+    .unwrap();
+    assert_eq!(mode(&restored) & 0o111, 0, "{:o}", mode(&restored));
+}
+
+/// DVC 3 `.dir` manifests carry no modes (`dvc add` of a directory holding
+/// a 0755 file records none), but a manifest hashed with per-file metadata
+/// can mark a file `isexec`. Pull refuses it by name before writing
+/// anything rather than restore the file without its mode; the same for a
+/// directory output marked `isexec` in its `.dvc`.
+#[test]
+fn pull_refuses_an_executable_mark_inside_a_directory() {
+    let e = env();
+    let tool = e.data.join("tool.sh");
+    write(&tool, b"#!/bin/sh\n");
+    folder::push(&e.remote, &tool, &opts("ds/tool")).unwrap();
+    let raw = br#"[{"isexec": true, "md5": "3e2b31c72181b87149ff995e7202c0e3", "relpath": "sub/run.sh"}]"#;
+    let id = hash_reader(&mut &raw[..], HashFunction::Md5).unwrap();
+    let id = id.to_string();
+    write(
+        &e.store
+            .join(format!("files/md5/{}/{}.dir", &id[..2], &id[2..])),
+        raw,
+    );
+    let dvc = e.data.join("out.dvc");
+    let dir_pointer =
+        format!("outs:\n- md5: {id}.dir\n  size: 10\n  nfiles: 1\n  hash: md5\n  path: out\n");
+    std::fs::write(&dvc, &dir_pointer).unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(dvc.clone()),
+        &pull_opts(None),
+    )
+    .unwrap_err();
+    let (path, reason) = refused(&err);
+    assert_eq!(path, Path::new("sub/run.sh"));
+    assert!(matches!(reason, Refusal::ExecutableInDirectory), "{err:#}");
+    assert!(!e.data.join("out").exists(), "nothing written");
+
+    let marked = dir_pointer.replace("  hash: md5", "  isexec: true\n  hash: md5");
+    std::fs::write(&dvc, marked).unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(dvc.clone()),
+        &pull_opts(None),
+    )
+    .unwrap_err();
+    let (path, reason) = refused(&err);
+    assert_eq!(path, dvc);
+    assert!(matches!(reason, Refusal::ExecutableInDirectory), "{err:#}");
+}

@@ -151,6 +151,15 @@
   file) wrote the file without its execute bit. On unix it is now written
   0777 minus umask, as git checks out an executable; DVC's `.dir`
   manifests record no modes, so `import-dvc-dir` is unchanged.
+- `folder pull` of such a `.dvc` (a single-file output) dropped the mark
+  the same way. It now restores the file executable on unix, and makes an
+  identical copy already in place executable instead of leaving it as it
+  was. A `.dir` manifest entry marked `isexec` (only manifests hashed with
+  per-file metadata have one; `dvc add` writes none) is refused instead of
+  restored without its mode: `folder pull` says so as
+  `Refusal::ExecutableInDirectory`, as it does for a directory output
+  marked `isexec` in its `.dvc`, and `import-dvc-dir` and `dvc-ls` fail
+  naming the entry (`dvc::ExecutableEntry`).
 - On Windows, `import-dvc-dir`, `folder pull` and every other path bigstore
   writes refuse names Windows cannot create before writing anything, naming
   the path: device names (`CON`, `nul.txt`, `com1.log`, `con .txt`,
