@@ -183,8 +183,11 @@ impl RepoPath {
     }
 
     fn new_for(s: &str, syntax: PathSyntax) -> Result<Self> {
+        // Syntax, not the host, decides: under Windows rules the `\`/`:`
+        // refusal below already covers every absolute form (`C:\`, `C:/`,
+        // `\\server`), so `PathSyntax::Posix` means the same on every host.
         anyhow::ensure!(
-            !s.starts_with('/') && !Path::new(s).is_absolute(),
+            !s.starts_with('/'),
             "path must be relative to the repository root: {s:?}"
         );
         anyhow::ensure!(!s.contains('\0'), "path contains a NUL byte: {s:?}");

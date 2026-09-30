@@ -1014,7 +1014,13 @@ fn a_refused_pull_lists_every_differing_file_and_writes_nothing() {
     assert_eq!(paths, &[a.clone(), b.clone()]);
     let shown = err.to_string();
     assert!(shown.starts_with("2 local file(s) differ"), "{shown}");
-    assert!(shown.contains(&a.display().to_string()) && shown.contains(&b.display().to_string()));
+    // The message shows each path in native form (`\` on Windows), while `a`
+    // and `b` were joined with `/`; compare component-wise normalised forms.
+    let native = |p: &Path| p.components().collect::<PathBuf>().display().to_string();
+    assert!(
+        shown.contains(&native(&a)) && shown.contains(&native(&b)),
+        "{shown}"
+    );
     // Refusal is all or nothing: the missing file was not restored either.
     assert!(!w
         .join("site=s1/date=2026-09-01/src_01/regions.jsonl")

@@ -79,6 +79,12 @@ jobs:
   windows:
     name: Windows (folder mode)
     runs-on: windows-latest
+    # bash runs with -e, so every command in a step counts. The pwsh
+    # default only fails a step on its last command's exit code, which hid
+    # failing test runs earlier in a multi-line step.
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -104,6 +110,7 @@ jobs:
         # The official zip: one download, no package manager.
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           Invoke-WebRequest https://downloads.rclone.org/rclone-current-windows-amd64.zip -OutFile rclone.zip
           Expand-Archive rclone.zip -DestinationPath "$env:RUNNER_TEMP\rclone"
           $dir = (Get-ChildItem "$env:RUNNER_TEMP\rclone" -Directory | Select-Object -First 1).FullName
@@ -132,6 +139,7 @@ jobs:
         # mode does not depend on the machine's setting.
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
           "LongPathsEnabled was $((Get-ItemProperty $key).LongPathsEnabled)"
           Set-ItemProperty $key -Name LongPathsEnabled -Value 0
