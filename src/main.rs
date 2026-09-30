@@ -175,10 +175,64 @@ impl FolderPushArgs {
             jobs: resolve_jobs(self.jobs)?.get(),
             exclude: Excludes::new(&self.exclude)?,
             cancel: cancel_on_ctrl_c()?,
+            progress: progress_bars(),
             ..PushOptions::new(HistoryKey::new(&self.history)?)
         };
         Ok((open_folder_remote(&self.remote)?, opts))
     }
+}
+
+/// One bar on stderr per phase of a folder command, in bytes when the
+/// phase's size is known and in files otherwise. Nothing is drawn when
+/// stderr is not a terminal; the last bar is cleared when the options
+/// holding it are dropped.
+fn progress_bars() -> bigstore::folder::Progress {
+    use bigstore::folder::{Phase, Progress, ProgressEvent};
+    use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
+    // The bar, and whether it counts bytes (else files).
+    let current = std::sync::Mutex::new(None::<(ProgressBar, bool)>);
+    Progress::new(move |event| {
+        let mut current = current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match event {
+            ProgressEvent::Started {
+                phase,
+                files,
+                bytes,
+            } => {
+                if let Some((done, _)) = current.take() {
+                    done.finish_and_clear();
+                }
+                let label = match phase {
+                    Phase::Hashing => "hashing",
+                    Phase::Uploading => "uploading",
+                    Phase::Downloading => "downloading",
+                    _ => "working",
+                };
+                let (len, counts, by_bytes) = match bytes {
+                    Some(b) => (b, "{bytes}/{total_bytes}", true),
+                    None => (files, "{pos}/{len} files", false),
+                };
+                let style = ProgressStyle::with_template(&format!(
+                    "{{prefix:>11}} [{{bar:30.cyan/blue}}] {counts}"
+                ))
+                .expect("progress template is valid")
+                .progress_chars("#>-");
+                let bar = ProgressBar::new(len)
+                    .with_style(style)
+                    .with_prefix(label)
+                    .with_finish(ProgressFinish::AndClear);
+                *current = Some((bar, by_bytes));
+            }
+            ProgressEvent::Advanced { files, bytes, .. } => {
+                if let Some((bar, by_bytes)) = &*current {
+                    bar.inc(if *by_bytes { bytes } else { files });
+                }
+            }
+            _ => {}
+        }
+    })
 }
 
 /// A token the first Ctrl-C cancels, so a folder command stops cleanly
@@ -748,8 +802,10 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
     use bigstore::folder::{self, HistoryKey, Overwrite, PointerSource, Selector};
     match cmd {
         FolderCommand::Push(args) => {
-            let (remote, opts) = args.open()?;
-            let r = folder::push(&remote, &args.path, &opts)?;
+            let r = {
+                let (remote, opts) = args.open()?;
+                folder::push(&remote, &args.path, &opts)?
+            };
             for w in &r.warnings {
                 eprintln!("warning: {w}");
             }
@@ -770,8 +826,10 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
             );
         }
         FolderCommand::Status(args) => {
-            let (remote, opts) = args.open()?;
-            let s = folder::status(&remote, &args.path, &opts)?;
+            let s = {
+                let (remote, opts) = args.open()?;
+                folder::status(&remote, &args.path, &opts)?
+            };
             for w in &s.warnings {
                 eprintln!("warning: {w}");
             }
@@ -843,6 +901,7 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                     },
                     jobs: resolve_jobs(jobs)?.get(),
                     cancel: cancel_on_ctrl_c()?,
+                    progress: progress_bars(),
                 },
             )?;
             eprintln!(

@@ -556,6 +556,29 @@ match folder::push(&remote, dir, &opts) {
 }
 ```
 
+Progress, for a bar or a job status: a `Progress` callback gets
+`ProgressEvent::Started { phase, files, bytes }` when a phase begins
+(`Phase::Hashing`, `Uploading` or `Downloading`; `bytes` is `None` when the
+size is unknown up front, as for a directory's download) and
+`Advanced { phase, files, bytes }` per finished file. It is called from
+worker threads, possibly concurrently, so it must be `Send + Sync`; the
+default does nothing and costs nothing. The library does not depend on
+`indicatif`; the CLI draws its bars from these events.
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+let done = std::sync::Arc::new(AtomicU64::new(0));
+let seen = done.clone();
+let opts = PushOptions {
+    progress: folder::Progress::new(move |event| {
+        if let folder::ProgressEvent::Advanced { phase: folder::Phase::Uploading, bytes, .. } = event {
+            seen.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }),
+    ..PushOptions::new(key)
+};
+```
+
 History, from the library:
 
 ```rust

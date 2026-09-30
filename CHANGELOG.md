@@ -66,6 +66,14 @@
   `PushOptions::new(history)` and `PullOptions::default()` give the defaults
   (8 jobs), so new options fields no longer break struct literals written
   as `PushOptions { jobs: 4, ..PushOptions::new(key) }`.
+- Progress for folder mode: `folder::Progress::new(|event| …)` as
+  `PushOptions::progress` and `PullOptions::progress` receives
+  `ProgressEvent::Started { phase, files, bytes }` and
+  `Advanced { phase, files, bytes }` per finished file, for the phases
+  `Hashing`, `Uploading` and `Downloading`. The callback is `Send + Sync`,
+  usable from sync callers, and free when unset; the library needs no
+  `indicatif`. `git bigstore folder push|status|pull` draw a bar per phase
+  on a terminal.
 
 ### Security
 

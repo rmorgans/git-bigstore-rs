@@ -165,6 +165,71 @@ impl CancelToken {
 }
 
 // ──────────────────────────────────────────────────
+// Progress
+// ──────────────────────────────────────────────────
+
+/// A stretch of work a progress display can show as one bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Phase {
+    /// Push and status: snapshotting and hashing the output. Pull: hashing
+    /// the local files it may replace.
+    Hashing,
+    /// Push: uploading contents the remote lacks.
+    Uploading,
+    /// Pull: downloading and placing files.
+    Downloading,
+}
+
+/// What [`Progress`] is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProgressEvent {
+    /// A phase starts, with its totals: files, and bytes when known up
+    /// front (a directory's download size is not). A push that restarts
+    /// because files changed under it starts [`Phase::Hashing`] again.
+    Started {
+        phase: Phase,
+        files: u64,
+        bytes: Option<u64>,
+    },
+    /// Files finished in a phase, and their size. Uploads count distinct
+    /// contents; a download counts every file written from one object.
+    Advanced {
+        phase: Phase,
+        files: u64,
+        bytes: u64,
+    },
+}
+
+/// A progress callback for push, status and pull: one event per phase
+/// start and per finished file. It runs on worker threads, possibly several
+/// at once, so it must be `Send + Sync`, and should return quickly. The
+/// default reports nothing and costs nothing.
+#[derive(Clone, Default)]
+pub struct Progress(Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>);
+
+impl Progress {
+    pub fn new(report: impl Fn(ProgressEvent) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(report)))
+    }
+
+    /// Report `event()`, built only if anyone is listening.
+    fn emit(&self, event: impl FnOnce() -> ProgressEvent) {
+        if let Some(report) = &self.0 {
+            report(event());
+        }
+    }
+}
+
+impl std::fmt::Debug for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = if self.0.is_some() { "set" } else { "none" };
+        write!(f, "Progress({state})")
+    }
+}
+
+// ──────────────────────────────────────────────────
 // Push
 // ──────────────────────────────────────────────────
 
@@ -180,17 +245,19 @@ pub struct PushOptions {
     pub exclude: Excludes,
     /// Stops the push before it writes the `.dvc`; after that it completes.
     pub cancel: CancelToken,
+    pub progress: Progress,
 }
 
 impl PushOptions {
-    /// Push to `history` with 8 jobs, the default excludes, and a token
-    /// nobody else can cancel.
+    /// Push to `history` with 8 jobs, the default excludes, a token nobody
+    /// else can cancel and no progress reports.
     pub fn new(history: HistoryKey) -> Self {
         Self {
             history,
             jobs: crate::transfer::DEFAULT_CONCURRENCY,
             exclude: Excludes::default(),
             cancel: CancelToken::default(),
+            progress: Progress::default(),
         }
     }
 }
@@ -237,7 +304,7 @@ async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Resul
     let jobs = opts.jobs.max(1);
     let plan = plan(remote, &staged, jobs).await?;
 
-    upload_all(remote, &plan.upload, jobs, &opts.cancel).await?;
+    upload_all(remote, &plan.upload, opts).await?;
     if let Some(manifest) = plan.manifest {
         opts.cancel.check()?;
         let key = remote.manifest_key(staged.id());
@@ -449,6 +516,14 @@ fn stage<C>(
     .into())
 }
 
+fn hashed(s: &Snapshot) -> ProgressEvent {
+    ProgressEvent::Advanced {
+        phase: Phase::Hashing,
+        files: 1,
+        bytes: s.size(),
+    }
+}
+
 fn warn_unterminated(relpath: &str, s: &Snapshot, warnings: &mut Vec<String>) {
     if relpath.ends_with(".jsonl") && s.unterminated_line() {
         warnings.push(format!(
@@ -470,6 +545,16 @@ fn snapshot_dir<C>(
         Err(e) => return Err(Retry::Fatal(e.into())),
     };
     let files = walk.files.len();
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Hashing,
+        files: files as u64,
+        bytes: Some(
+            walk.files
+                .iter()
+                .map(|f| std::fs::metadata(&f.path).map_or(0, |m| m.len()))
+                .sum(),
+        ),
+    });
     let mut entries = Vec::with_capacity(files);
     let mut contents = BTreeMap::new();
     let mut warnings = Vec::new();
@@ -478,6 +563,7 @@ fn snapshot_dir<C>(
         opts.cancel.check().map_err(Retry::Fatal)?;
         let s = snapshot::snapshot(&f.path, tmp)?;
         warn_unterminated(f.relpath.as_str(), &s, &mut warnings);
+        opts.progress.emit(|| hashed(&s));
         size += s.size();
         entries.push(ManifestEntry {
             relpath: f.relpath.to_manifest_path(),
@@ -513,7 +599,13 @@ fn snapshot_file<C>(
     keep: fn(Snapshot) -> C,
 ) -> std::result::Result<Staged<C>, Retry> {
     opts.cancel.check().map_err(Retry::Fatal)?;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Hashing,
+        files: 1,
+        bytes: std::fs::metadata(file).ok().map(|m| m.len()),
+    });
     let s = snapshot::snapshot(file, tmp)?;
+    opts.progress.emit(|| hashed(&s));
     let mut warnings = Vec::new();
     warn_unterminated(&file.to_string_lossy(), &s, &mut warnings);
     Ok(Staged {
@@ -578,13 +670,14 @@ async fn plan<'a, C: Content + Sync>(
 /// Upload `snaps`, `jobs` at a time. Once `cancel` is cancelled no upload
 /// starts; those under way finish (dropping one could orphan a multipart
 /// upload) and the push stops.
-async fn upload_all(
-    remote: &Remote,
-    snaps: &[&Snapshot],
-    jobs: usize,
-    cancel: &CancelToken,
-) -> Result<()> {
+async fn upload_all(remote: &Remote, snaps: &[&Snapshot], opts: &PushOptions) -> Result<()> {
     use futures::stream::{self, StreamExt, TryStreamExt};
+    let cancel = &opts.cancel;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Uploading,
+        files: snaps.len() as u64,
+        bytes: Some(snaps.iter().map(|s| s.size()).sum()),
+    });
     stream::iter(snaps)
         .map(|s| async move {
             if cancel.is_cancelled() {
@@ -592,9 +685,15 @@ async fn upload_all(
             }
             backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
                 .await
-                .with_context(|| format!("upload of {} failed", s.md5()))
+                .with_context(|| format!("upload of {} failed", s.md5()))?;
+            opts.progress.emit(|| ProgressEvent::Advanced {
+                phase: Phase::Uploading,
+                files: 1,
+                bytes: s.size(),
+            });
+            Ok::<_, anyhow::Error>(())
         })
-        .buffer_unordered(jobs)
+        .buffer_unordered(opts.jobs.max(1))
         .try_collect::<()>()
         .await?;
     cancel.check()
@@ -734,6 +833,7 @@ pub struct PullOptions {
     /// Stops the pull between files: each file is either left as it was or
     /// fully restored, never partly written.
     pub cancel: CancelToken,
+    pub progress: Progress,
 }
 
 impl Default for PullOptions {
@@ -743,6 +843,7 @@ impl Default for PullOptions {
             overwrite: Overwrite::Refuse,
             jobs: crate::transfer::DEFAULT_CONCURRENCY,
             cancel: CancelToken::default(),
+            progress: Progress::default(),
         }
     }
 }
@@ -829,9 +930,23 @@ async fn pull_async(
     let mut plan = Vec::new();
     let mut conflicts = Vec::new();
     let mut unchanged = 0;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Hashing,
+        files: targets.len() as u64,
+        bytes: None,
+    });
     for (path, md5) in &targets {
         opts.cancel.check()?;
-        match classify_target(&into, path, md5)? {
+        let target = classify_target(&into, path, md5)?;
+        opts.progress.emit(|| ProgressEvent::Advanced {
+            phase: Phase::Hashing,
+            files: 1,
+            bytes: match target {
+                Target::Missing => 0,
+                Target::Same | Target::Differs => std::fs::metadata(path).map_or(0, |m| m.len()),
+            },
+        });
+        match target {
             Target::Same => unchanged += 1,
             Target::Missing => plan.push((path, md5, false)),
             Target::Differs => match opts.overwrite {
@@ -854,7 +969,15 @@ async fn pull_async(
     for (path, md5, replace) in plan {
         by_object.entry(md5).or_default().push((path, replace));
     }
-    let written = fetch_and_place(remote, by_object, opts.jobs.max(1), &opts.cancel).await?;
+    opts.progress.emit(|| ProgressEvent::Started {
+        phase: Phase::Downloading,
+        files: by_object.values().map(|places| places.len() as u64).sum(),
+        bytes: match &pointer.output {
+            DvcOutput::File { size, .. } => Some(*size),
+            DvcOutput::Dir { .. } => None,
+        },
+    });
+    let written = fetch_and_place(remote, by_object, opts).await?;
 
     Ok(PullReport {
         pointer,
@@ -961,15 +1084,15 @@ fn count_extra(root: &Path, targets: &[(PathBuf, Hexdigest)]) -> usize {
 }
 
 /// Download each object once and place it at every path that needs it,
-/// `jobs` objects at a time. Once `cancel` is cancelled no download starts;
-/// those under way finish and are placed whole, and the pull stops.
+/// `opts.jobs` objects at a time. Once cancelled no download starts; those
+/// under way finish and are placed whole, and the pull stops.
 async fn fetch_and_place(
     remote: &Remote,
     by_object: BTreeMap<&Hexdigest, Vec<(&PathBuf, bool)>>,
-    jobs: usize,
-    cancel: &CancelToken,
+    opts: &PullOptions,
 ) -> Result<usize> {
     use futures::stream::{self, StreamExt, TryStreamExt};
+    let cancel = &opts.cancel;
     let counts: Vec<usize> = stream::iter(by_object)
         .map(|(md5, places)| async move {
             if cancel.is_cancelled() {
@@ -981,6 +1104,7 @@ async fn fetch_and_place(
             let tmp =
                 backend::download_verified(&remote.backend, &remote.object_key(md5), md5, dir)
                     .await?;
+            let bytes = tmp.as_file().metadata()?.len();
             // Extra copies first (from the verified temp), then move the temp.
             for (path, replace) in &places[1..] {
                 let parent = path.parent().context("target has no parent")?;
@@ -990,9 +1114,14 @@ async fn fetch_and_place(
                 place(copy, path, *replace)?;
             }
             place(tmp, first, places[0].1)?;
+            opts.progress.emit(|| ProgressEvent::Advanced {
+                phase: Phase::Downloading,
+                files: places.len() as u64,
+                bytes,
+            });
             Ok::<_, anyhow::Error>(places.len())
         })
-        .buffer_unordered(jobs)
+        .buffer_unordered(opts.jobs.max(1))
         .try_collect()
         .await?;
     cancel.check()?;

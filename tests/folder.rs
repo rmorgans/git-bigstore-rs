@@ -3,12 +3,14 @@
 
 use bigstore::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use bigstore::folder::{
-    self, Credentials, Error as FolderError, Excludes, HistoryKey, Overwrite, PointerSource,
-    PullOptions, PushOptions, Refusal, Remote, RemoteConfig, Selector, SyncState,
+    self, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey, Overwrite, Phase,
+    PointerSource, Progress, ProgressEvent, PullOptions, PushOptions, Refusal, Remote,
+    RemoteConfig, Selector, SyncState,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// The typed refusal in `err`'s chain.
 #[track_caller]
@@ -1649,4 +1651,171 @@ fn a_cancelled_pull_writes_nothing() {
     let err = folder::pull(&e.remote, &history(KEY, Selector::Latest), &o).unwrap_err();
     assert_cancelled(&err);
     assert!(tree(&into).is_empty(), "{:?}", tree(&into));
+}
+
+/// A progress callback recording every event, and the events so far.
+fn recorder() -> (Progress, Arc<Mutex<Vec<ProgressEvent>>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    (Progress::new(move |e| sink.lock().unwrap().push(e)), events)
+}
+
+/// Files and bytes advanced in `phase`, and the totals it started with.
+fn phase_sums(events: &[ProgressEvent], phase: Phase) -> ((u64, Option<u64>), (u64, u64)) {
+    let mut started = None;
+    let mut done = (0, 0);
+    for e in events {
+        match *e {
+            ProgressEvent::Started {
+                phase: p,
+                files,
+                bytes,
+            } if p == phase => {
+                started = Some((files, bytes));
+                done = (0, 0);
+            }
+            ProgressEvent::Advanced {
+                phase: p,
+                files,
+                bytes,
+            } if p == phase => {
+                done = (done.0 + files, done.1 + bytes);
+            }
+            _ => {}
+        }
+    }
+    (
+        started.unwrap_or_else(|| panic!("{phase:?} never started: {events:?}")),
+        done,
+    )
+}
+
+#[test]
+fn push_and_pull_report_progress_per_file_and_byte() {
+    let e = env();
+    let w = writer_dir(&e);
+    let total: u64 = tree(&w).iter().map(|(_, c)| c.len() as u64).sum();
+    let (progress, events) = recorder();
+    folder::push(
+        &e.remote,
+        &w,
+        &PushOptions {
+            progress,
+            ..opts(KEY)
+        },
+    )
+    .unwrap();
+    let events = std::mem::take(&mut *events.lock().unwrap());
+    assert_eq!(
+        phase_sums(&events, Phase::Hashing),
+        ((4, Some(total)), (4, total))
+    );
+    assert_eq!(
+        phase_sums(&events, Phase::Uploading),
+        ((4, Some(total)), (4, total))
+    );
+
+    let into = e.data.parent().unwrap().join("restore");
+    let (progress, events) = recorder();
+    folder::pull(
+        &e.remote,
+        &history(KEY, Selector::Latest),
+        &PullOptions {
+            progress,
+            ..pull_opts(Some(into))
+        },
+    )
+    .unwrap();
+    let events = std::mem::take(&mut *events.lock().unwrap());
+    assert_eq!(phase_sums(&events, Phase::Hashing).1 .0, 4, "{events:?}");
+    assert_eq!(
+        phase_sums(&events, Phase::Downloading),
+        ((4, None), (4, total))
+    );
+}
+
+/// `n` files of distinct content under `dir`.
+fn many_files(dir: &Path, n: usize) -> u64 {
+    for i in 0..n {
+        write(
+            &dir.join(format!("f{i:03}.txt")),
+            format!("file {i}\n").as_bytes(),
+        );
+    }
+    tree(dir).iter().map(|(_, c)| c.len() as u64).sum()
+}
+
+#[test]
+fn a_push_cancelled_mid_upload_leaves_history_and_pointer_alone() {
+    let e = env();
+    let out = e.data.join("out");
+    many_files(&out, 20);
+    let cancel = CancelToken::new();
+    let trigger = cancel.clone();
+    let o = PushOptions {
+        jobs: 1,
+        cancel,
+        progress: Progress::new(move |e| {
+            if let ProgressEvent::Advanced {
+                phase: Phase::Uploading,
+                ..
+            } = e
+            {
+                trigger.cancel();
+            }
+        }),
+        ..opts("ds/out")
+    };
+    let err = folder::push(&e.remote, &out, &o).unwrap_err();
+    assert_cancelled(&err);
+    let keys = remote_keys(&e.store);
+    let objects = keys.iter().filter(|k| k.starts_with("files/")).count();
+    assert!((1..20).contains(&objects), "{keys:?}");
+    assert!(
+        !keys.iter().any(|k| k.ends_with(".dir")),
+        "manifest uploaded"
+    );
+    assert!(!keys.iter().any(|k| k.starts_with("bigstore-history/")));
+    assert!(!e.data.join("out.dvc").exists());
+
+    // The next push completes, skipping what is already there.
+    let r = folder::push(&e.remote, &out, &opts("ds/out")).unwrap();
+    assert_eq!((r.uploaded, r.already_present), (20 - objects, objects));
+}
+
+#[test]
+fn a_pull_cancelled_mid_download_leaves_only_whole_files() {
+    let e = env();
+    let out = e.data.join("out");
+    many_files(&out, 20);
+    folder::push(&e.remote, &out, &opts("ds/out")).unwrap();
+    let into = e.data.parent().unwrap().join("restore");
+    let cancel = CancelToken::new();
+    let trigger = cancel.clone();
+    let o = PullOptions {
+        jobs: 1,
+        cancel,
+        progress: Progress::new(move |e| {
+            if let ProgressEvent::Advanced {
+                phase: Phase::Downloading,
+                ..
+            } = e
+            {
+                trigger.cancel();
+            }
+        }),
+        ..pull_opts(Some(into.clone()))
+    };
+    let err = folder::pull(&e.remote, &history("ds/out", Selector::Latest), &o).unwrap_err();
+    assert_cancelled(&err);
+    let restored = tree(&into);
+    assert!((1..20).contains(&restored.len()), "{restored:?}");
+    let original: std::collections::BTreeMap<_, _> = tree(&out).into_iter().collect();
+    for (name, content) in &restored {
+        assert_eq!(
+            original.get(name),
+            Some(content),
+            "{name} is not a whole file"
+        );
+    }
 }
