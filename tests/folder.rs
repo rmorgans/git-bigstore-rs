@@ -9,6 +9,7 @@ use bigstore::folder::{
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -429,14 +430,40 @@ fn unterminated_jsonl_warns_but_pushes() {
 }
 
 #[test]
-fn calling_from_inside_a_tokio_runtime_is_an_error_not_a_panic() {
+fn calling_from_inside_a_tokio_runtime_is_an_error_that_names_the_async_fn() {
     let e = env();
     let w = writer_dir(&e);
+    let key = HistoryKey::new(KEY).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let err = rt
-        .block_on(async { folder::push(&e.remote, &w, &opts(KEY)) })
-        .unwrap_err();
-    assert!(format!("{err}").contains("tokio runtime"), "{err}");
+    let errors = rt.block_on(async {
+        [
+            ("push", folder::push(&e.remote, &w, &opts(KEY)).map(drop)),
+            (
+                "status",
+                folder::status(&e.remote, &w, &opts(KEY)).map(drop),
+            ),
+            (
+                "pull",
+                folder::pull(&e.remote, &history(KEY, Selector::Latest), &pull_opts(None))
+                    .map(drop),
+            ),
+            (
+                "log",
+                folder::log(&e.remote, &key, &LogOptions::default()).map(drop),
+            ),
+            ("keys", folder::keys(&e.remote, None).map(drop)),
+        ]
+    });
+    for (name, result) in errors {
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("tokio runtime"), "{name}: {msg}");
+        assert!(
+            msg.contains(&format!("bigstore::folder::{name}_async")),
+            "{name}: {msg}"
+        );
+    }
+    assert!(remote_keys(&e.store).is_empty(), "something was published");
 }
 
 #[test]
@@ -2161,4 +2188,204 @@ fn pull_refuses_an_executable_mark_inside_a_directory() {
     let (path, reason) = refused(&err);
     assert_eq!(path, dvc);
     assert!(matches!(reason, Refusal::ExecutableInDirectory), "{err:#}");
+}
+
+// ──────────────────────────────────────────────────
+// Async API
+// ──────────────────────────────────────────────────
+
+#[test]
+fn every_async_fn_can_be_spawned_with_owned_arguments() {
+    // A caller on its own runtime moves owned arguments into `tokio::spawn`,
+    // which needs each future to be `Send + 'static`: this test is that it
+    // compiles. The futures are never polled.
+    fn spawnable<F>(_: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send,
+    {
+    }
+    let e = env();
+    let (remote, path, key) = (Arc::new(e.remote), e.data, HistoryKey::new(KEY).unwrap());
+
+    let (r, p, o) = (Arc::clone(&remote), path.clone(), opts(KEY));
+    spawnable(async move { folder::push_async(&r, &p, &o).await });
+    let (r, p, o) = (Arc::clone(&remote), path, opts(KEY));
+    spawnable(async move { folder::status_async(&r, &p, &o).await });
+    let (r, s, o) = (
+        Arc::clone(&remote),
+        history(KEY, Selector::Latest),
+        pull_opts(None),
+    );
+    spawnable(async move { folder::pull_async(&r, &s, &o).await });
+    let (r, k, o) = (Arc::clone(&remote), key.clone(), LogOptions::default());
+    spawnable(async move { folder::log_async(&r, &k, &o).await });
+    let (r, k) = (remote, key);
+    spawnable(async move { folder::keys_async(&r, Some(&k)).await });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_fns_push_and_restore_on_a_current_thread_runtime() {
+    let e = env();
+    let w = writer_dir(&e);
+    let key = HistoryKey::new(KEY).unwrap();
+    let pushed = folder::push_async(&e.remote, &w, &opts(KEY)).await.unwrap();
+    assert_eq!((pushed.files, pushed.uploaded), (4, 4));
+    assert!(pushed.pointer_path.exists());
+    let written = pushed.history_record.clone().expect("a first version");
+
+    let status = folder::status_async(&e.remote, &w, &opts(KEY))
+        .await
+        .unwrap();
+    assert!(
+        matches!(status.sync, SyncState::InSync),
+        "{:?}",
+        status.sync
+    );
+    assert_eq!(status.to_upload, 0);
+
+    let log = folder::log_async(&e.remote, &key, &LogOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!((&log[0].key, &log[0].pointer), (&written, &pushed.pointer));
+    assert_eq!(folder::keys_async(&e.remote, None).await.unwrap(), [key]);
+
+    let into = e.data.parent().unwrap().join("restore");
+    let pulled = folder::pull_async(
+        &e.remote,
+        &history(KEY, Selector::Latest),
+        &pull_opts(Some(into.clone())),
+    )
+    .await
+    .unwrap();
+    assert_eq!((pulled.written, pulled.unchanged), (4, 0));
+    assert_eq!(tree(&into), tree(&w));
+    let again = folder::pull_async(
+        &e.remote,
+        &PointerSource::File(pushed.pointer_path),
+        &pull_opts(Some(into.clone())),
+    )
+    .await
+    .unwrap();
+    assert_eq!((again.written, again.unchanged), (0, 4));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_async_pushes_of_different_outputs_on_a_multi_thread_runtime() {
+    let e = env();
+    let (a, b) = (e.data.join("a"), e.data.join("b"));
+    many_files(&a, 20);
+    write(&b.join("only.txt"), b"b\n");
+    let remote = Arc::new(e.remote);
+    let spawn_push = |output: &Path, key: &str| {
+        let (remote, output, o) = (Arc::clone(&remote), output.to_path_buf(), opts(key));
+        tokio::spawn(async move { folder::push_async(&remote, &output, &o).await })
+    };
+    let (pushed_a, pushed_b) = tokio::join!(spawn_push(&a, "ds/a"), spawn_push(&b, "ds/b"));
+    let (pushed_a, pushed_b) = (pushed_a.unwrap().unwrap(), pushed_b.unwrap().unwrap());
+    assert_eq!((pushed_a.files, pushed_a.uploaded), (20, 20));
+    assert_eq!((pushed_b.files, pushed_b.uploaded), (1, 1));
+
+    let keys = folder::keys_async(&remote, None).await.unwrap();
+    let keys: Vec<&str> = keys.iter().map(HistoryKey::as_str).collect();
+    assert_eq!(keys, ["ds/a", "ds/b"]);
+    for (output, key) in [(&a, "ds/a"), (&b, "ds/b")] {
+        let into = e.data.parent().unwrap().join(key.replace('/', "-"));
+        folder::pull_async(
+            &remote,
+            &history(key, Selector::Latest),
+            &pull_opts(Some(into.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tree(&into), tree(output), "{key}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_and_progress_work_through_the_async_api() {
+    let e = env();
+    let out = e.data.join("out");
+    let total = many_files(&out, 20);
+
+    // Cancelled mid-upload: no .dvc and no history, as with `push`.
+    let cancel = CancelToken::new();
+    let trigger = cancel.clone();
+    let o = PushOptions {
+        jobs: 1,
+        cancel,
+        progress: Progress::new(move |e| {
+            if let ProgressEvent::Advanced {
+                phase: Phase::Uploading,
+                ..
+            } = e
+            {
+                trigger.cancel();
+            }
+        }),
+        ..opts("ds/out")
+    };
+    let err = folder::push_async(&e.remote, &out, &o).await.unwrap_err();
+    assert_cancelled(&err);
+    assert!(!e.data.join("out.dvc").exists());
+    let err = folder::status_async(&e.remote, &out, &o).await.unwrap_err();
+    assert_cancelled(&err);
+
+    let (progress, events) = recorder();
+    let pushed = folder::push_async(
+        &e.remote,
+        &out,
+        &PushOptions {
+            progress,
+            ..opts("ds/out")
+        },
+    )
+    .await
+    .unwrap();
+    let events = std::mem::take(&mut *events.lock().unwrap());
+    assert_eq!(
+        phase_sums(&events, Phase::Hashing),
+        ((20, Some(total)), (20, total))
+    );
+    let ((to_upload, _), (uploaded, _)) = phase_sums(&events, Phase::Uploading);
+    assert_eq!(
+        (to_upload, uploaded),
+        (pushed.uploaded as u64, pushed.uploaded as u64)
+    );
+    assert!((1..20).contains(&pushed.already_present), "{pushed:?}");
+
+    let into = e.data.parent().unwrap().join("restore");
+    let o = pull_opts(Some(into.clone()));
+    o.cancel.cancel();
+    let err = folder::pull_async(&e.remote, &history("ds/out", Selector::Latest), &o)
+        .await
+        .unwrap_err();
+    assert_cancelled(&err);
+    assert!(tree(&into).is_empty());
+
+    let (progress, events) = recorder();
+    folder::pull_async(
+        &e.remote,
+        &history("ds/out", Selector::Latest),
+        &PullOptions {
+            progress,
+            ..pull_opts(Some(into.clone()))
+        },
+    )
+    .await
+    .unwrap();
+    let events = std::mem::take(&mut *events.lock().unwrap());
+    assert_eq!(
+        phase_sums(&events, Phase::Downloading),
+        ((20, None), (20, total))
+    );
+    assert_eq!(tree(&into), tree(&out));
+
+    let o = LogOptions::default();
+    o.cancel.cancel();
+    let err = folder::log_async(&e.remote, &HistoryKey::new("ds/out").unwrap(), &o)
+        .await
+        .unwrap_err();
+    assert_cancelled(&err);
 }

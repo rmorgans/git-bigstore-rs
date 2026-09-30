@@ -7,8 +7,18 @@
 //! pointer or from history. Real DVC can `dvc pull` what this writes, and
 //! this can pull what `dvc push` wrote.
 //!
-//! The API is blocking: each call runs its own tokio runtime, so it must not
-//! be called from inside one (that returns an error rather than panicking).
+//! Every call comes in two forms with the same arguments and results.
+//! [`push`], [`status`], [`pull`], [`log`] and [`keys`] block: each runs its
+//! own tokio runtime, so it must not be called from inside one (that
+//! returns an error naming the async form, rather than panicking).
+//! [`push_async`], [`status_async`], [`pull_async`], [`log_async`] and
+//! [`keys_async`] run on the caller's tokio runtime instead, which must have
+//! the I/O and time drivers enabled (`Builder::enable_all`, as
+//! `#[tokio::main]` and `#[tokio::test]` do): the remote's HTTP client needs
+//! both. A `current_thread` runtime works as well as a `multi_thread` one.
+//! Their futures are `Send`, so they can be `tokio::spawn`ed with owned
+//! arguments moved in. [`Remote::open`] does no I/O and has one form.
+//!
 //! Nothing here calls git.
 
 mod error;
@@ -18,6 +28,7 @@ mod walk;
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +41,9 @@ use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{DvcOutput, DvcPointer, Manifest, ManifestEntry};
 use crate::types::{check_portable_component, long_path, Hexdigest, Layout, ManifestPath};
 pub use error::{Error, Refusal};
-pub use history::{keys, log, HistoryKey, HistoryRecord, LogOptions, Selector};
+pub use history::{
+    keys, keys_async, log, log_async, HistoryKey, HistoryRecord, LogOptions, Selector,
+};
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
 use snapshot::{Snapshot, SnapshotError};
@@ -116,19 +129,67 @@ impl Remote {
     }
 }
 
-/// Run `fut` on a private runtime. Refuses (instead of panicking) when the
+/// Run `fut`, the future of `bigstore::folder::{name}_async`, on a private
+/// runtime for the blocking `name`. Refuses (instead of panicking) when the
 /// caller is already inside a tokio runtime.
-fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output> {
+fn block_on<F: Future>(name: &str, fut: F) -> Result<F::Output> {
     anyhow::ensure!(
         tokio::runtime::Handle::try_current().is_err(),
-        "bigstore::folder functions are blocking and cannot run inside a tokio runtime; \
-         call them from a plain thread or tokio::task::spawn_blocking"
+        "bigstore::folder::{name} blocks, so it cannot run inside a tokio runtime; \
+         await bigstore::folder::{name}_async instead"
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to start async runtime")?;
     Ok(rt.block_on(fut))
+}
+
+// Concurrent work made by a closure (`stream::iter(..).map(|x| async ..)`) is
+// built by these plain fns, never inline in an async fn: held across an
+// `.await` there, rustc cannot prove the closure's future `Send` for every
+// lifetime ("implementation of `FnOnce` is not general enough"), and the
+// public futures could not be spawned. The opaque return types declare
+// `Send` instead.
+
+/// `f` over `items`, at most `jobs` at a time; results in `items`' order.
+fn each_in_order<'a, I, F, Fut, T>(
+    items: I,
+    jobs: usize,
+    f: F,
+) -> impl Future<Output = Result<Vec<T>>> + Send + 'a
+where
+    I: IntoIterator,
+    I::IntoIter: Send + 'a,
+    F: FnMut(I::Item) -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T>> + Send + 'a,
+    T: Send + 'a,
+{
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    stream::iter(items)
+        .map(f)
+        .buffered(jobs.max(1))
+        .try_collect()
+}
+
+/// `f` over `items`, at most `jobs` at a time; results as they finish.
+fn each_unordered<'a, I, F, Fut, T>(
+    items: I,
+    jobs: usize,
+    f: F,
+) -> impl Future<Output = Result<Vec<T>>> + Send + 'a
+where
+    I: IntoIterator,
+    I::IntoIter: Send + 'a,
+    F: FnMut(I::Item) -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T>> + Send + 'a,
+    T: Send + 'a,
+{
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    stream::iter(items)
+        .map(f)
+        .buffer_unordered(jobs.max(1))
+        .try_collect()
 }
 
 // ──────────────────────────────────────────────────
@@ -295,10 +356,11 @@ pub struct PushReport {
 /// anything is published; an output that keeps changing through every retry
 /// is [`Error::OutputChanged`].
 pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
-    block_on(push_async(remote, output, opts))?
+    block_on("push", push_async(remote, output, opts))?
 }
 
-async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
+/// [`push`] on the caller's tokio runtime (see [the module docs](self)).
+pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
     let (name, pointer_path, _) = locate(output)?;
     let tmp = snapshot_tmpdir()?;
     let staged = stage(output, &name, tmp.path(), opts, |s| s)?;
@@ -379,10 +441,15 @@ pub enum SyncState {
 /// private temp directory, one file at a time. Refuses whatever push
 /// refuses.
 pub fn status(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
-    block_on(status_async(remote, output, opts))?
+    block_on("status", status_async(remote, output, opts))?
 }
 
-async fn status_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
+/// [`status`] on the caller's tokio runtime (see [the module docs](self)).
+pub async fn status_async(
+    remote: &Remote,
+    output: &Path,
+    opts: &PushOptions,
+) -> Result<StatusReport> {
     let (name, _, local) = locate(output)?;
     let tmp = snapshot_tmpdir()?;
     let staged = stage(output, &name, tmp.path(), opts, |s| Hashed {
@@ -657,7 +724,6 @@ async fn plan<'a, C: Content + Sync>(
     staged: &'a Staged<C>,
     jobs: usize,
 ) -> Result<Plan<'a, C>> {
-    use futures::stream::{self, StreamExt, TryStreamExt};
     // A manifest already on the remote means all its objects are (DVC's own
     // invariant, and ours: it is uploaded last).
     if staged.manifest.is_some()
@@ -669,11 +735,10 @@ async fn plan<'a, C: Content + Sync>(
             manifest: None,
         });
     }
-    let there: Vec<bool> = stream::iter(&staged.contents)
-        .map(|c| async move { backend::exists(&remote.backend, &remote.object_key(c.md5())).await })
-        .buffered(jobs)
-        .try_collect()
-        .await?;
+    let there: Vec<bool> = each_in_order(&staged.contents, jobs, |c| async move {
+        backend::exists(&remote.backend, &remote.object_key(c.md5())).await
+    })
+    .await?;
     let (present, upload): (Vec<_>, Vec<_>) = staged
         .contents
         .iter()
@@ -690,31 +755,27 @@ async fn plan<'a, C: Content + Sync>(
 /// starts; those under way finish (dropping one could orphan a multipart
 /// upload) and the push stops.
 async fn upload_all(remote: &Remote, snaps: &[&Snapshot], opts: &PushOptions) -> Result<()> {
-    use futures::stream::{self, StreamExt, TryStreamExt};
     let cancel = &opts.cancel;
     opts.progress.emit(|| ProgressEvent::Started {
         phase: Phase::Uploading,
         files: snaps.len() as u64,
         bytes: Some(snaps.iter().map(|s| s.size()).sum()),
     });
-    stream::iter(snaps)
-        .map(|s| async move {
-            if cancel.is_cancelled() {
-                return Ok(());
-            }
-            backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
-                .await
-                .with_context(|| format!("upload of {} failed", s.md5()))?;
-            opts.progress.emit(|| ProgressEvent::Advanced {
-                phase: Phase::Uploading,
-                files: 1,
-                bytes: s.size(),
-            });
-            Ok::<_, anyhow::Error>(())
-        })
-        .buffer_unordered(opts.jobs.max(1))
-        .try_collect::<()>()
-        .await?;
+    each_unordered(snaps, opts.jobs, |s| async move {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        backend::upload(&remote.backend, s.path(), &remote.object_key(s.md5()))
+            .await
+            .with_context(|| format!("upload of {} failed", s.md5()))?;
+        opts.progress.emit(|| ProgressEvent::Advanced {
+            phase: Phase::Uploading,
+            files: 1,
+            bytes: s.size(),
+        });
+        Ok(())
+    })
+    .await?;
     cancel.check()
 }
 
@@ -884,10 +945,11 @@ pub struct PullReport {
 /// left alone. A history selector that matches nothing is
 /// [`Error::NoSuchVersion`].
 pub fn pull(remote: &Remote, source: &PointerSource, opts: &PullOptions) -> Result<PullReport> {
-    block_on(pull_async(remote, source, opts))?
+    block_on("pull", pull_async(remote, source, opts))?
 }
 
-async fn pull_async(
+/// [`pull`] on the caller's tokio runtime (see [the module docs](self)).
+pub async fn pull_async(
     remote: &Remote,
     source: &PointerSource,
     opts: &PullOptions,
@@ -1152,43 +1214,39 @@ async fn fetch_and_place(
     opts: &PullOptions,
     mode: WorktreeMode,
 ) -> Result<usize> {
-    use futures::stream::{self, StreamExt, TryStreamExt};
     let cancel = &opts.cancel;
-    let counts: Vec<usize> = stream::iter(by_object)
-        .map(|(md5, places)| async move {
-            if cancel.is_cancelled() {
-                return Ok(0);
-            }
-            let (first, _) = places[0];
-            let dir = first.parent().context("target has no parent")?;
-            std::fs::create_dir_all(dir)?;
-            let tmp = backend::download_verified(
-                &remote.backend,
-                &remote.object_key(md5),
-                md5,
-                &long_path(dir)?,
-            )
-            .await?;
-            let bytes = tmp.as_file().metadata()?.len();
-            // Extra copies first (from the verified temp), then move the temp.
-            for (path, replace) in &places[1..] {
-                let parent = path.parent().context("target has no parent")?;
-                std::fs::create_dir_all(parent)?;
-                let mut copy = tempfile::NamedTempFile::new_in(long_path(parent)?)?;
-                std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut copy)?;
-                place(copy, path, *replace, mode)?;
-            }
-            place(tmp, first, places[0].1, mode)?;
-            opts.progress.emit(|| ProgressEvent::Advanced {
-                phase: Phase::Downloading,
-                files: places.len() as u64,
-                bytes,
-            });
-            Ok::<_, anyhow::Error>(places.len())
-        })
-        .buffer_unordered(opts.jobs.max(1))
-        .try_collect()
+    let counts: Vec<usize> = each_unordered(by_object, opts.jobs, |(md5, places)| async move {
+        if cancel.is_cancelled() {
+            return Ok(0);
+        }
+        let (first, _) = places[0];
+        let dir = first.parent().context("target has no parent")?;
+        std::fs::create_dir_all(dir)?;
+        let tmp = backend::download_verified(
+            &remote.backend,
+            &remote.object_key(md5),
+            md5,
+            &long_path(dir)?,
+        )
         .await?;
+        let bytes = tmp.as_file().metadata()?.len();
+        // Extra copies first (from the verified temp), then move the temp.
+        for (path, replace) in &places[1..] {
+            let parent = path.parent().context("target has no parent")?;
+            std::fs::create_dir_all(parent)?;
+            let mut copy = tempfile::NamedTempFile::new_in(long_path(parent)?)?;
+            std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut copy)?;
+            place(copy, path, *replace, mode)?;
+        }
+        place(tmp, first, places[0].1, mode)?;
+        opts.progress.emit(|| ProgressEvent::Advanced {
+            phase: Phase::Downloading,
+            files: places.len() as u64,
+            bytes,
+        });
+        Ok(places.len())
+    })
+    .await?;
     cancel.check()?;
     Ok(counts.into_iter().sum())
 }
