@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Added
+
+- **Folder mode** (`git bigstore folder push|pull|log`, library
+  `bigstore::folder`): Git-free backup of plain directories and single files
+  in DVC 3's exact format, checked against real DVC 3.67.1 in CI on Linux and
+  Windows. Includes snapshot-while-hashing (safe for files being appended to),
+  an append-only history log on the remote with restore by id or time,
+  non-destructive pull with a typed `PullConflict`, a required S3 endpoint
+  with no AWS/IMDS fallback, and a blocking API for sync callers.
+- `cli` cargo feature (default). `default-features = false` builds only the
+  library.
+- Windows CI job that builds and uploads `git-bigstore.exe`.
+
+### Security
+
+- On Windows, `RepoPath` rejects `\` and `:`. Before this, a hostile DVC
+  manifest could make `import-dvc-dir` write outside the repository via
+  `a\..\..\x` or a drive-relative `C:x`.
+
+### Changed
+
+- DVC pointers are parsed strictly as DVC 3. A pointer without `hash: md5`
+  comes from DVC 2 (md5-dos2unix, a different cache layout) and is refused
+  with a message saying so, instead of being reported as a missing object.
+
 ### Fixed
 
 - `pull` no longer overwrites uncommitted edits. It fills the cache, then

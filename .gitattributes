@@ -1,0 +1,3 @@
+# DVC golden fixtures are compared byte for byte (and their md5s are their
+# names): never let checkout translate line endings.
+tests/fixtures/** -text

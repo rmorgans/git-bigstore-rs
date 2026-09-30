@@ -11,7 +11,7 @@ use bigstore::config::BigstoreConfig;
 use bigstore::filter::{self, WorktreeFile};
 use bigstore::git::{self, IndexBlob};
 use bigstore::transfer::{self, Remote};
-use bigstore::types::{Hexdigest, RepoPath};
+use bigstore::types::{self, Hexdigest, RepoPath};
 use bigstore::{dvc, hash};
 
 #[derive(Parser)]
@@ -110,6 +110,10 @@ enum Commands {
         force: bool,
     },
 
+    /// Back up plain folders in DVC 3's format, without git
+    #[command(subcommand)]
+    Folder(FolderCommand),
+
     /// Internal: clean filter (stdin -> stdout)
     #[command(name = "filter-clean", hide = true)]
     FilterClean,
@@ -121,6 +125,63 @@ enum Commands {
     /// Internal: Git LFS custom transfer adapter (stdin/stdout JSON protocol)
     #[command(name = "lfs-adapter", hide = true)]
     LfsAdapter,
+}
+
+/// Remote options shared by every `folder` command.
+#[derive(clap::Args)]
+struct RemoteArgs {
+    /// Remote URL: s3://bucket/prefix, local:///path or rclone://remote:path
+    #[arg(long, env = "BIGSTORE_FOLDER_REMOTE")]
+    remote: String,
+    /// S3 endpoint (required for s3://; also read from AWS_ENDPOINT_URL)
+    #[arg(long)]
+    endpoint: Option<String>,
+    /// S3 region (also read from AWS_REGION)
+    #[arg(long, env = "AWS_REGION")]
+    region: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum FolderCommand {
+    /// Back up a directory or file; writes <name>.dvc beside it
+    Push {
+        /// Directory or file to back up
+        path: PathBuf,
+        /// History key, e.g. <survey>/<dataset>/<output path>
+        #[arg(long)]
+        history: String,
+        #[command(flatten)]
+        remote: RemoteArgs,
+        #[arg(short, long)]
+        jobs: Option<NonZeroUsize>,
+    },
+    /// Restore from a .dvc file, or from history with --history
+    Pull {
+        /// The .dvc file to restore (omit with --history)
+        pointer: Option<PathBuf>,
+        /// Restore a version of this history key instead of a .dvc file
+        #[arg(long, conflicts_with = "pointer", requires = "into")]
+        history: Option<String>,
+        /// Version: latest, an id prefix (8+ hex), or a time (RFC 3339)
+        #[arg(long, default_value = "latest", requires = "history")]
+        at: String,
+        /// Where to restore (default: beside the .dvc file)
+        #[arg(long)]
+        into: Option<PathBuf>,
+        /// Replace local files that differ
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        remote: RemoteArgs,
+        #[arg(short, long)]
+        jobs: Option<NonZeroUsize>,
+    },
+    /// List the versions of a history key
+    Log {
+        history: String,
+        #[command(flatten)]
+        remote: RemoteArgs,
+    },
 }
 
 fn main() -> Result<()> {
@@ -146,6 +207,7 @@ fn main() -> Result<()> {
             patterns,
             force,
         } => cmd_import_dvc_dir(&source, &dest_root, &patterns, force),
+        Commands::Folder(cmd) => cmd_folder(cmd),
         Commands::FilterClean => filter::clean(),
         Commands::FilterSmudge => filter::smudge(),
         Commands::LfsAdapter => bigstore::lfs_adapter::run(),
@@ -379,13 +441,14 @@ fn cmd_ref(source: &RepoPath, dest: &RepoPath) -> Result<()> {
     let git_dir = git::common_dir()?;
 
     let source_path = source.to_fs_path(&repo_root);
-    let dvc::DvcKind::File {
-        pointer,
+    let dvc::DvcPointer {
+        output: dvc::DvcOutput::File { md5, .. },
         path: dvc_out_path,
-    } = dvc::parse_dvc_file(&source_path)?
+    } = dvc::DvcPointer::load(&source_path)?
     else {
         anyhow::bail!("{source} is a .dir .dvc file — use `git bigstore import-dvc-dir` instead");
     };
+    let pointer = types::Pointer::new(md5);
     let dvc_cache_root = resolve_dvc_cache(&repo_root, &source_path)?;
 
     match cache::import_from_dvc_cache(&dvc_cache_root, &git_dir, pointer.hexdigest())? {
@@ -555,8 +618,8 @@ fn cmd_import_dvc_dir(
 fn resolve_dir_manifest(
     dvc_cache_root: &Path,
     source_path: &Path,
-) -> Result<(Hexdigest, Vec<dvc::DirEntry>)> {
-    let dvc::DvcKind::Dir { manifest } = dvc::parse_dvc_file(source_path)? else {
+) -> Result<(Hexdigest, Vec<dvc::ManifestEntry>)> {
+    let dvc::DvcOutput::Dir { manifest, .. } = dvc::DvcPointer::load(source_path)?.output else {
         anyhow::bail!(
             "{} is a single-file .dvc — use `git bigstore ref` instead",
             source_path.display()
@@ -591,6 +654,118 @@ fn resolve_dvc_cache(repo_root: &Path, source_path: &Path) -> Result<PathBuf> {
         Some(dvc_root) => cache::resolve_dvc_cache_root(&dvc_root),
         None => Ok(repo_root.join(".dvc/cache")),
     }
+}
+
+fn open_folder_remote(args: &RemoteArgs) -> Result<bigstore::folder::Remote> {
+    use bigstore::folder::{Credentials, Remote, RemoteConfig};
+    Remote::open(&RemoteConfig {
+        url: args.remote.clone(),
+        endpoint: args
+            .endpoint
+            .clone()
+            .or_else(backend::store::env_s3_endpoint),
+        region: args.region.clone(),
+        credentials: Credentials::FromEnv,
+    })
+}
+
+fn cmd_folder(cmd: FolderCommand) -> Result<()> {
+    use bigstore::folder::{self, HistoryKey, Overwrite, PointerSource, Selector};
+    match cmd {
+        FolderCommand::Push {
+            path,
+            history,
+            remote,
+            jobs,
+        } => {
+            let remote = open_folder_remote(&remote)?;
+            let r = folder::push(
+                &remote,
+                &path,
+                &folder::PushOptions {
+                    history: HistoryKey::new(&history)?,
+                    jobs: resolve_jobs(jobs)?.get(),
+                },
+            )?;
+            for w in &r.warnings {
+                eprintln!("warning: {w}");
+            }
+            if r.empty_dirs > 0 {
+                eprintln!("{} empty dir(s) not recorded (DVC cannot)", r.empty_dirs);
+            }
+            eprintln!(
+                "{} file(s): {} uploaded, {} already on the remote; wrote {}{}",
+                r.files,
+                r.uploaded,
+                r.already_present,
+                r.pointer_path.display(),
+                if r.history_record.is_some() {
+                    ""
+                } else {
+                    " (unchanged since the last version)"
+                }
+            );
+        }
+        FolderCommand::Pull {
+            pointer,
+            history,
+            at,
+            into,
+            force,
+            remote,
+            jobs,
+        } => {
+            let remote = open_folder_remote(&remote)?;
+            let source = match (pointer, history) {
+                (Some(p), None) => PointerSource::File(p),
+                (None, Some(key)) => PointerSource::History {
+                    key: HistoryKey::new(&key)?,
+                    at: match at.as_str() {
+                        "latest" => Selector::Latest,
+                        s if s.len() >= 8 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                            Selector::Id(s.to_string())
+                        }
+                        s => Selector::AtOrBefore(s.to_string()),
+                    },
+                },
+                _ => anyhow::bail!("give a .dvc file or --history"),
+            };
+            let r = folder::pull(
+                &remote,
+                &source,
+                &folder::PullOptions {
+                    into,
+                    overwrite: if force {
+                        Overwrite::Force
+                    } else {
+                        Overwrite::Refuse
+                    },
+                    jobs: resolve_jobs(jobs)?.get(),
+                },
+            )?;
+            eprintln!(
+                "{} file(s) written, {} already up to date, {} local file(s) not in this version (kept)",
+                r.written, r.unchanged, r.extra_local
+            );
+        }
+        FolderCommand::Log { history, remote } => {
+            let remote = open_folder_remote(&remote)?;
+            for r in folder::log(&remote, &HistoryKey::new(&history)?)? {
+                let (kind, detail) = match &r.pointer.output {
+                    dvc::DvcOutput::Dir { size, nfiles, .. } => {
+                        ("dir", format!("{nfiles} files, {size} bytes"))
+                    }
+                    dvc::DvcOutput::File { size, .. } => ("file", format!("{size} bytes")),
+                };
+                println!(
+                    "{}  {}  {kind}  {detail}",
+                    r.time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    r.id()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve concurrency: --jobs flag > BIGSTORE_JOBS env > default (8).

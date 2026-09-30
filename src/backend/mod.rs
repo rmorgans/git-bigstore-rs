@@ -43,6 +43,116 @@ pub async fn exists(backend: &Backend, key: &str) -> Result<bool> {
     }
 }
 
+/// Store `bytes` at `key` (small objects: manifests, pointers).
+pub async fn put_bytes(backend: &Backend, key: &str, bytes: Vec<u8>) -> Result<()> {
+    match backend {
+        Backend::ObjectStore(store) => {
+            store
+                .put(&object_store::path::Path::from(key), bytes.into())
+                .await?;
+            Ok(())
+        }
+        Backend::Rclone(r) => {
+            let tmp = tempfile::NamedTempFile::new()?;
+            tokio::fs::write(tmp.path(), &bytes).await?;
+            r.upload(tmp.path(), key).await
+        }
+    }
+}
+
+/// Read a whole object into memory, refusing anything over `limit` bytes.
+/// `Ok(None)` if the object does not exist.
+pub async fn get_bytes(backend: &Backend, key: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    match backend {
+        Backend::ObjectStore(store) => {
+            let result = match store.get(&object_store::path::Path::from(key)).await {
+                Ok(r) => r,
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            anyhow::ensure!(
+                result.meta.size <= limit,
+                "{key} is {} bytes, over the {limit}-byte limit",
+                result.meta.size
+            );
+            Ok(Some(result.bytes().await?.to_vec()))
+        }
+        Backend::Rclone(r) => {
+            if !r.exists(key).await? {
+                return Ok(None);
+            }
+            let tmp = tempfile::NamedTempFile::new()?;
+            r.download(key, tmp.path()).await?;
+            let len = tokio::fs::metadata(tmp.path()).await?.len();
+            anyhow::ensure!(
+                len <= limit,
+                "{key} is {len} bytes, over the {limit}-byte limit"
+            );
+            Ok(Some(tokio::fs::read(tmp.path()).await?))
+        }
+    }
+}
+
+/// Keys of all objects under `prefix` (a key prefix ending at a `/`), sorted.
+pub async fn list(backend: &Backend, prefix: &str) -> Result<Vec<String>> {
+    let mut keys = match backend {
+        Backend::ObjectStore(store) => {
+            use futures::TryStreamExt;
+            let prefix = object_store::path::Path::from(prefix);
+            store
+                .list(Some(&prefix))
+                .map_ok(|meta| meta.location.to_string())
+                .try_collect::<Vec<_>>()
+                .await?
+        }
+        Backend::Rclone(r) => r.list(prefix).await?,
+    };
+    keys.sort();
+    Ok(keys)
+}
+
+/// Download `key` into a new temp file in `dir`, hashing while it streams,
+/// and return the file only if its content is `expected`.
+pub async fn download_verified(
+    backend: &Backend,
+    key: &str,
+    expected: &crate::types::Hexdigest,
+    dir: &Path,
+) -> Result<tempfile::NamedTempFile> {
+    use crate::hash::Hasher;
+    use tokio::io::AsyncWriteExt;
+
+    let tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let actual = match backend {
+        Backend::ObjectStore(store) => {
+            use futures::StreamExt;
+            let mut file = tokio::fs::File::from_std(tmp.reopen()?);
+            let mut stream = store
+                .get(&object_store::path::Path::from(key))
+                .await?
+                .into_stream();
+            let mut hasher = Hasher::new(expected.hash_fn());
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                hasher.update(&chunk);
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+            hasher.finalize()
+        }
+        Backend::Rclone(r) => {
+            r.download(key, tmp.path()).await?;
+            let (path, hash_fn) = (tmp.path().to_path_buf(), expected.hash_fn());
+            tokio::task::spawn_blocking(move || crate::hash::hash_file(&path, hash_fn)).await??
+        }
+    };
+    anyhow::ensure!(
+        actual == *expected,
+        "integrity check failed for {key}: expected {expected}, got {actual}"
+    );
+    Ok(tmp)
+}
+
 /// Upload a local file to the remote. Streams — does not buffer the entire file.
 pub async fn upload(backend: &Backend, local_path: &Path, key: &str) -> Result<()> {
     match backend {

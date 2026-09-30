@@ -14,10 +14,18 @@ path = "src/lib.rs"
 [[bin]]
 name = "git-bigstore"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The git-bigstore binary. Library users (`bigstore::folder`, …) can turn it
+# off with `default-features = false` and drop clap and tracing-subscriber.
+cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 futures = "0.3.32"
 globset = "0.4.18"
 hex = "0.4"
@@ -33,13 +41,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 url = "2"
+walkdir = "2.5.0"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
-
-[dev-dependencies]
-walkdir = "2.5.0"
