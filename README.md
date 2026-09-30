@@ -583,7 +583,9 @@ committed it.
 
 **"not a pointer in git (git add --renormalize)"** — The file was committed
 before its `filter=bigstore` rule existed, so git holds its raw content. Run
-`git add --renormalize <path>` and commit to move it into bigstore.
+`git add --renormalize <path>` and commit to move it into bigstore. Until
+then, checkout passes it through unchanged, buffering content over 8 MiB in
+`.git/bigstore/tmp` (not the system temp dir).
 
 **"pointer only (needs pull)"** — The file is tracked but not downloaded. Run
 `git bigstore pull`.

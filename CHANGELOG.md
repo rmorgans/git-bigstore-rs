@@ -143,6 +143,12 @@
   upload can't poison the bucket) — writes downloads to a private per-run temp
   dir (no predictable shared path), and cleans up on failure.
 - Push/pull progress bar now advances for skipped and not-found objects.
+- The filter process no longer spools checkouts of large non-pointer files
+  (committed before their `filter=bigstore` rule) to the system temp dir,
+  which could fill a small `/tmp` or tmpfs, or fail when `TMPDIR` is
+  unusable. Content over 8 MiB now goes to an unnamed file in
+  `.git/bigstore/tmp`, on the cache's filesystem; files a crashed filter left
+  there are removed when the next one starts.
 
 ### Changed
 

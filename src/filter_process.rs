@@ -15,8 +15,9 @@
 
 use anyhow::{Context, Result};
 use std::io::{self, Read, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::cache;
 use crate::catfile::CatFileBatch;
 use crate::filter::{self, Head};
 use crate::git;
@@ -24,19 +25,38 @@ use crate::pktline::{Content, ContentWriter, PktReader, PktWriter};
 use crate::types::Pointer;
 
 /// Non-pointer content smudged through the filter is held in memory up to
-/// this size, then in a temp file: it must be read completely before the
-/// reply starts.
+/// this size, then in a file in [`cache::spool_dir`]: it must be read
+/// completely before the reply starts.
 const SPOOL_LIMIT: usize = 8 << 20;
 
 /// Serve git on stdin/stdout until it closes the stream.
 pub fn run() -> Result<()> {
+    let git_dir = git::common_dir()?;
+    remove_stale_spools(&cache::spool_dir(&git_dir));
     let mut handler = Handler {
-        git_dir: git::common_dir()?,
+        git_dir,
         worktree: PathBuf::from("."),
         spool_limit: SPOOL_LIMIT,
         index: None,
     };
     serve(&mut handler, io::stdin().lock(), io::stdout().lock())
+}
+
+/// On Unix a spool file is unlinked the moment it is created, so a named
+/// file in the spool directory is one a crashed filter left behind. Removing
+/// one that a running filter has only just created is harmless too: it holds
+/// the file open and ignores the failure of its own unlink. (On Windows an
+/// open spool cannot be removed, and the OS deletes it when closed, even by a
+/// crash.) Best effort: leftovers cost space, not correctness.
+fn remove_stale_spools(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn serve<R: Read, W: Write>(handler: &mut Handler, input: R, output: W) -> Result<()> {
@@ -306,19 +326,29 @@ impl Handler {
             (Command::Smudge, Head::Content { head }) => {
                 // Content passes through, but git's content must be read
                 // completely before the reply starts.
-                let mut spool = tempfile::spooled_tempfile(self.spool_limit);
-                let spooled = spool
-                    .write_all(&head)
-                    .and_then(|()| io::copy(request.content(), &mut spool))
-                    .and_then(|_| spool.rewind());
-                if let Err(err) = spooled {
-                    return request.fail(&err.into());
-                }
+                let mut spool = match self.spool(&head, request.content()) {
+                    Ok(spool) => spool,
+                    Err(err) => return request.fail(&err),
+                };
                 let mut response = request.succeed()?;
                 let copied = io::copy(&mut spool, &mut response);
                 response.finish(copied.map(drop).map_err(anyhow::Error::from))
             }
         }
+    }
+
+    /// `head` and the rest of `content`, rewound: in memory up to the spool
+    /// limit, then in an unnamed file on the cache's filesystem. Not the
+    /// system temp dir, which may be a small tmpfs.
+    fn spool(&self, head: &[u8], content: &mut impl Read) -> Result<tempfile::SpooledTempFile> {
+        let dir = cache::spool_dir(&self.git_dir);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        let mut spool = tempfile::spooled_tempfile_in(self.spool_limit, dir);
+        spool.write_all(head)?;
+        io::copy(content, &mut spool)?;
+        spool.rewind()?;
+        Ok(spool)
     }
 
     /// The pointer the index holds for `pathname`; `None` for a path
@@ -350,11 +380,9 @@ fn reply<R: Read, W: Write>(request: Request<'_, R, W>, body: &[u8]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache;
     use crate::hash::Hasher;
     use crate::types::HashFunction;
     use std::io::Cursor;
-    use std::path::Path;
     use std::process::Command as Git;
 
     /// The handshake reply, written by hand from gitattributes(5).
@@ -715,6 +743,27 @@ mod tests {
         assert_eq!(
             replies(&out),
             [Reply::Rejected, Reply::Success(b"plain".to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_failed_spool_rejects_the_file_and_the_stream_stays_in_sync() {
+        let mut f = fixture();
+        // A file where the spool directory should be.
+        let spool = cache::spool_dir(&f.handler.git_dir);
+        std::fs::create_dir_all(spool.parent().unwrap()).unwrap();
+        std::fs::write(&spool, b"not a directory").unwrap();
+        let big: Vec<u8> = (0..200 * 1024u32).map(|i| (i % 253) as u8).collect();
+        let ptr = sha256_pointer(b"x");
+
+        let mut input = git_handshake();
+        input.extend(request("smudge", "raw.bin", &big));
+        input.extend(request("smudge", "p.bin", &ptr.encode()));
+        let (result, out) = serve_bytes(&mut f.handler, input);
+        result.unwrap();
+        assert_eq!(
+            replies(&out),
+            [Reply::Rejected, Reply::Success(ptr.encode())]
         );
     }
 }

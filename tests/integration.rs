@@ -2758,3 +2758,41 @@ fn one_shot_and_process_filters_agree() {
     }
     assert_eq!(listings[0], listings[1]);
 }
+
+/// Non-pointer content past the in-memory limit spools under the git dir,
+/// not the system temp dir, which may be small or, here, unusable. Spool
+/// files never outlive the process, and a crashed run's are removed.
+#[test]
+fn large_non_pointer_smudge_spools_under_the_git_dir() {
+    let t = TestRepo::new();
+    // Committed before tracking: git holds the raw bytes, and smudge passes
+    // them through the filter process.
+    let big: Vec<u8> = (0..9 << 20).map(|i: u32| (i % 251) as u8).collect();
+    t.write_file("big.bin", &big);
+    git(&t.repo_dir, &["add", "big.bin"]);
+    git(&t.repo_dir, &["commit", "-q", "-m", "raw"]);
+    t.track("*.bin filter=bigstore\n");
+
+    let spool = t.repo_dir.join(".git/bigstore/tmp");
+    std::fs::create_dir_all(&spool).unwrap();
+    std::fs::write(spool.join(".tmpCRASHED"), b"left by a killed filter").unwrap();
+    std::fs::remove_file(t.repo_dir.join("big.bin")).unwrap();
+
+    let checkout = Command::new("git")
+        .args(["checkout", "--", "big.bin"])
+        .current_dir(&t.repo_dir)
+        .env("TMPDIR", t.repo_dir.join("no-such-dir"))
+        .output()
+        .unwrap();
+    assert!(
+        checkout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+    assert!(t.read_file("big.bin") == big, "big.bin not restored");
+    let left: Vec<_> = std::fs::read_dir(&spool)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "spool files left: {left:?}");
+}
