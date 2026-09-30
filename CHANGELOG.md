@@ -73,7 +73,9 @@
   `Thumbs.db` and `desktop.ini`, at any depth. Finder writes `.DS_Store` just
   by showing a folder, which made the next push a new manifest and history
   record. `--exclude PATTERN` (`PushOptions::exclude`, `folder::Excludes`)
-  skips more, with `.gitignore` rules relative to the pushed directory.
+  skips more, with `.gitignore` rules relative to the pushed directory; a
+  directory-only pattern (`scratch/`) also skips a symlink to a directory,
+  as `.dvcignore` does, instead of refusing it, and never follows it.
   Anyone also running `dvc add` on the folder needs the same patterns in
   `.dvcignore`; the README gives the lines.
 

@@ -242,6 +242,14 @@ fn dvc_add_with_the_documented_dvcignore_matches_push() {
     // directories only.
     write(&views.join("a/cache/kept.bin"), b"kept");
     write(&views.join("b/scratch"), b"a file");
+    // A symlink to a directory: `scratch/` matches it in DVC and in push,
+    // and neither follows it.
+    #[cfg(unix)]
+    {
+        write(&tmp.path().join("elsewhere/f.bin"), b"outside");
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), views.join("site=s1/scratch"))
+            .unwrap();
+    }
 
     let mut ignore = std::fs::read_to_string(project.join(".dvcignore")).unwrap();
     for line in DEFAULT_EXCLUDES

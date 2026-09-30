@@ -20,12 +20,14 @@ pub const DEFAULT_EXCLUDES: [&str; 4] = [".DS_Store", "._*", "Thumbs.db", "deskt
 /// patterns. Patterns follow `.gitignore`/`.dvcignore` rules relative to the
 /// output: without a `/` a pattern matches a name at any depth; with one
 /// (leading or inside) it matches the path from the output root; a trailing
-/// `/` matches directories only, and an excluded directory is skipped whole.
+/// `/` matches directories only (a symlink to a directory counts as one, as
+/// in DVC), and an excluded directory is skipped whole.
 /// `*`, `?` and `[…]` never match `/`; `**` matches any number of
 /// directories; `\` escapes. Negation (`!`) is not supported.
 ///
-/// Skipped entries are never inspected, so an excluded symlink or special
-/// file is not refused. Nested `.git`/`.dvc` and `*.dvc` are refused even if
+/// Skipped entries are never read or walked (of a symlink, only its
+/// target's type is looked at), so an excluded symlink or special file is
+/// not refused. Nested `.git`/`.dvc` and `*.dvc` are refused even if
 /// excluded.
 #[derive(Debug, Clone)]
 pub struct Excludes {
@@ -228,7 +230,12 @@ pub fn walk(root: &Path, excludes: &Excludes) -> Result<Walk, WalkError> {
                 }
                 Err(e) => return Err(WalkError::Io(e.into())),
             };
-            if excludes.excludes(&relpath, kind.is_dir()) {
+            // A symlink counts as what it points at, as in DVC: a dir-only
+            // pattern matches a symlink to a directory. Only its target's
+            // type is read; a symlink is never walked.
+            let target = kind.is_symlink().then(|| std::fs::metadata(&path));
+            let is_dir = kind.is_dir() || matches!(&target, Some(Ok(m)) if m.is_dir());
+            if excludes.excludes(&relpath, is_dir) {
                 continue;
             }
             any = true;
@@ -236,17 +243,14 @@ pub fn walk(root: &Path, excludes: &Excludes) -> Result<Walk, WalkError> {
                 stack.push((path, relpath));
                 continue;
             }
-            let is_file = if kind.is_symlink() {
-                match std::fs::metadata(&path) {
-                    Ok(m) if m.is_file() => true,
-                    Ok(m) if m.is_dir() => {
-                        return Err(refused(&relpath, Refusal::SymlinkToDirectory))
-                    }
-                    Ok(_) => false,
-                    Err(_) => return Err(refused(&relpath, Refusal::BrokenSymlink)),
+            let is_file = match target {
+                None => kind.is_file(),
+                Some(Ok(m)) if m.is_file() => true,
+                Some(Ok(m)) if m.is_dir() => {
+                    return Err(refused(&relpath, Refusal::SymlinkToDirectory))
                 }
-            } else {
-                kind.is_file()
+                Some(Ok(_)) => false,
+                Some(Err(_)) => return Err(refused(&relpath, Refusal::BrokenSymlink)),
             };
             if !is_file {
                 return Err(refused(&relpath, Refusal::SpecialFile));
@@ -374,6 +378,28 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// As in DVC, a dir-only pattern (`scratch/`) matches a symlink to a
+    /// directory, which is then skipped, not refused and never walked; it
+    /// does not match a symlink to a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_dir_only_exclude_skips_a_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("out");
+        std::fs::create_dir_all(d.path().join("elsewhere")).unwrap();
+        std::fs::write(d.path().join("elsewhere/f"), b"f").unwrap();
+        std::fs::create_dir_all(out.join("a")).unwrap();
+        std::fs::write(out.join("a/real.txt"), b"x").unwrap();
+        symlink("../elsewhere", out.join("scratch")).unwrap();
+        symlink("../../elsewhere", out.join("a/scratch")).unwrap();
+        symlink("real.txt", out.join("a/keep")).unwrap();
+        let excludes = Excludes::new(["scratch/", "keep/"]).unwrap();
+        let w = super::walk(&out, &excludes).unwrap();
+        assert_eq!(names(&w), ["a/keep", "a/real.txt"]);
+        assert_eq!(w.empty_dirs, 0);
     }
 
     #[test]

@@ -482,7 +482,8 @@ What it guarantees:
   with `--exclude PATTERN` (repeatable; `PushOptions::exclude` in the
   library), using `.gitignore` rules relative to the pushed directory: `*.tmp`
   matches at any depth, `/cache` only at the top, `scratch/` only
-  directories; `!` is not supported. A directory holding only skipped files
+  directories (a symlink to one included, as in DVC: it is skipped, never
+  followed); `!` is not supported. A directory holding only skipped files
   counts as empty. Pull is unaffected: it never deletes local files.
 
 Push records exactly what DVC 3 would, so if you also run `dvc add` on the
