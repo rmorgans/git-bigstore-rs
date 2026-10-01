@@ -45,10 +45,11 @@
   control frames, file bodies in data packets. Every file received, on
   either side, is checked with `layout::verify`'s rules as it arrives into
   `<name>#<random>`, then placed by a rename that never replaces (or a
-  hard link where the filesystem cannot rename so): a name already there
-  counts as present. Transfers go objects, then manifests, then records,
-  both ways, and a receiver places nothing after its first refusal. The
-  server refuses a record outside the history given to `open` and any key
+  hard link where the filesystem cannot rename so; FAT and exFAT can do
+  neither): a name already there counts as present. Transfers go objects,
+  then manifests, then records, both ways, and a receiver places nothing
+  after its first refusal. The server refuses a record sent to it outside
+  the history given to `open` and any key
   that is not a store file's; a dedicated thread reads its input, and
   when that ends outside an orderly close the session stops at its next
   step, removes its temp file and `serve` returns, so the far process
