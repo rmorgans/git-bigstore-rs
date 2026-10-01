@@ -53,6 +53,10 @@ pub enum Error {
     /// and was not restored, so it cannot be read: the store answered
     /// `InvalidObjectState`. Restore it, then read again.
     Archived { key: String },
+    /// [`store::build_strict_s3`] was asked for credentials from the
+    /// environment, and `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` is
+    /// unset or empty.
+    CredentialsMissing,
 }
 
 impl std::fmt::Display for Error {
@@ -61,6 +65,9 @@ impl std::fmt::Display for Error {
             Self::Archived { key } => write!(
                 f,
                 "{key} is archived (InvalidObjectState): restore it before reading it"
+            ),
+            Self::CredentialsMissing => f.write_str(
+                "S3 credentials missing: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must both be set",
             ),
         }
     }

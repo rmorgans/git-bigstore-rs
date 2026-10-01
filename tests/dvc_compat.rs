@@ -223,10 +223,10 @@ fn dvc_reads_pointers_and_history_records_carrying_bigstore_meta() {
     let src = tmp.path().join("src/host=xenoglossicist");
     let opts = PushOptions::new(HistoryKey::new("ds/host=xenoglossicist").unwrap());
     populate(&src);
-    folder::push(&remote, &src, &opts).unwrap();
+    let _ = folder::push(&remote, &src, &opts).unwrap();
     write(&src.join("a.txt"), b"second version");
     let report = folder::push(&remote, &src, &opts).unwrap();
-    let record = store.join(report.history_record.as_deref().unwrap());
+    let record = store.join(report.outcome.record().unwrap());
 
     for (i, pointer) in [&report.pointer_path, &record].into_iter().enumerate() {
         let text = std::fs::read_to_string(pointer).unwrap();

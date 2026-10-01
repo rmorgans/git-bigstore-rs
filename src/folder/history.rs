@@ -429,7 +429,8 @@ pub(super) async fn select(
     let listed = list(remote, key).await?;
     let found = match pick {
         Pick::Latest => match heads(&listed)[..] {
-            [] => None,
+            [] if listed.is_empty() => None,
+            [] => return Err(Error::NoHead { key: key.clone() }.into()),
             [one] => Some(one),
             ref many => return Err(Error::Diverged { heads: ids(many) }.into()),
         },
@@ -483,10 +484,7 @@ pub(super) async fn heads_of(remote: &Remote, key: &HistoryKey, jobs: usize) -> 
     let listed = list(remote, key).await?;
     Ok(match heads(&listed)[..] {
         [] if listed.is_empty() => Heads::None,
-        [] => anyhow::bail!(
-            "history {} has no head: its records name each other as parents",
-            key.as_str()
-        ),
+        [] => return Err(Error::NoHead { key: key.clone() }.into()),
         [one] => Heads::One(Box::new(fetch(remote, one).await?)),
         ref many => Heads::Many(
             fetch_all(remote, many.iter().copied(), jobs, &CancelToken::default()).await?,
@@ -563,18 +561,18 @@ pub(super) async fn next(
                     return Err(Error::Diverged { heads: ids }.into())
                 }
                 Some(base) if !ids.contains(base) => return Err(stale(ids).into()),
-                Some(_) => {
-                    anyhow::ensure!(
-                        ids.len() <= MAX_PARENTS,
-                        "history {} has {} heads; a merge joins at most {MAX_PARENTS}",
-                        key.as_str(),
-                        ids.len()
-                    );
-                    Next::Publish {
-                        after: heads.iter().map(|h| h.time).max(),
-                        parents: ids,
+                Some(_) if ids.len() > MAX_PARENTS => {
+                    return Err(Error::TooManyHeads {
+                        key: key.clone(),
+                        heads: ids,
+                        max: MAX_PARENTS,
                     }
+                    .into())
                 }
+                Some(_) => Next::Publish {
+                    after: heads.iter().map(|h| h.time).max(),
+                    parents: ids,
+                },
             }
         }
     })
@@ -843,7 +841,7 @@ mod tests {
         std::fs::write(dir.path().join("f.dvc"), synced.to_yaml()).unwrap();
 
         let pushed = push(&remote, &f, &push_opts()).unwrap();
-        let written = pushed.history_record.expect("a new version");
+        let written = pushed.outcome.record().expect("a new version").to_string();
         let head = format!("bigstore-history/k/{}", legacy_name(50));
         assert_eq!(store.take(), [head], "push reads only the head");
 
@@ -946,6 +944,6 @@ mod tests {
             &LogOptions::default(),
         )
         .unwrap_err();
-        assert_eq!(Some(archived_key(err)), pushed.history_record);
+        assert_eq!(Some(archived_key(err).as_str()), pushed.outcome.record());
     }
 }

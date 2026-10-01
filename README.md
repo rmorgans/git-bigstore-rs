@@ -453,6 +453,12 @@ git bigstore folder pull ds/store.toml.dvc --remote $R
 git bigstore folder pull --history ST032/Beatons/annotations/reviewer=rick/host=mac \
     --at 9f9acd0a --into /tmp/v1 --remote $R
 
+# Catch up with another host's push: replace (or remove) only the files
+# still as the .dvc beside the output records them; any local change is
+# refused, and nothing is written.
+git bigstore folder pull --history ST032/Beatons/views/default --if-unchanged \
+    --into ds/views/default --remote $R
+
 # After a fork: reconcile the heads into one output whose .dvc names one of
 # them, then record a version that follows them all.
 git bigstore folder push ds/annotations/reviewer=rick/host=mac --resolve merge \
@@ -479,10 +485,13 @@ What it guarantees:
   can't be checked cheaply or tested on `local://`, and a lifecycle rule or
   delete marker would drop history silently.
 - **Pull never destroys local work.** It refuses to replace a file that
-  differs unless forced, never deletes files missing from the version, never
-  writes through a symlink, and writes via temp file plus rename (never a
-  link). A single file DVC marked executable (`isexec: true` in its `.dvc`)
-  is restored executable on unix (0777 minus umask), and an identical copy
+  differs unless told to (`--if-unchanged` replaces only files still as the
+  `.dvc`'s base has them; `--force` replaces any), deletes nothing but what
+  `--if-unchanged` proves unchanged since the base (it is in that version
+  on the remote), never writes through a symlink, and writes via temp file
+  plus rename (never a link). A single file DVC marked executable
+  (`isexec: true` in its `.dvc`) is restored executable on unix (0777
+  minus umask), and an identical copy
   already there is made executable. Push records no modes, so a version
   pulled from history never is. DVC's `dvc add` writes no modes into a
   `.dir` manifest; an entry that has one (a manifest hashed with per-file
@@ -517,7 +526,7 @@ What it guarantees:
   matches at any depth, `/cache` only at the top, `scratch/` only
   directories (a symlink to one included, as in DVC: it is skipped, never
   followed); `!` is not supported. A directory holding only skipped files
-  counts as empty. Pull is unaffected: it never deletes local files.
+  counts as empty. Pull is unaffected.
 
 Push records exactly what DVC 3 would, so if you also run `dvc add` on the
 same folder, DVC must ignore the same files. Add these lines to the DVC
@@ -565,14 +574,18 @@ before uploading anything:
 3. No base while the history has versions, or a base that is not the only
    head: refused, `folder::Error::StaleBase { base, heads }`. Nothing is
    published. Set local changes aside, pull the latest version, redo them.
+   An output unchanged since its base (`SyncState::RemoteAhead`) catches up
+   with a pull of `Overwrite::IfUnchanged` (`--if-unchanged`), below.
 4. Several heads: refused, `folder::Error::Diverged { heads }`, unless
    `--resolve merge` (`Resolve::Merge`) and the base is one of the heads;
-   the new version then follows every head.
+   the new version then follows every head (at most 8, else
+   `folder::Error::TooManyHeads`).
 5. Otherwise objects, then the `.dir` manifest, then the record, then the
    `.dvc` with the new base: the base is written last.
 6. History is listed again. If another push published from the same base
-   meanwhile, both versions stand: that is a *fork*. Push succeeds and says
-   so (`PushReport::forked_with`, a warning from the CLI).
+   meanwhile, both versions stand: that is a *fork*. The push is not a plain
+   success: `PushReport::outcome` is `Pushed::Forked { record, with }`
+   rather than `Pushed::Published { record }`, and the CLI exits non-zero.
 
 Forks are detected, not prevented: plain S3 has no compare-and-swap that
 every store honours (Wasabi accepted `If-None-Match` and overwrote anyway).
@@ -596,6 +609,19 @@ made to it is `StaleBase` rather than silently replacing the latest. A
 crash after a push published its record but before it wrote the `.dvc`
 leaves a stale base; the next push finds the output equal to the head and
 adopts it, publishing nothing.
+
+**Catching up.** Pull with `Overwrite::IfUnchanged` (`--if-unchanged`)
+brings an output that has not changed since its base to the version
+pulled. It replaces a differing file only if the file still has the
+content the base records, and removes a file the base had, still
+unchanged, that the version pulled does not; every other differing file,
+and a file the version removed but that changed locally, is
+`PullConflict`, before anything is written. Each file is hashed again just
+before it is replaced or removed, and one written meanwhile is left as it
+is (`Refusal::ChangedWhilePulling`). Files the base never had are kept.
+Only a pull from history has a base (the `.dvc` beside `into`); from a
+`.dvc` file, or with none beside `into`, this refuses like
+`Overwrite::Refuse`. It never falls back to `Force`.
 
 `Selector::Id` (`--at <hex>`) matches a record id prefix as `folder log`
 prints it, or the content id (md5) in a 0.2 record's name, which 0.2's log
@@ -676,8 +702,26 @@ let report = folder::push(&remote, dir, &PushOptions {
     exclude: Excludes::new(["*.tmp", "/cache/"])?, // default: Excludes::default()
     ..PushOptions::new(key) // 8 jobs, default excludes, never cancelled
 })?;
+match report.outcome {
+    folder::Pushed::Forked { with, .. } => { /* published, but the history forked: merge */ }
+    _ => {} // Published, AlreadyLatest
+}
 let pulled = folder::pull(&remote, &PointerSource::File(dvc_file), &PullOptions::default())?;
 ```
+
+`PushReport` is `#[must_use]`: a push that forked the history published
+its version but is not a plain success, so look at `outcome`.
+
+**Confined to a root.** With `PushOptions::root` or `PullOptions::root`
+set, the output (and pull's `into`, or its `.dvc` source) is a path
+relative to the root, of plain names only (`Refusal::OutsideRoot`
+otherwise), and nothing from the root down to the output, nor the output
+itself or its `.dvc`, may be a symlink or, on Windows, a junction or any
+other reparse point (`Refusal::SymlinkedComponent`). The root itself may
+be one. Use it when the caller owns a boundary, such as a dataset folder,
+that an output named inside it must not leave. Below the output nothing
+changes: pull never writes through a symlink, and push backs up a symlink
+to a file with its target's content, as DVC does.
 
 Build options from `PushOptions::new(history)`, `PullOptions::default()` or
 `LogOptions::default()` and override fields with `..`, as above: options
@@ -764,7 +808,7 @@ match s.sync {
     folder::SyncState::NoHistory => {}              // never pushed
     folder::SyncState::InSync => {}                 // push would add no version
     folder::SyncState::LocalAhead => {}             // changed since its base: push
-    folder::SyncState::RemoteAhead { latest } => {} // newer version, no local change: pull
+    folder::SyncState::RemoteAhead { latest } => {} // newer version, no local change: pull IfUnchanged
     folder::SyncState::Stale { base, head } => {}   // changed, but the base is old: StaleBase
     folder::SyncState::Diverged { heads } => {}     // forked: merge
     _ => {}                                         // #[non_exhaustive]
@@ -812,20 +856,26 @@ under way finish.
 Errors are `anyhow::Error`. Every refusal, and every other outcome a caller
 may want to act on, carries a `bigstore::folder::Error` in its chain, found
 with `err.downcast_ref::<folder::Error>()` whatever context was added above
-it. Match on it instead of on message text; its `Display` is the message the
-CLI prints. Both enums are `#[non_exhaustive]`.
+it. Match on it instead of on message text. Its `Display` says what
+happened, never which flag to pass, a request URL or the remote's answer:
+the remedy is the caller's to name (the CLI adds a `hint:` line), and the
+ids and paths are fields. Both enums are `#[non_exhaustive]`.
 
 | `folder::Error` | When |
 | --- | --- |
 | `Refused { path, reason }` | push or pull will not touch `path`; `reason` is a `folder::Refusal` (below). Nothing was published or written. |
 | `OutputChanged { detail }` | files kept changing or vanishing through every retry; push again later |
-| `PullConflict { paths }` | local files differ from the version (`Overwrite::Refuse`); nothing written |
+| `PullConflict { paths }` | local files differ from the version and `PullOptions::overwrite` does not allow replacing them (`Refuse`: any; `IfUnchanged`: changed since the base); nothing written |
 | `NoSuchVersion` | no version in history matches the selector, or there is none |
 | `AmbiguousId { prefix, candidates }` | a version id prefix matches several versions (`candidates`, oldest first) |
 | `StaleBase { base, heads }` | push: the output's base is not the latest version (another push landed, an older version was pulled, or there is no base while history has versions); nothing published |
 | `Diverged { heads }` | the history has forked: pull of `Latest`, or push without `Resolve::Merge`; nothing written or published |
+| `TooManyHeads { key, heads, max }` | a merge push of a history with more heads than one version can follow; nothing published |
+| `NoHead { key }` | the history has versions but none is the latest (each follows another): a damaged remote |
 | `InvalidVersionId { prefix }`, `InvalidTime { time }` | a `Selector::Id` that is not 8+ hex characters; a `Selector::AtOrBefore` that is not RFC 3339 |
 | `EndpointRequired` | an `s3://` remote without an endpoint |
+| `CredentialsMissing` | an `s3://` remote without both an access key id and a secret (unset or empty); no request made |
+| `RemoteUnusable { url }` | `Remote::open` cannot make a client for `url` (a URL it cannot parse, no TLS crypto compiled in, a `local://` directory it cannot create); no request made |
 | `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
 | `InvalidExclude { pattern }` | an exclude pattern that does not compile (or uses `!`) |
 | `InvalidHistoryKey { key }` | `HistoryKey::new` of a key that is not a relative `/`-separated path of portable names |
@@ -840,7 +890,9 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `ControlFile` (`.git`, `.hg`, `.dvc`, `.dvcignore`, `*.dvc`), `SymlinkToDirectory`, `BrokenSymlink`, `SpecialFile`, `NonPortableName { detail }`, `NotUtf8Name` | push, inside a directory | relative to the output, `/`-separated |
 | `PointerPathEscapes { output }` | pull, a `.dvc` naming an output outside its directory | the `.dvc` |
 | `UnrestorablePointer` (not a DVC 3 pointer to one md5-addressed output: `cache: false`, etag-only, several outputs, `wdir:`…; stage fields and annotations are fine) | pull, the `.dvc` | the `.dvc` |
-| `SymlinkedOutput`, `NotADirectory`, `NotRegularFile`, `AppearedWhilePulling` | pull, the destination | the filesystem path |
+| `SymlinkedOutput`, `NotADirectory`, `NotRegularFile`, `AppearedWhilePulling`, `ChangedWhilePulling` (`IfUnchanged`: written between check and replace or remove) | pull, the destination | the filesystem path |
+| `OutsideRoot` | push and pull with a `root`, a path that is absolute or holds `.`/`..` | the path as given |
+| `SymlinkedComponent` | push and pull with a `root`: a symlink or reparse point from the root to the output, at the output or at its `.dvc` | the filesystem path |
 | `CaseCollision { other }`, `UnwritableName` (`\` or `:` on Windows) | pull, the manifest | the manifest name |
 | `ExecutableInDirectory` (`isexec` on a manifest entry, or on a directory output in its `.dvc`) | pull | the manifest name, or the `.dvc` |
 
