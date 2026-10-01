@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
-use object_store::ObjectStoreExt;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
 
-use crate::backend::{self, Backend};
+use crate::backend::Store;
 use crate::cache;
 use crate::config::BigstoreConfig;
 use crate::filter::{self, WorktreeFile};
 use crate::git::{self, IndexBlob, IndexEntry};
-use crate::hash::{self, Hasher};
+use crate::hash;
 use crate::types::{HashFunction, Hexdigest, Pointer, RepoPath};
 
 pub const DEFAULT_CONCURRENCY: usize = 8;
@@ -47,7 +45,7 @@ pub fn objects<'a>(entries: impl IntoIterator<Item = &'a IndexEntry>) -> Vec<Obj
 
 /// The remote store and the local cache a transfer moves objects between.
 pub struct Remote<'a> {
-    pub store: &'a Backend,
+    pub store: &'a Store,
     pub cfg: &'a BigstoreConfig,
     /// Common git dir holding the object cache.
     pub git_dir: &'a Path,
@@ -152,7 +150,7 @@ pub async fn push(remote: &Remote<'_>, objects: &[Object], jobs: usize) -> Repor
 
 async fn upload_one(remote: &Remote<'_>, hexdigest: &Hexdigest) -> Result<Outcome> {
     let key = remote.cfg.remote_object_key(hexdigest)?;
-    if backend::exists(remote.store, &key).await? {
+    if remote.store.head(&key).await?.is_some() {
         return Ok(Outcome::UpToDate);
     }
     let cache_path = cache::object_path(remote.git_dir, hexdigest);
@@ -161,7 +159,7 @@ async fn upload_one(remote: &Remote<'_>, hexdigest: &Hexdigest) -> Result<Outcom
         "not in the local cache and not on the remote \
          (push from the clone that committed it)"
     );
-    backend::upload(remote.store, &cache_path, &key).await?;
+    remote.store.put_file(&key, &cache_path).await?;
     Ok(Outcome::Transferred)
 }
 
@@ -218,7 +216,7 @@ async fn fetch_one(
     }
 
     anyhow::ensure!(
-        backend::exists(remote.store, &key).await?,
+        remote.store.head(&key).await?.is_some(),
         "not found on remote"
     );
     download_to_cache(remote, &key, hexdigest)
@@ -229,37 +227,10 @@ async fn fetch_one(
 
 async fn download_to_cache(remote: &Remote<'_>, key: &str, expected: &Hexdigest) -> Result<()> {
     cache::ensure_cache_dir(remote.git_dir)?;
-    let tmp = tempfile::NamedTempFile::new_in(cache::cache_dir(remote.git_dir))?;
-
-    let (tmp, actual) = match remote.store {
-        Backend::ObjectStore(store) => {
-            let mut file = tokio::fs::File::from_std(tmp.reopen()?);
-            let mut stream = store
-                .get(&object_store::path::Path::from(key))
-                .await?
-                .into_stream();
-            let mut hasher = Hasher::new(expected.hash_fn());
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                hasher.update(&chunk);
-                file.write_all(&chunk).await?;
-            }
-            file.flush().await?;
-            (tmp, hasher.finalize())
-        }
-        Backend::Rclone(r) => {
-            let tmp = backend::rclone_into(r, key, tmp).await?;
-            let (path, hash_fn) = (tmp.path().to_path_buf(), expected.hash_fn());
-            let actual =
-                tokio::task::spawn_blocking(move || hash::hash_file(&path, hash_fn)).await??;
-            (tmp, actual)
-        }
-    };
-
-    anyhow::ensure!(
-        actual == *expected,
-        "integrity check failed: expected {expected}, got {actual}"
-    );
+    let tmp = remote
+        .store
+        .download_verified(key, expected, &cache::cache_dir(remote.git_dir))
+        .await?;
 
     let dest = cache::object_path(remote.git_dir, expected);
     if let Some(parent) = dest.parent() {

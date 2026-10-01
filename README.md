@@ -429,7 +429,8 @@ export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
 export AWS_ENDPOINT_URL=https://s3.ap-southeast-2.wasabisys.com AWS_REGION=ap-southeast-2
 R=s3://my-bucket/dvc
 
-# Back up a directory or a single file; writes <name>.dvc beside it.
+# Back up a directory or a single file; writes <name>.dvc beside it, naming
+# the version pushed as its base.
 git bigstore folder push ds/annotations/reviewer=rick/host=mac \
     --history ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
 git bigstore folder push ds/store.toml --history ST032/Beatons/store.toml --remote $R
@@ -439,17 +440,23 @@ git bigstore folder push ds/store.toml --history ST032/Beatons/store.toml --remo
 git bigstore folder status ds/annotations/reviewer=rick/host=mac \
     --history ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
 
-# Every version ever pushed, oldest first.
+# Every version ever pushed, oldest first, with the versions each follows.
 git bigstore folder log ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
 
 # Every history key, or those under a prefix (whole path components):
 # here, every reviewer and host that pushed annotations.
 git bigstore folder keys ST032/Beatons/annotations --remote $R
 
-# Restore: from a .dvc file, or any version from history.
+# Restore: from a .dvc file, or any version from history (which writes
+# /tmp/v1.dvc naming it, once every file is in place).
 git bigstore folder pull ds/store.toml.dvc --remote $R
 git bigstore folder pull --history ST032/Beatons/annotations/reviewer=rick/host=mac \
     --at 9f9acd0a --into /tmp/v1 --remote $R
+
+# After a fork: reconcile the heads into one output whose .dvc names one of
+# them, then record a version that follows them all.
+git bigstore folder push ds/annotations/reviewer=rick/host=mac --resolve merge \
+    --history ST032/Beatons/annotations/reviewer=rick/host=mac --remote $R
 ```
 
 What it guarantees:
@@ -462,15 +469,15 @@ What it guarantees:
   snapshot while being hashed, so an uploaded object always matches its key.
   Files that change or vanish mid-push are retried; after 3 tries push fails.
   A `.jsonl` without a final newline is a warning.
-- **History without git.** Every push that changes an output appends its
-  pointer to `bigstore-history/<key>/` on the remote. A push that changes
-  nothing adds nothing. Versions are ordered by push time; each record is a
-  valid `.dvc` file, named `<time>-<id>.dvc`, so push and pull pick a
-  version from one listing and fetch only that record, however long the
-  history. It is a log rather than S3 bucket versioning because object_store
-  cannot list object versions, a bucket's versioning setting can't be checked
-  cheaply or tested on `local://`, and a lifecycle rule or delete marker would
-  drop history silently.
+- **History without git.** Every push that changes an output records a
+  version under `bigstore-history/<key>/` on the remote; a push that changes
+  nothing adds nothing. History is a graph, not a timeline: each version
+  names the versions it follows, and the latest version is the one no other
+  follows (the *head*). See [History](#history-bases-forks-and-merges)
+  below. It is kept as records rather than S3 bucket versioning because
+  object_store cannot list object versions, a bucket's versioning setting
+  can't be checked cheaply or tested on `local://`, and a lifecycle rule or
+  delete marker would drop history silently.
 - **Pull never destroys local work.** It refuses to replace a file that
   differs unless forced, never deletes files missing from the version, never
   writes through a symlink, and writes via temp file plus rename (never a
@@ -530,6 +537,83 @@ add` gives the same `.dir` md5 as `folder push` (CI checks this).
 
 Do not run `dvc gc --cloud` against this remote: DVC only knows the latest
 `.dvc` files, and would delete the objects of older versions.
+
+### History: bases, forks and merges
+
+A version is a *record*: a valid DVC 3 `.dvc` pointer plus
+`meta: {bigstore: {parents, writer, time}}`, stored as
+`bigstore-history/<key>/<parents>/<id>.dvc`. `<id>` is 32 hex characters,
+the first half of the SHA-256 of the record's bytes; `<parents>` is `root`
+for a first version, else the ids it follows, sorted and `+`-joined (a merge
+joins at most 8). Every name is new, so a record is written once and never
+overwritten, which works on any S3-compatible store with no conditional
+writes. One listing gives the whole graph; a record is fetched only for its
+pointer, writer (`PushOptions::writer`, the host name by default) and time.
+A record whose bytes do not hash to its id, or whose parents differ from
+its name's, is refused as a bad record.
+
+The `.dvc` beside an output records its *base*, the version it was last
+pushed or pulled as, in `meta: {bigstore: {base: <id>}}` (DVC keeps and
+ignores `meta:`). Push compares it with the history, from one listing,
+before uploading anything:
+
+1. Output equal to the only head: no new version; the head becomes the base.
+   This also repairs a `.dvc` a crash left behind (see below).
+2. A `.dvc` without a base (0.2 wrote it, or `dvc add` did) that records
+   the only head's content counts as based on the head: the output was last
+   synced to it.
+3. No base while the history has versions, or a base that is not the only
+   head: refused, `folder::Error::StaleBase { base, heads }`. Nothing is
+   published. Set local changes aside, pull the latest version, redo them.
+4. Several heads: refused, `folder::Error::Diverged { heads }`, unless
+   `--resolve merge` (`Resolve::Merge`) and the base is one of the heads;
+   the new version then follows every head.
+5. Otherwise objects, then the `.dir` manifest, then the record, then the
+   `.dvc` with the new base: the base is written last.
+6. History is listed again. If another push published from the same base
+   meanwhile, both versions stand: that is a *fork*. Push succeeds and says
+   so (`PushReport::forked_with`, a warning from the CLI).
+
+Forks are detected, not prevented: plain S3 has no compare-and-swap that
+every store honours (Wasabi accepted `If-None-Match` and overwrote anyway).
+Until a merge joins the fork, `pull --at latest` is `Diverged` and so is
+every push. `folder log` marks each head, fork point and merge:
+
+```
+2026-10-01T02:00:00.000Z  6f1c…  dir  4 files, 37 bytes  by mac  <- root  [fork: 2 children]
+2026-10-01T02:05:00.000Z  24a7…  dir  4 files, 40 bytes  by mac  <- 6f1c…  [head]
+2026-10-01T02:05:01.000Z  c925…  dir  5 files, 52 bytes  by pc  <- 6f1c…  [head]
+```
+
+To resolve it, pull one head by id over the output (`--at 24a7…`, which
+makes it the base), bring in the other head's changes, and push with
+`--resolve merge`.
+
+Pull writes the base last, only once every file is in place, so a
+cancelled or failed pull leaves the old base. Pulling an older version
+(`--at <id or time>`) makes that version the base, so a push of changes
+made to it is `StaleBase` rather than silently replacing the latest. A
+crash after a push published its record but before it wrote the `.dvc`
+leaves a stale base; the next push finds the output equal to the head and
+adopts it, publishing nothing.
+
+`Selector::Id` (`--at <hex>`) matches a record id prefix as `folder log`
+prints it, or the content id (md5) in a 0.2 record's name, which 0.2's log
+printed; a prefix matching more than one version, of either kind, is
+refused with every candidate listed. `Selector::AtOrBefore` (`--at
+<time>`) picks the newest version by the time each record holds, fetching
+every record.
+
+**Upgrading from 0.2 is a hard cutover per key.** 0.2 named records
+`<time>-<content id>.dvc` directly under the key. 0.3 reads them as a
+straight line in time order (a 0.2 record's id is that of its file name)
+and continues it, but never writes that form. A 0.2 client does not see
+0.3 records (they sit one directory deeper), so it would keep extending the
+0.2 line: 0.3 then reports a fork. Upgrade every writer of a key together.
+A `.dvc` 0.2 wrote has no base. If it records the latest version's content,
+its output counts as based on it (step 2 above), so the first 0.3 push of
+local changes simply follows the head; if it records an older version, the
+push is `StaleBase`.
 
 What to push, and what push assumes:
 
@@ -606,11 +690,12 @@ clone of a `CancelToken` shares one flag. Push, status and pull check it
 between files and between objects, and log between history records;
 whatever is being hashed, uploaded or downloaded at that moment finishes
 first. The call then returns
-`folder::Error::Cancelled`. A cancelled push has written no `.dvc` and no
-history record (objects already uploaded stay; they are content-addressed,
-and the next push skips them); the check before the `.dvc` is written is
-the last, after which the push completes. A cancelled pull leaves every file
-as it was or fully restored, never partly written, and no temp files.
+`folder::Error::Cancelled`. A cancelled push has published no history
+record and written no `.dvc` (objects already uploaded stay; they are
+content-addressed, and the next push skips them); the check before the
+record is published is the last, after which the push completes. A
+cancelled pull leaves every file as it was or fully restored, never partly
+written, no temp files, and the `.dvc` beside it untouched.
 `git bigstore folder` (push, status, pull and log) cancels this way on the
 first Ctrl-C (a second one exits at once).
 
@@ -656,7 +741,7 @@ let under = HistoryKey::new("ST032/Beatons/annotations")?;
 for key in folder::keys(&remote, Some(&under))? {
     // Every version of it, oldest first, records fetched 8 at a time.
     for v in folder::log(&remote, &key, &folder::LogOptions::default())? {
-        println!("{}  {}  {}", key.as_str(), v.time, v.id());
+        println!("{}  {}  {}  <- {:?}", key.as_str(), v.time, v.id, v.parents);
     }
 }
 ```
@@ -667,26 +752,27 @@ bigstore pushes is affected.
 
 Dry run: `folder::status` walks, snapshots and hashes the output exactly as
 `push` does (and refuses what push refuses), asks the remote which contents
-it has and fetches the latest history record, and writes nothing, on the
-remote or beside the output. Snapshots go to a private temp directory one
-file at a time. `sync` compares the output with the latest version, using
-the `.dvc` beside it as the version it was last pushed or pulled as:
+it has and fetches the history's heads, and writes nothing, on the remote or
+beside the output. Snapshots go to a private temp directory one file at a
+time. `sync` compares the output with the latest version, using the `.dvc`
+beside it for its base and the content it had then:
 
 ```rust
 let s = folder::status(&remote, dir, &opts)?; // the PushOptions push would get
 println!("{} to upload ({} bytes)", s.to_upload, s.to_upload_bytes);
 match s.sync {
-    folder::SyncState::NoHistory => {}           // never pushed
-    folder::SyncState::InSync => {}              // push would add no version
-    folder::SyncState::LocalAhead => {}          // changed since its .dvc: push
-    folder::SyncState::RemoteAhead { latest } => {} // newer version elsewhere: pull
-    folder::SyncState::Diverged { latest } => {} // both changed (or no .dvc)
-    _ => {}                                      // #[non_exhaustive]
+    folder::SyncState::NoHistory => {}              // never pushed
+    folder::SyncState::InSync => {}                 // push would add no version
+    folder::SyncState::LocalAhead => {}             // changed since its base: push
+    folder::SyncState::RemoteAhead { latest } => {} // newer version, no local change: pull
+    folder::SyncState::Stale { base, head } => {}   // changed, but the base is old: StaleBase
+    folder::SyncState::Diverged { heads } => {}     // forked: merge
+    _ => {}                                         // #[non_exhaustive]
 }
 ```
 
 `InSync` says push would record no new version. It may still rewrite the
-`.dvc` beside the output, if that is missing or records another version.
+`.dvc` beside the output, if that is missing or records another base.
 
 Each function above blocks and runs its own tokio runtime; called from inside
 a runtime it returns an error naming its async twin. The twins,
@@ -719,8 +805,9 @@ Dropping an async call's future stops it like a crash at that point, never
 leaving a partial file or object: hashing stops at the next file, a file
 already downloaded is placed whole, and transfers under way are abandoned
 (an S3 multipart upload may be left for the bucket's lifecycle rule). A push
-dropped after writing its `.dvc` may lack its history record, as when the
-append fails. A `CancelToken` stops more gently: transfers under way finish.
+dropped after publishing its record may not have written its `.dvc`; the
+next push adopts the record. A `CancelToken` stops more gently: transfers
+under way finish.
 
 Errors are `anyhow::Error`. Every refusal, and every other outcome a caller
 may want to act on, carries a `bigstore::folder::Error` in its chain, found
@@ -735,18 +822,21 @@ CLI prints. Both enums are `#[non_exhaustive]`.
 | `PullConflict { paths }` | local files differ from the version (`Overwrite::Refuse`); nothing written |
 | `NoSuchVersion` | no version in history matches the selector, or there is none |
 | `AmbiguousId { prefix, candidates }` | a version id prefix matches several versions (`candidates`, oldest first) |
+| `StaleBase { base, heads }` | push: the output's base is not the latest version (another push landed, an older version was pulled, or there is no base while history has versions); nothing published |
+| `Diverged { heads }` | the history has forked: pull of `Latest`, or push without `Resolve::Merge`; nothing written or published |
 | `InvalidVersionId { prefix }`, `InvalidTime { time }` | a `Selector::Id` that is not 8+ hex characters; a `Selector::AtOrBefore` that is not RFC 3339 |
 | `EndpointRequired` | an `s3://` remote without an endpoint |
 | `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
 | `InvalidExclude { pattern }` | an exclude pattern that does not compile (or uses `!`) |
 | `InvalidHistoryKey { key }` | `HistoryKey::new` of a key that is not a relative `/`-separated path of portable names |
 | `DestinationRequired` | a pull from history without `PullOptions::into` |
-| `Cancelled` | the caller's `CancelToken` was cancelled; a push published no `.dvc` or history record, a pull wrote no partial file |
+| `Cancelled` | the caller's `CancelToken` was cancelled; a push published no history record or `.dvc`, a pull wrote no partial file and left its `.dvc` |
+| `Archived { key }` | the remote says object `key` (file, `.dir` manifest or history record) is archived and not restored (S3 `InvalidObjectState`); restore it and retry |
 
 | `folder::Refusal` | Refused by | `path` is |
 | --- | --- | --- |
 | `NoFileName`, `NotUtf8Name` (of the output), `NonPortableName { detail }` (of the output), `DvcFile`, `NotFileOrDirectory` (a symlink or special file) | push, the output itself | the output |
-| `ForeignPointer` (not a plain DVC 3 pointer), `PointerForOtherOutput { other }` | push, the `.dvc` beside the output | the `.dvc` |
+| `ForeignPointer` (not a plain DVC 3 pointer: a stage, annotations, or a `meta:` that is not bigstore's own), `PointerForOtherOutput { other }` | push, and pull from history, the `.dvc` beside the output | the `.dvc` |
 | `ControlFile` (`.git`, `.hg`, `.dvc`, `.dvcignore`, `*.dvc`), `SymlinkToDirectory`, `BrokenSymlink`, `SpecialFile`, `NonPortableName { detail }`, `NotUtf8Name` | push, inside a directory | relative to the output, `/`-separated |
 | `PointerPathEscapes { output }` | pull, a `.dvc` naming an output outside its directory | the `.dvc` |
 | `UnrestorablePointer` (not a DVC 3 pointer to one md5-addressed output: `cache: false`, etag-only, several outputs, `wdir:`…; stage fields and annotations are fine) | pull, the `.dvc` | the `.dvc` |

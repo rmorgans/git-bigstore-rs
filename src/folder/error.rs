@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::HistoryRecord;
+use crate::dvc::RecordId;
 
 /// A refusal, or another outcome a caller may want to handle by kind, from
 /// any `bigstore::folder` function. Find it with
@@ -72,6 +73,28 @@ pub enum Error {
     /// uploaded stay: they are content-addressed); a pull left every file
     /// either as it was or fully restored, never partly written.
     Cancelled,
+    /// A remote object (`key`: a file, `.dir` manifest or history record)
+    /// is in an archive storage class and was not restored, so it cannot be
+    /// read; the store said so (S3 `InvalidObjectState`). Restore it on the
+    /// remote, then try again. Like any failed download it stops a pull:
+    /// files already restored stay, and none is partly written.
+    Archived { key: String },
+    /// Push: the output's base (the version its `.dvc` says it was last
+    /// pushed or pulled as) is not the latest version — another push landed
+    /// since, a pull chose an older version, or there is no base while the
+    /// history has versions (no `.dvc`, or one without a base that records
+    /// another version's content). Nothing was published. Set local changes
+    /// aside, pull the latest version, redo them, and push again.
+    StaleBase {
+        base: Option<RecordId>,
+        /// The latest versions (several if the history has forked).
+        heads: Vec<RecordId>,
+    },
+    /// The history has forked: pushes from one base raced, and each landed.
+    /// A pull of `Latest`, or a push, would have to pick one; nothing was
+    /// written or published. Pull one head by id, reconcile the others into
+    /// it, and push with [`Resolve::Merge`](super::Resolve::Merge).
+    Diverged { heads: Vec<RecordId> },
 }
 
 /// Why a path was refused.
@@ -179,7 +202,7 @@ impl fmt::Display for Error {
             Self::AmbiguousId { prefix, candidates } => {
                 write!(f, "version id prefix {prefix} is ambiguous; it matches:")?;
                 for r in candidates {
-                    write!(f, "\n  {}  pushed {}", r.id(), r.time.to_rfc3339())?;
+                    write!(f, "\n  {}  pushed {}", r.id, r.time.to_rfc3339())?;
                 }
                 Ok(())
             }
@@ -201,8 +224,40 @@ impl fmt::Display for Error {
                 f.write_str("pulling from history needs a destination (`into`)")
             }
             Self::Cancelled => f.write_str("cancelled"),
+            Self::Archived { key } => write!(
+                f,
+                "{key} is archived on the remote: restore it, then try again"
+            ),
+            Self::StaleBase { base, heads } => {
+                match base {
+                    Some(base) => write!(f, "this output's base is version {base}, ")?,
+                    None => f.write_str(
+                        "this output has no base version (no .dvc from a push or pull), ",
+                    )?,
+                }
+                write!(
+                    f,
+                    "but the latest is {}: nothing pushed; set local changes aside, pull the \
+                     latest version, redo them and push again",
+                    heads_list(heads)
+                )
+            }
+            Self::Diverged { heads } => write!(
+                f,
+                "history has forked: versions {} were each pushed from the same base; pull one \
+                 with its id, reconcile the others into it, then push with merge",
+                heads_list(heads)
+            ),
         }
     }
+}
+
+fn heads_list(heads: &[RecordId]) -> String {
+    heads
+        .iter()
+        .map(RecordId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt::Result {
