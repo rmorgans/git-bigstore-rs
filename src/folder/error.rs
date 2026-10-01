@@ -206,6 +206,11 @@ pub enum Refusal {
     /// A file appeared at a path while pulling; it was left untouched.
     AppearedWhilePulling,
     /// Under [`Overwrite::IfUnchanged`](super::Overwrite::IfUnchanged), a
+    /// file the pull would replace or remove holds base content that is
+    /// not on the remote (missing, or not the size it has here): the local
+    /// file may be its only copy. Nothing was written.
+    BaseNotOnRemote,
+    /// Under [`Overwrite::IfUnchanged`](super::Overwrite::IfUnchanged), a
     /// file changed or vanished between being checked and being replaced
     /// or removed; it was left as it is.
     ChangedWhilePulling,
@@ -374,6 +379,11 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
             path.to_string_lossy()
         ),
         Refusal::AppearedWhilePulling => write!(f, "{p} appeared while pulling; left untouched"),
+        Refusal::BaseNotOnRemote => write!(
+            f,
+            "{p} would be replaced or removed, but its content is not on the remote; \
+             refusing to discard what may be its only copy"
+        ),
         Refusal::ExecutableInDirectory => write!(
             f,
             "{p} is marked executable (`isexec`) inside a directory output; pull restores \

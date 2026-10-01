@@ -1495,6 +1495,7 @@ pub async fn pull_async(
         check_targets(&into, targets, base, dir, mode, &opts)
     })
     .await?;
+    base_on_remote(remote, &checked, opts.jobs.max(1)).await?;
     opts.progress.emit(|| ProgressEvent::Started {
         phase: Phase::Downloading,
         files: checked.by_object.values().map(|p| p.len() as u64).sum(),
@@ -1605,6 +1606,38 @@ async fn base_targets(
                 }
             }
         }
+    }
+}
+
+/// Refuse ([`Refusal::BaseNotOnRemote`]) unless every file
+/// [`Overwrite::IfUnchanged`] would replace or remove has its content on the
+/// remote, at the size it has here: only then is discarding the local copy
+/// recoverable. A `.dir` manifest on the remote does not prove its objects
+/// are (they can be deleted behind it), so each is asked for.
+async fn base_on_remote(remote: &Remote, checked: &Checked, jobs: usize) -> Result<()> {
+    let replaced = checked
+        .by_object
+        .values()
+        .flatten()
+        .filter_map(|(path, r)| match r {
+            Replace::Unchanged(md5) => Some((path, md5)),
+            _ => None,
+        });
+    let removed = checked.remove.iter().map(|(path, md5)| (path, md5));
+    let discarded: Vec<(&PathBuf, &Hexdigest)> = replaced.chain(removed).collect();
+    let missing = each_in_order(&discarded, jobs, |(path, md5)| async move {
+        let size = tokio::fs::metadata(long_path(path)?).await?.len();
+        let there = remote.store.head(&remote.object_key(md5)).await?;
+        Ok(there.is_none_or(|m| m.size != size).then_some(*path))
+    })
+    .await?;
+    match missing.into_iter().flatten().next() {
+        Some(path) => Err(Error::Refused {
+            path: path.clone(),
+            reason: Refusal::BaseNotOnRemote,
+        }
+        .into()),
+        None => Ok(()),
     }
 }
 

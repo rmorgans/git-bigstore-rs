@@ -3767,3 +3767,24 @@ fn a_history_with_no_head_or_too_many_to_merge_is_typed() {
     assert_eq!((k, h.len(), *max), (&key, 9, 8));
     assert_eq!(remote_keys(&e.store), before, "something was published");
 }
+
+#[test]
+fn a_catch_up_pull_never_discards_content_the_remote_lacks() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    push_v2(&e, "k", &a);
+    // v1's manifest stays, but the object of a file v2 removed is gone.
+    let md5 = hash_reader(&mut &b"removed in v2\n"[..], HashFunction::Md5)
+        .unwrap()
+        .to_string();
+    let object = e
+        .store
+        .join(format!("files/md5/{}/{}", &md5[..2], &md5[2..]));
+    std::fs::remove_file(&object).unwrap();
+
+    let before = tree(&b);
+    let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+    let gone = b.join("gone.txt");
+    assert_eq!(refused(&err), (gone.as_path(), &Refusal::BaseNotOnRemote));
+    assert_eq!(tree(&b), before, "nothing written or removed");
+}
