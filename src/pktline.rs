@@ -110,6 +110,15 @@ impl<R: Read> PktReader<R> {
         }
     }
 
+    /// The next packet: [`Packet::Data`] with its payload, [`Packet::Flush`],
+    /// or `Ok(None)` at a clean EOF before the first header byte.
+    pub fn packet(&mut self) -> Result<Option<Packet<'_>>, PktError> {
+        Ok(self.read_packet()?.map(|frame| match frame {
+            Frame::Flush => Packet::Flush,
+            Frame::Data => Packet::Data(&self.buf),
+        }))
+    }
+
     /// `Ok(None)` is a clean EOF before the first header byte: the peer shut
     /// down at a packet boundary.
     fn read_packet(&mut self) -> Result<Option<Frame>, PktError> {
@@ -138,6 +147,14 @@ impl<R: Read> PktReader<R> {
             }
         }
     }
+}
+
+/// One packet, as [`PktReader::packet`] reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Packet<'a> {
+    Flush,
+    /// A data packet's payload, LF and all.
+    Data(&'a [u8]),
 }
 
 enum Frame {

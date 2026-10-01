@@ -16,13 +16,12 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
+use super::layout::MAX_RECORD_BYTES;
 use super::{archived, block_on, each_in_order, CancelToken, Error, Remote, Resolve};
 use crate::backend;
 use crate::dvc::{BigstoreMeta, DvcOutput, DvcPointer, RecordId};
 use crate::types::{Hexdigest, PortableRelPath};
 
-/// Largest history record fetched.
-const MAX_RECORD_BYTES: u64 = 64 << 10;
 /// The time in a 0.2 record's name.
 const LEGACY_TIME: &str = "%Y%m%dT%H%M%S%.9fZ";
 /// Most parents a record has, which bounds its name.
@@ -106,7 +105,7 @@ struct Listed {
 }
 
 /// What a record's name says.
-enum Name<'a> {
+pub(super) enum Name<'a> {
     Linked {
         parents: Vec<RecordId>,
         id: RecordId,
@@ -122,7 +121,7 @@ enum Name<'a> {
 /// The history key and record name of `rel`, a key below
 /// `bigstore-history/`; `None` for anything that is not a record. The two
 /// forms cannot be confused: a record id is hex, a 0.2 name has a `-`.
-fn parse_record_path(rel: &str) -> Option<(&str, Name<'_>)> {
+pub(super) fn parse_record_path(rel: &str) -> Option<(&str, Name<'_>)> {
     let (dir, file) = rel.rsplit_once('/')?;
     if let Some((key, parents)) = dir.rsplit_once('/') {
         if let Some(name) = parse_linked(parents, file) {
@@ -463,6 +462,19 @@ pub(super) async fn select(
         }
     };
     match found {
+        Some(l) => fetch(remote, l).await,
+        None => Err(Error::NoSuchVersion.into()),
+    }
+}
+
+/// The version `id` of `key`'s history: one listing, then that record.
+pub(super) async fn find(
+    remote: &Remote,
+    key: &HistoryKey,
+    id: &RecordId,
+) -> Result<HistoryRecord> {
+    let listed = list(remote, key).await?;
+    match listed.iter().find(|l| l.id == *id) {
         Some(l) => fetch(remote, l).await,
         None => Err(Error::NoSuchVersion.into()),
     }

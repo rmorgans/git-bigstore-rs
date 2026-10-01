@@ -124,6 +124,17 @@ pub enum Error {
     /// latest: the remote's history is damaged. Nothing was written or
     /// published.
     NoHead { key: HistoryKey },
+    /// `key` is not one of a store's own files
+    /// ([`layout::Kind::Other`](super::layout::Kind::Other)): a temp file,
+    /// a traversing or absolute key, a name of no store file's shape.
+    InvalidStoreKey { key: String },
+    /// The store file `key` is not what its name says: its bytes have
+    /// another hash, or it is over its kind's size limit, or (received in an
+    /// exchange) not the size announced. Nothing was placed under its name.
+    Integrity { key: String },
+    /// An exchange received the history record `key`, which is outside the
+    /// history the session was opened for (`history`). Nothing was placed.
+    OutOfScope { key: String, history: HistoryKey },
 }
 
 /// Why a path was refused.
@@ -306,6 +317,11 @@ impl fmt::Display for Error {
                 "history {} has no latest version: each of its versions follows another",
                 key.as_str()
             ),
+            Self::InvalidStoreKey { key } => write!(f, "{key:?} is not a store file's key"),
+            Self::Integrity { key } => write!(f, "{key} is not what its name says"),
+            Self::OutOfScope { key, history } => {
+                write!(f, "{key} is a record outside history {}", history.as_str())
+            }
         }
     }
 }

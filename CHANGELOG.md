@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.5.0 — 2026-10-01
+
+### Added
+
+- **`folder::layout`: a store's files in one place.** `layout::kind(key)`
+  says what a store-relative key (in the store's on-disk form, as
+  object_store encodes it) names: `Kind::Object` (`files/md5/xx/<30
+  hex>`), `Kind::Manifest` (the same with `.dir`), `Kind::Record`
+  (`bigstore-history/<key>/<parents>/<id>.dvc`, or a 0.2 record's name) or
+  `Kind::Other` (a `#` temp file, `.partial`, `.DS_Store`, a traversing or
+  absolute key, any other shape). `Kind` orders `Object < Manifest <
+  Record`: every transfer between stores places files in that order, so a
+  manifest never exists without its objects (which push relies on) and a
+  record never without its content. `layout::verify(key, bytes)` checks a
+  file against its name: md5 for objects and manifests, the record id and
+  the parents its name gives for records, size only for 0.2 records; a
+  manifest at most 64 MiB, a record 64 KiB.
+- **`folder::verify` / `verify_async`: is a version complete on the
+  remote?** `verify(&remote, &key, &version)` returns `Completeness {
+  objects, missing }`: a file version's object; a directory version's
+  `.dir` manifest, read (not trusted for being there), then every object
+  it names. A missing manifest, or one whose bytes are not the manifest
+  named, is reported missing and hides the objects behind it. Keys are
+  relative to the remote, as `layout::kind` takes them. An id that is not
+  a version of `key` is `NoSuchVersion`.
+- **`PushOptions::repair`.** Never trusts a manifest on the remote to mean
+  its objects are there: every object and the manifest are checked, and
+  whatever is missing is uploaded. An output equal to the latest version
+  publishes nothing (`Pushed::AlreadyLatest`), writes its `.dvc`, and
+  counts the objects restored in `uploaded`. `status` with it counts what
+  such a push would upload.
+- **`StatusReport::heads` and `StatusReport::based`**: the latest versions
+  status found, and whether the output is `InSync` with a `.dvc` naming
+  that version as its base (`InSync && !based`: copied in, or a crash
+  between a push's record and its `.dvc`; the next push adopts it).
+- **`folder::exchange`: store-to-store copying over one byte stream**, for
+  `ssh` the way git uses it. `exchange::serve(reader, writer,
+  &ServeOptions)` serves a store on stdin/stdout; `exchange::Client`
+  (`spawn(Command)` or `connect(reader, writer)`) offers `open(store_dir,
+  history, create)`, `list()`, `fetch(keys, into)`, `send(keys, from)`
+  and `close()`. pkt-lines, a magic line each way and an integer protocol
+  version (`exchange::VERSION`, 1) agreed before anything else, JSON
+  control frames, file bodies in data packets. Every file received, on
+  either side, is checked with `layout::verify`'s rules as it arrives into
+  `<name>#<random>`, then placed by a rename that never replaces (or a
+  hard link where the filesystem cannot rename so; FAT and exFAT can do
+  neither): a name already there counts as present. Transfers go objects,
+  then manifests, then records, both ways, and a receiver places nothing
+  after its first refusal. The server refuses a record sent to it outside
+  the history given to `open` and any key
+  that is not a store file's; a dedicated thread reads its input, and
+  when that ends outside an orderly close the session stops at its next
+  step, removes its temp file and `serve` returns, so the far process
+  never lingers. Errors carry codes and keys only:
+  `exchange::Error::{NotAServer, Version, Refused { code, key },
+  SessionBroken}`, and for a file this side refuses the new
+  `folder::Error::{InvalidStoreKey, Integrity, OutOfScope}`.
+  `Client::canceller()` kills the far program from another thread
+  (`Error::Cancelled`).
+- `pktline::PktReader::packet()` reads one packet (`Packet::Data` or
+  `Packet::Flush`).
+
+### Changed
+
+- **Breaking (library):** `StatusReport` is `#[non_exhaustive]` and has
+  the `heads` and `based` fields; `PushOptions` has a `repair` field
+  (struct literals ending in `..PushOptions::new(key)` are unaffected).
+  `folder::Error` has three more variants (it is `#[non_exhaustive]`).
+
+### Known issues
+
+- History keys holding `# % ~ [ ] { } ^` or `` ` `` are still listed
+  wrong: object_store percent-encodes them in the store (`~` as `%7E`),
+  `keys` returns them in that encoded form, and `log` of such a key
+  encodes it again and finds nothing. Keep those characters out of
+  history keys (asset-store refuses them).
+- A merge of 8 heads names its record under a 263-character directory (8
+  ids `+`-joined), past the 255 a name may have on APFS, ext4 and NTFS, so
+  a `local://` store, or an exchange into one, cannot hold it (an S3 key
+  can); 7 heads fit.
+
 ## 0.4.0 — 2026-10-01
 
 ### Added

@@ -14,15 +14,16 @@
 //! fork that push reports and pull, status and the next push refuse to
 //! guess through; a push with [`Resolve::Merge`] joins it again.
 //!
-//! Every call comes in two forms with the same arguments and results.
-//! [`push`], [`status`], [`pull`], [`log`] and [`keys`] block: each runs its
-//! own tokio runtime, so it must not be called from inside one (that
-//! returns an error naming the async form, rather than panicking).
-//! [`push_async`], [`status_async`], [`pull_async`], [`log_async`] and
-//! [`keys_async`] run on the caller's tokio runtime instead, which must have
-//! the I/O and time drivers enabled (`Builder::enable_all`, as
-//! `#[tokio::main]` and `#[tokio::test]` do): the remote's HTTP client needs
-//! both. A `current_thread` runtime works as well as a `multi_thread` one.
+//! Every call here comes in two forms with the same arguments and results.
+//! [`push`], [`status`], [`pull`], [`log`], [`keys`] and [`verify`] block:
+//! each runs its own tokio runtime, so it must not be called from inside
+//! one (that returns an error naming the async form, rather than
+//! panicking). [`push_async`], [`status_async`], [`pull_async`],
+//! [`log_async`], [`keys_async`] and [`verify_async`] run on the caller's
+//! tokio runtime instead, which must have the I/O and time drivers enabled
+//! (`Builder::enable_all`, as `#[tokio::main]` and `#[tokio::test]` do):
+//! the remote's HTTP client needs both. A `current_thread` runtime works as
+//! well as a `multi_thread` one.
 //! Their futures are `Send`, so they can be `tokio::spawn`ed with owned
 //! arguments moved in. Filesystem and hashing work (walking, snapshotting,
 //! classifying, writing and placing files) runs on the runtime's blocking
@@ -39,10 +40,17 @@
 //! first. [`Remote::open`] makes no request (for `local://` it only creates
 //! the directory) and has one form.
 //!
+//! [`layout`] names a store's files and checks them against their names;
+//! [`exchange`] copies them between two stores over one byte stream (an
+//! `ssh` session), and only blocks.
+//!
 //! Nothing here calls git.
 
+mod completeness;
 mod error;
+pub mod exchange;
 mod history;
+pub mod layout;
 mod snapshot;
 mod walk;
 
@@ -60,17 +68,17 @@ use crate::cache::WorktreeMode;
 use crate::config::{BackendConfig, BigstoreConfig};
 use crate::dvc::{BigstoreMeta, DvcOutput, DvcPointer, Manifest, ManifestEntry, RecordId};
 use crate::types::{check_portable_component, long_path, Hexdigest, Layout, ManifestPath};
+pub use completeness::{verify, verify_async, Completeness};
 pub use error::{Error, Refusal};
 pub use history::{
     keys, keys_async, log, log_async, HistoryKey, HistoryRecord, LogOptions, Selector,
 };
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
+use layout::MAX_MANIFEST_BYTES;
 use snapshot::{Snapshot, SnapshotError};
 use walk::WalkError;
 
-/// Largest `.dir` manifest pull will fetch into memory.
-const MAX_MANIFEST_BYTES: u64 = 64 << 20;
 /// How often push restarts when files change under it.
 const PUSH_ATTEMPTS: usize = 3;
 
@@ -436,12 +444,20 @@ pub struct PushOptions {
     /// file is still backed up with its target's content, as DVC does.
     /// `None` (the default): the output path is used as given.
     pub root: Option<PathBuf>,
+    /// Repair a version whose content the remote lost: never trust a
+    /// `.dir` manifest on the remote to mean its objects are there, but ask
+    /// for every object and the manifest, and upload whatever is missing.
+    /// An output equal to the latest version then publishes nothing
+    /// ([`Pushed::AlreadyLatest`]), writes its `.dvc`, and reports the
+    /// objects restored as `uploaded`. Otherwise a push as usual. Status
+    /// with it counts what such a push would upload. Off by default.
+    pub repair: bool,
 }
 
 impl PushOptions {
     /// Push to `history` with 8 jobs, the default excludes, a token nobody
     /// else can cancel, no progress reports, forks refused, as this host,
-    /// with no root.
+    /// with no root and no repair.
     pub fn new(history: HistoryKey) -> Self {
         Self {
             history,
@@ -452,6 +468,7 @@ impl PushOptions {
             resolve: Resolve::default(),
             writer: gethostname::gethostname().to_string_lossy().into_owned(),
             root: None,
+            repair: false,
         }
     }
 }
@@ -608,7 +625,7 @@ async fn publish(
         jobs,
     )
     .await?;
-    let plan = plan(remote, staged, jobs).await?;
+    let plan = plan(remote, staged, jobs, opts.repair).await?;
     upload_all(remote, &plan.upload, opts).await?;
     let (uploaded, already_present, upload_manifest) =
         (plan.upload.len(), plan.present.len(), plan.manifest);
@@ -665,6 +682,7 @@ async fn publish(
 
 /// What [`status`] found: what [`push`] would do with the same arguments.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct StatusReport {
     /// The pointer push would write, less its base.
     pub pointer: DvcPointer,
@@ -682,6 +700,14 @@ pub struct StatusReport {
     pub warnings: Vec<String>,
     /// How the output relates to the latest version in its history.
     pub sync: SyncState,
+    /// The latest versions as status found them, sorted: none for an empty
+    /// history, several for a fork.
+    pub heads: Vec<RecordId>,
+    /// Whether the output is [`SyncState::InSync`] and the `.dvc` beside it
+    /// names that version as its base. An output in sync without it (copied
+    /// in, or a crash between a push's record and its `.dvc`) is adopted by
+    /// the next push, which writes the `.dvc` and publishes nothing.
+    pub based: bool,
 }
 
 /// How a local output relates to the latest version in its history (its
@@ -744,29 +770,42 @@ pub async fn status_async(
     let staged = &scratch.get().0;
     let jobs = opts.jobs.max(1);
     let checked = async {
-        let plan = plan(remote, staged, jobs).await?;
+        let plan = plan(remote, staged, jobs, opts.repair).await?;
         Ok::<_, anyhow::Error>((plan, history::heads_of(remote, &opts.history, jobs).await?))
     }
     .await;
     let report = checked.map(|(plan, heads)| {
         let output = &staged.pointer.output;
         let base = history::base_of(local.as_ref());
-        let sync = match heads {
-            history::Heads::None => SyncState::NoHistory,
-            history::Heads::One(head) if head.pointer.output == *output => SyncState::InSync,
+        let ids = match &heads {
+            history::Heads::None => Vec::new(),
+            history::Heads::One(head) => vec![head.id.clone()],
+            history::Heads::Many(heads) => heads.iter().map(|h| h.id.clone()).collect(),
+        };
+        let (sync, based) = match heads {
+            history::Heads::None => (SyncState::NoHistory, false),
+            history::Heads::One(head) if head.pointer.output == *output => {
+                (SyncState::InSync, base == Some(&head.id))
+            }
             history::Heads::One(head) if history::follows(&head, local.as_ref()) => {
-                SyncState::LocalAhead
+                (SyncState::LocalAhead, false)
             }
             history::Heads::One(head) => match &local {
-                Some(p) if p.output == *output => SyncState::RemoteAhead { latest: *head },
-                _ => SyncState::Stale {
-                    base: base.cloned(),
-                    head: *head,
+                Some(p) if p.output == *output => (SyncState::RemoteAhead { latest: *head }, false),
+                _ => (
+                    SyncState::Stale {
+                        base: base.cloned(),
+                        head: *head,
+                    },
+                    false,
+                ),
+            },
+            history::Heads::Many(heads) => (
+                SyncState::Diverged {
+                    heads: heads.into_iter().map(|h| h.id).collect(),
                 },
-            },
-            history::Heads::Many(heads) => SyncState::Diverged {
-                heads: heads.into_iter().map(|h| h.id).collect(),
-            },
+                false,
+            ),
         };
         let bytes = |cs: &[&Hashed]| cs.iter().map(|c| c.size).sum();
         StatusReport {
@@ -779,6 +818,8 @@ pub async fn status_async(
             empty_dirs: staged.empty_dirs,
             warnings: staged.warnings.clone(),
             sync,
+            heads: ids,
+            based,
         }
     });
     scratch.delete().await;
@@ -1127,20 +1168,25 @@ struct Plan<'a, C> {
     manifest: bool,
 }
 
+/// What of `staged` the remote lacks. A manifest already on the remote
+/// means all its objects are (DVC's own invariant, and ours: a manifest is
+/// placed after its objects), so they are not asked for, unless `repair`
+/// says the remote may have lost some.
 async fn plan<'a, C: Content + Sync>(
     remote: &Remote,
     staged: &'a Staged<C>,
     jobs: usize,
+    repair: bool,
 ) -> Result<Plan<'a, C>> {
-    // A manifest already on the remote means all its objects are (DVC's own
-    // invariant, and ours: it is uploaded last).
-    if staged.manifest.is_some()
-        && remote
+    let manifest_there = match staged.manifest {
+        Some(_) => remote
             .store
             .head(&remote.manifest_key(staged.id()))
             .await?
-            .is_some()
-    {
+            .is_some(),
+        None => false,
+    };
+    if manifest_there && !repair {
         return Ok(Plan {
             upload: Vec::new(),
             present: staged.contents.iter().collect(),
@@ -1163,7 +1209,7 @@ async fn plan<'a, C: Content + Sync>(
     Ok(Plan {
         upload: upload.into_iter().map(|(c, _)| c).collect(),
         present: present.into_iter().map(|(c, _)| c).collect(),
-        manifest: staged.manifest.is_some(),
+        manifest: staged.manifest.is_some() && !manifest_there,
     })
 }
 

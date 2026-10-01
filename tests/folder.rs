@@ -3,9 +3,9 @@
 
 use bigstore::dvc::{BigstoreMeta, DvcOutput, DvcPointer, Manifest, ManifestEntry, RecordId};
 use bigstore::folder::{
-    self, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey, HistoryRecord,
-    LogOptions, Overwrite, Phase, PointerSource, Progress, ProgressEvent, PullOptions, PushOptions,
-    Pushed, Refusal, Remote, RemoteConfig, Resolve, Selector, SyncState,
+    self, layout, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey,
+    HistoryRecord, LogOptions, Overwrite, Phase, PointerSource, Progress, ProgressEvent,
+    PullOptions, PushOptions, Pushed, Refusal, Remote, RemoteConfig, Resolve, Selector, SyncState,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
@@ -2836,6 +2836,7 @@ fn pushes_racing_from_one_base_both_land_as_a_fork_that_a_merge_joins() {
         "{:?}",
         s.sync
     );
+    assert_eq!((&s.heads, s.based), (&heads, false));
     write(&a, b"a again");
     let err = folder::push(&e.remote, &a, &opts("k")).unwrap_err();
     assert_eq!(diverged(&err), heads);
@@ -2948,12 +2949,16 @@ fn a_version_published_without_its_dvc_is_adopted_not_pushed_again() {
     assert_eq!(base_of(&dvc), Some(v1));
     let s = folder::status(&e.remote, &f, &opts("k")).unwrap();
     assert!(matches!(s.sync, SyncState::InSync), "{:?}", s.sync);
+    // In sync, but not based on the head: what push adopts.
+    assert_eq!((&s.heads[..], s.based), (std::slice::from_ref(&v2), false));
     let again = folder::push(&e.remote, &f, &opts("k")).unwrap();
     assert_eq!(
         (again.outcome, &again.version),
         (Pushed::AlreadyLatest, &v2)
     );
     assert_eq!(base_of(&dvc), Some(v2.clone()));
+    let s = folder::status(&e.remote, &f, &opts("k")).unwrap();
+    assert_eq!((&s.heads[..], s.based), (std::slice::from_ref(&v2), true));
     // Or a crash before the first .dvc was written.
     std::fs::remove_file(&dvc).unwrap();
     let again = folder::push(&e.remote, &f, &opts("k")).unwrap();
@@ -3881,6 +3886,208 @@ fn a_catch_up_from_a_dvc_file_refuses_like_refuse() {
     .unwrap_err();
     assert!(
         matches!(folder_error(&err), FolderError::PullConflict { .. }),
+        "{err:#}"
+    );
+}
+
+/// The object for `content` on a local remote, relative to its root.
+fn object_key(content: &[u8]) -> String {
+    let md5 = hash_reader(&mut &content[..], HashFunction::Md5).unwrap();
+    format!("files/md5/{}/{}", md5.prefix(), md5.rest())
+}
+
+fn verified(e: &Env, key: &str, version: &RecordId) -> folder::Completeness {
+    folder::verify(&e.remote, &HistoryKey::new(key).unwrap(), version).unwrap()
+}
+
+fn repair(key: &str) -> PushOptions {
+    PushOptions {
+        repair: true,
+        ..opts(key)
+    }
+}
+
+#[test]
+fn status_without_history_names_no_heads_and_is_not_based() {
+    let e = env();
+    let f = e.data.join("f");
+    write(&f, b"v1");
+    let s = folder::status(&e.remote, &f, &opts("k")).unwrap();
+    assert!(matches!(s.sync, SyncState::NoHistory), "{:?}", s.sync);
+    assert_eq!((s.heads.len(), s.based), (0, false));
+    let v1 = folder::push(&e.remote, &f, &opts("k")).unwrap().version;
+    let s = folder::status(&e.remote, &f, &opts("k")).unwrap();
+    assert_eq!((&s.heads[..], s.based), (std::slice::from_ref(&v1), true));
+    // Changed since: the head is the base, but the output is not it.
+    write(&f, b"v2");
+    let s = folder::status(&e.remote, &f, &opts("k")).unwrap();
+    assert!(matches!(s.sync, SyncState::LocalAhead), "{:?}", s.sync);
+    assert_eq!((&s.heads[..], s.based), (std::slice::from_ref(&v1), false));
+}
+
+#[test]
+fn a_lost_file_object_is_found_by_verify_and_restored_by_repair() {
+    let e = env();
+    let f = e.data.join("f");
+    write(&f, b"precious");
+    let v1 = folder::push(&e.remote, &f, &opts("k")).unwrap().version;
+    let complete = verified(&e, "k", &v1);
+    assert_eq!((complete.objects, complete.is_complete()), (1, true));
+    let object = object_key(b"precious");
+    std::fs::remove_file(e.store.join(&object)).unwrap();
+
+    let lost = verified(&e, "k", &v1);
+    assert_eq!(
+        (lost.objects, &lost.missing[..]),
+        (1, std::slice::from_ref(&object))
+    );
+    let s = folder::status(&e.remote, &f, &repair("k")).unwrap();
+    assert!(
+        matches!(s.sync, SyncState::InSync) && s.based,
+        "{:?}",
+        s.sync
+    );
+    assert_eq!(s.to_upload, 1);
+    let repaired = folder::push(&e.remote, &f, &repair("k")).unwrap();
+    assert_eq!(
+        (repaired.outcome, &repaired.version, repaired.uploaded),
+        (Pushed::AlreadyLatest, &v1, 1)
+    );
+    assert!(verified(&e, "k", &v1).is_complete());
+    assert_eq!(history_log(&e, "k").unwrap().len(), 1);
+}
+
+#[test]
+fn objects_lost_behind_a_manifest_are_found_by_verify_and_restored_by_repair() {
+    let e = env();
+    let w = writer_dir(&e);
+    let pushed = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let v1 = pushed.version;
+    let DvcOutput::Dir { manifest, .. } = &pushed.pointer.output else {
+        panic!("a directory")
+    };
+    let manifest = format!("files/md5/{}/{}.dir", manifest.prefix(), manifest.rest());
+    let complete = verified(&e, KEY, &v1);
+    assert_eq!((complete.objects, complete.is_complete()), (4, true));
+    let object = object_key(b"PAR1 geometry");
+    std::fs::remove_file(e.store.join(&object)).unwrap();
+
+    // The manifest is still there, so a plain push trusts that its objects
+    // are, and would upload nothing.
+    let s = folder::status(&e.remote, &w, &opts(KEY)).unwrap();
+    assert!(
+        matches!(s.sync, SyncState::InSync) && s.based,
+        "{:?}",
+        s.sync
+    );
+    assert_eq!(s.to_upload, 0);
+    let lost = verified(&e, KEY, &v1);
+    assert_eq!(
+        (lost.objects, &lost.missing[..]),
+        (4, std::slice::from_ref(&object))
+    );
+    assert_eq!(
+        folder::status(&e.remote, &w, &repair(KEY))
+            .unwrap()
+            .to_upload,
+        1
+    );
+    let repaired = folder::push(&e.remote, &w, &repair(KEY)).unwrap();
+    assert_eq!(
+        (repaired.outcome, &repaired.version, repaired.uploaded),
+        (Pushed::AlreadyLatest, &v1, 1)
+    );
+    assert!(verified(&e, KEY, &v1).is_complete());
+
+    // A lost manifest: the objects behind it are unknown until it is back.
+    std::fs::remove_file(e.store.join(&manifest)).unwrap();
+    let lost = verified(&e, KEY, &v1);
+    assert_eq!(
+        (lost.objects, &lost.missing[..]),
+        (0, std::slice::from_ref(&manifest))
+    );
+    let repaired = folder::push(&e.remote, &w, &repair(KEY)).unwrap();
+    assert_eq!(
+        (repaired.outcome, repaired.uploaded),
+        (Pushed::AlreadyLatest, 0)
+    );
+    assert!(verified(&e, KEY, &v1).is_complete());
+    // One whose bytes are not the manifest named is as good as lost.
+    std::fs::write(e.store.join(&manifest), b"[]").unwrap();
+    assert_eq!(verified(&e, KEY, &v1).missing, [manifest]);
+    assert_eq!(history_log(&e, KEY).unwrap().len(), 1);
+}
+
+#[test]
+fn verify_of_a_version_not_in_the_history_is_no_such_version() {
+    let e = env();
+    let f = e.data.join("f");
+    write(&f, b"v1");
+    let other = folder::push(&e.remote, &f, &opts("other")).unwrap().version;
+    let err = folder::verify(&e.remote, &HistoryKey::new("k").unwrap(), &other).unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::NoSuchVersion),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn every_file_push_writes_is_a_store_file_that_verifies() {
+    let e = env();
+    let w = writer_dir(&e);
+    let _ = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    write(
+        &w.join("site=s1/date=2026-09-01/src_01/labels.jsonl"),
+        b"{}\n",
+    );
+    let _ = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let mut kinds = Vec::new();
+    for (key, bytes) in tree(&e.store) {
+        let kind = layout::kind(&key);
+        assert_ne!(kind, layout::Kind::Other, "{key}");
+        layout::verify(&key, &bytes).unwrap_or_else(|err| panic!("{key}: {err:#}"));
+        kinds.push(kind);
+        // One byte more is not that file.
+        let mut damaged = bytes.clone();
+        damaged.push(b'\n');
+        let err = layout::verify(&key, &damaged).unwrap_err();
+        assert!(
+            matches!(folder_error(&err), FolderError::Integrity { key: k } if *k == key),
+            "{err:#}"
+        );
+    }
+    kinds.sort();
+    kinds.dedup();
+    assert_eq!(
+        kinds,
+        [
+            layout::Kind::Object,
+            layout::Kind::Manifest,
+            layout::Kind::Record
+        ]
+    );
+}
+
+#[test]
+fn a_record_under_parents_its_bytes_do_not_name_does_not_verify() {
+    let e = env();
+    let f = e.data.join("f");
+    write(&f, b"v1");
+    let _ = folder::push(&e.remote, &f, &opts("k")).unwrap();
+    let (key, bytes) = tree(&e.store)
+        .into_iter()
+        .find(|(k, _)| k.starts_with("bigstore-history/"))
+        .unwrap();
+    layout::verify(&key, &bytes).unwrap();
+    let moved = key.replace("/root/", &format!("/{}/", "ab".repeat(16)));
+    let err = layout::verify(&moved, &bytes).unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::Integrity { .. }),
+        "{err:#}"
+    );
+    let err = layout::verify("files/md5/ab/cd", b"").unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::InvalidStoreKey { .. }),
         "{err:#}"
     );
 }

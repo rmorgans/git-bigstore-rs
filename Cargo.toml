@@ -1,6 +1,6 @@
 [package]
 name = "git-bigstore-rs"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Large files in git, your bucket, one binary."
@@ -15,6 +15,12 @@ path = "src/lib.rs"
 name = "git-bigstore"
 path = "src/main.rs"
 required-features = ["cli"]
+
+# Its own harness: a subprocess of the test binary serves the exchange
+# protocol on stdout, where libtest would write.
+[[test]]
+name = "exchange"
+harness = false
 
 [features]
 default = ["cli"]

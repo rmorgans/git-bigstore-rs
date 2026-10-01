@@ -672,10 +672,13 @@ What to push, and what push assumes:
   it lists. That is wrong if objects were deleted behind their manifest: by
   hand, by a bucket lifecycle rule, or by a copy or sync of the bucket that
   stopped part way. Push then succeeds, and pulling that version fails on
-  the missing object. To repair, delete the manifest
-  (`files/md5/xx/<rest>.dir`, named by the `.dvc`'s `md5`) and push again:
-  push then checks each object and uploads the missing ones. Single-file
-  outputs always check their object.
+  the missing object. `folder::verify` finds them (it reads the manifest
+  and asks for every object it names), and a push with
+  `PushOptions::repair` uploads them: it checks every object and the
+  manifest, and an output equal to the latest version publishes nothing.
+  From the CLI, delete the manifest (`files/md5/xx/<rest>.dir`, named by
+  the `.dvc`'s `md5`) and push again. Single-file outputs always check
+  their object.
 - **Change detection is length plus mtime.** A file's length and mtime are
   read before and after it is copied, and the copy is retried if either
   moved, or if the bytes copied are not the length the file ended at.
@@ -827,17 +830,40 @@ match s.sync {
 ```
 
 `InSync` says push would record no new version. It may still rewrite the
-`.dvc` beside the output, if that is missing or records another base.
+`.dvc` beside the output, if that is missing or records another base:
+`s.based` says whether it names the latest version, and `s.heads` are the
+latest versions status found (none for no history, several for a fork).
+
+Completeness: `folder::verify(&remote, &key, &version)` says whether the
+remote still holds every file a version needs, without downloading them
+(but the manifest): a file version's object; a directory version's `.dir`
+manifest, then every object it names. `Completeness::missing` lists the
+keys it lacks, relative to the remote (a manifest gone, or whose bytes are
+not the manifest named, hides the objects behind it: `objects` is then 0).
+A damaged object shows only when it is restored. An id that is not a
+version of `key` is `NoSuchVersion`.
+
+```rust
+let c = folder::verify(&remote, &key, &s.heads[0])?;
+if !c.is_complete() {
+    // The output here is that version: put back what the remote lost.
+    let opts = PushOptions { repair: true, ..PushOptions::new(key.clone()) };
+    let r = folder::push(&remote, dir, &opts)?; // Pushed::AlreadyLatest, r.uploaded objects restored
+}
+```
 
 Each function above blocks and runs its own tokio runtime; called from inside
 a runtime it returns an error naming its async twin. The twins,
-`push_async`, `status_async`, `pull_async`, `log_async` and `keys_async`,
+`push_async`, `status_async`, `pull_async`, `log_async`, `keys_async` and
+`verify_async`,
 take the same arguments and return the same results on the caller's tokio
 runtime, which needs the I/O and time drivers (`#[tokio::main]` and
 `Builder::enable_all` enable both); `current_thread` and `multi_thread` both
 work. Their futures are `Send`, so they can be spawned with owned arguments,
 and their file and hashing work runs on the runtime's blocking pool, never
 on the thread polling them. `Remote::open` has no twin: it makes no request.
+`folder::exchange` ([below](#store-files-and-exchanging-stores)) blocks
+and has no twins: give it a thread of its own.
 
 ```rust
 #[tokio::main]
@@ -893,6 +919,9 @@ ids and paths are fields. Both enums are `#[non_exhaustive]`.
 | `DestinationRequired` | a pull from history without `PullOptions::into` |
 | `Cancelled` | the caller's `CancelToken` was cancelled; a push published no history record or `.dvc`, a pull wrote no partial file and left its `.dvc` |
 | `Archived { key }` | the remote says object `key` (file, `.dir` manifest or history record) is archived and not restored (S3 `InvalidObjectState`); restore it and retry |
+| `InvalidStoreKey { key }` | `layout::verify`, or an exchange, of a key that is not a store file's |
+| `Integrity { key }` | a store file whose bytes are not what its name says, over its size limit, or not the size announced; nothing placed |
+| `OutOfScope { key, history }` | an exchange of a record outside the history the session was opened for; nothing placed |
 
 | `folder::Refusal` | Refused by | `path` is |
 | --- | --- | --- |
@@ -917,6 +946,73 @@ match folder::pull(&remote, &source, &opts) {
     },
 }
 ```
+
+### Store files and exchanging stores
+
+`folder::layout` is the one place that knows a store's files. Keys are
+relative to the store, `/`-separated, in the form the store holds them on
+disk (object_store's encoding: a `~` in a history key is `%7E`).
+`layout::kind(key)` is `Kind::Object` (`files/md5/xx/<30 hex>`),
+`Kind::Manifest` (the same with `.dir`), `Kind::Record`
+(`bigstore-history/<key>/<parents>/<id>.dvc`, or a 0.2 record's name) or
+`Kind::Other`: a temp file (`#` in its name, `.partial`), a desktop's
+`.DS_Store`, a traversing or absolute key, anything else. `Kind` orders
+objects before manifests before records, the order in which every
+transfer between stores places them, so a manifest never exists without
+its objects nor a record without its content. `layout::verify(key, bytes)`
+checks a file against its name: an object's and a manifest's md5, a
+record's id (and the parents its name gives), a 0.2 record's size only;
+a manifest is at most 64 MiB and a record 64 KiB (`Error::Integrity`,
+`Error::InvalidStoreKey`).
+
+`folder::exchange` copies store files between two store directories over
+one byte stream, built for `ssh` the way git uses it: the far end runs
+`exchange::serve(stdin, stdout, &ServeOptions::new(build))`, this end a
+`Client` on the command that starts it.
+
+```rust
+use bigstore::folder::exchange::Client;
+let mut ssh = std::process::Command::new("ssh");
+ssh.args(["-T", "-o", "BatchMode=yes", "xeno", "asset-store", "backup", "serve", "--stdio"]);
+let mut far = Client::spawn(ssh)?;                    // agrees protocol version 1
+far.open("D:/data/.backup-store", &history, true)?;   // a path on the far machine
+let theirs = far.list()?;                             // every store file it holds
+let ours = /* the local store's keys */;
+far.send(ours.difference(&theirs), local_store)?;     // objects, then manifests, then records
+far.fetch(theirs.difference(&ours), local_store)?;
+far.close()?;
+```
+
+- **Every file received is checked against its name**, on either side,
+  as it arrives, into `<name>#<random>` beside its final name, then placed
+  by a rename that never replaces (or a hard link where the filesystem
+  cannot rename so): a name already there is `present` (same name, same
+  content). A cut session leaves no partial file under a store name, and
+  a receiver places nothing after the first file it refuses. Windows paths
+  go verbatim, past `MAX_PATH`. A store must be on a filesystem that can
+  rename without replacing or hard-link (NTFS, APFS, ext4 and the like),
+  not FAT or exFAT.
+- **The server refuses** a record sent to it outside the history given to
+  `open`, and any key that is not a store file's (`..`, `\`, `C:`, a
+  leading `/`, a temp name), whether sent or asked for. The client refuses
+  both before anything travels, either way (`Error::OutOfScope`,
+  `Error::InvalidStoreKey`).
+- **A version handshake first.** The client's first line names the
+  versions it speaks, the server's names its build; with no common version
+  both sides fail (`exchange::Error::Version`, naming the far build) before
+  any store is opened. A program that does not answer with the server's
+  line (not installed, or a banner on stdout) is `exchange::Error::NotAServer`.
+- **The server does not outlive its client.** A thread reads its input;
+  when that ends outside the client's `close` (the client was killed, the
+  connection dropped), the session stops at its next step, removes the
+  temp file it was writing and `serve` returns `Error::SessionBroken`, for
+  the caller to exit non-zero.
+- **Errors carry codes and keys only**: a far refusal is
+  `exchange::Error::Refused { code, key }` (`Code::Integrity`, `Missing`,
+  `Scope`, `Key`, `Open`, `Io`…), never text the far side wrote; its
+  stderr is wherever the command sends it. `Client::canceller()` gives a
+  handle that kills the far program from another thread; the call under
+  way returns `Error::Cancelled`.
 
 ## Comparison: bigstore vs Git LFS vs DVC
 
