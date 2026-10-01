@@ -127,6 +127,7 @@ jobs:
         run: |
           cargo test --lib -- folder dvc types
           cargo test --test folder
+          cargo test --test exchange
           cargo test --test dvc_compat -- --ignored
 
       - name: rclone round trip
