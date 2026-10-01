@@ -984,7 +984,7 @@ changed.
 
 ```rust
 use bigstore::folder::integrity::{self, ScrubOptions, Source};
-let report = integrity::scrub(&*store, &ScrubOptions::default())?; // deep: read everything
+let report = integrity::scrub(&*store, &ScrubOptions::default())?; // trusts md5 ETags; `deep: true` reads everything
 for key in &report.damaged {
     // Good bytes from a working copy, or a peer's verified copy:
     integrity::replace(&*store, key, Source::File(good_copy))?; // Replaced | Placed | HealedByOther
@@ -1001,15 +1001,19 @@ integrity::quarantine(&*store, &damaged_object)?; // objects and manifests only:
 - **`replace`** refuses bytes that are not what the key names, then reads
   the file there again: good, it writes nothing (`HealedByOther`);
   unreadable, nothing (`Error::Unreadable`); damaged, it copies it to
-  `quarantine/<key>.<UTC time>` in the same store, then writes the new
-  bytes in one atomic PUT (on a `LocalFileSystem`, a temp file renamed
+  `quarantine/<key>.<UTC time>` in the same store (on a
+  `LocalFileSystem` a hard link, so not on FAT or exFAT), then writes the
+  new bytes in one atomic PUT (on a `LocalFileSystem`, a temp file renamed
   over the name; files over 10 MiB by multipart upload, checked as they
-  go). Last it checks the write: an ETag equal to the md5, else a read
-  back, else `Error::WriteUnverified`. Concurrent heals of one key
-  converge on good bytes.
+  go, aborted if any part fails). Last it checks the write: an ETag equal
+  to the md5, else a read back: not what its name says,
+  `Error::WriteUnverified`; unreadable, `Error::Unreadable` (the write may
+  be fine). Concurrent heals of one key converge on good bytes.
 - **`quarantine`** moves a damaged object or manifest to quarantine,
   leaving the name absent (sync and `push --repair` refill names). A
   record is refused (`Error::RecordKept`): records are never made absent.
+  On S3 the move is a copy then a delete, so it needs delete permission:
+  without it the copy lands and the damaged file stays.
 - Quarantine keys are `Kind::Other`: never scrubbed, listed or synced.
 
 Each has an `_async` twin.
@@ -1057,12 +1061,15 @@ far.close()?;
 - **Version 2: scrub and heal.** `Client::scrub(deep)` returns the far
   store's `ScrubReport`; `Client::heal(key, file)` sends verified bytes,
   and the far side does what `integrity::replace` does (`HealedByOther`
-  if its copy reads good, `Code::Unreadable` if it cannot be read). A
+  if its copy reads good, `Code::Unreadable` if it cannot be read,
+  `Code::Unverified` if its write does not read back right). A
   version 1 session (a far side before 0.6) works as before; scrub and heal
   are `exchange::Error::Unsupported`, and its store's integrity is the
   caller's to call unverified.
 - **An open guard.** `ServeOptions::with_open_guard(|dir| …)` is called
-  with the store directory on `open`, before the store is read or written;
+  with the store directory on `open`, before the store is read, created or
+  written (only whether it exists is looked at first, so a guard making
+  its lock file there does not make a store the client did not create);
   what it returns (say a lock) is held until the session ends. An `Err`
   refuses the open as `Code::Busy`, which the client returns as
   `exchange::Error::Busy` (a version 1 client is told `Code::Open`).

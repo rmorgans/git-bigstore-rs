@@ -237,6 +237,11 @@ where
         let mut read: u64 = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| reason(&anyhow::Error::from(e)))?;
+            // LocalFileSystem yields empty chunks forever once a file is
+            // shorter than it was when opened: that is the end of it.
+            if chunk.as_ref().is_empty() {
+                break;
+            }
             read += chunk.as_ref().len() as u64;
             if read > size || tx.send(chunk).await.is_err() {
                 break;
@@ -292,10 +297,13 @@ pub enum Replaced {
 /// there is read again first: good, it is left alone
 /// ([`Replaced::HealedByOther`]); unreadable, nothing is written
 /// ([`Error::Unreadable`]); damaged, its bytes are copied to
-/// [quarantine](self) first. Then `source` replaces it in one atomic write
-/// (on a `LocalFileSystem`, a temp file renamed over the name). Last, the
-/// write is checked: an ETag equal to the bytes' md5, else the file read
-/// back and verified, else [`Error::WriteUnverified`].
+/// [quarantine](self) first (on a `LocalFileSystem`, a hard link: the
+/// store must be on a filesystem that has them). Then `source` replaces it
+/// in one atomic write (on a `LocalFileSystem`, a temp file renamed over
+/// the name). Last, the write is checked: an ETag equal to the bytes' md5,
+/// else the file read back and verified: not what its name says (or gone),
+/// [`Error::WriteUnverified`]; unreadable, [`Error::Unreadable`] (the write
+/// may be fine; a later scrub settles it).
 ///
 /// Replacing a content-addressed name with bytes that verify is safe
 /// whatever is there, so concurrent heals of one key converge on good
@@ -341,11 +349,24 @@ pub async fn replace_async(store: &dyn ObjectStore, key: &str, source: Source) -
             false
         }
     };
-    if !written && !matches!(examine(store, &location).await, State::Good) {
-        return Err(Error::WriteUnverified {
-            key: key.to_string(),
+    if !written {
+        match examine(store, &location).await {
+            State::Good => {}
+            State::Damaged | State::Absent => {
+                return Err(Error::WriteUnverified {
+                    key: key.to_string(),
+                }
+                .into())
+            }
+            // The write may be fine: a later scrub settles it.
+            State::Unreadable(reason) => {
+                return Err(Error::Unreadable {
+                    key: key.to_string(),
+                    reason,
+                }
+                .into())
+            }
         }
-        .into());
     }
     Ok(match quarantined {
         Some(quarantined) => Replaced::Replaced { quarantined },
@@ -436,7 +457,7 @@ async fn upload(
         .await
         .with_context(|| format!("failed to write {key}"))?;
     let mut writer = WriteMultipart::new_with_chunk_size(multipart, PART as usize);
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
     let checked_key = key.to_string();
     let reading = backend::blocking(move || {
         let mut check = Check::new(&checked_key, size)?;
@@ -449,7 +470,11 @@ async fn upload(
         })?;
         check.finish()
     });
+    // The receiver lives in the sending loop: when a part fails, it is
+    // dropped with the loop, so the reader stops instead of blocking on a
+    // full channel.
     let sending = async {
+        let mut rx = rx;
         while let Some(chunk) = rx.recv().await {
             writer.wait_for_capacity(4).await?;
             writer.write(&chunk);
@@ -457,9 +482,10 @@ async fn upload(
         Ok::<(), object_store::Error>(())
     };
     let (read, sent) = tokio::join!(reading, sending);
+    // A failed send stops the reader, so its error is the cause.
     let failed = match (read, sent) {
-        (Err(e), _) => Some(e),
-        (Ok(()), Err(e)) => Some(anyhow::Error::from(e).context(format!("failed to write {key}"))),
+        (_, Err(e)) => Some(anyhow::Error::from(e).context(format!("failed to write {key}"))),
+        (Err(e), Ok(())) => Some(e),
         (Ok(()), Ok(())) => None,
     };
     if let Some(e) = failed {
@@ -490,6 +516,12 @@ pub enum Quarantined {
 /// ([`Quarantined::Good`]), an unreadable one too ([`Error::Unreadable`]).
 /// A record is refused ([`Error::RecordKept`]): records are never made
 /// absent, only [`replace`]d.
+///
+/// The move is the store's rename: on a `LocalFileSystem` one rename; on
+/// S3 a copy to quarantine, then a delete of the original. So on S3 it
+/// needs permission to delete: without it the copy lands, the delete
+/// fails, the damaged file stays under its name, and each attempt adds
+/// another quarantine copy. Do not call it on a store that cannot delete.
 pub fn quarantine(store: &dyn ObjectStore, key: &str) -> Result<Quarantined> {
     block_on("integrity::quarantine", quarantine_async(store, key))?
 }

@@ -22,18 +22,22 @@
     bytes that are not what `key` names, reads the file there again
     (`Replaced::HealedByOther` and nothing written if it is now good,
     `Error::Unreadable` if it cannot be read), copies a damaged one to
-    `quarantine/<key>.<UTC time, colon-free>` in the same store, then
-    writes in one atomic PUT (a temp file renamed over the name on a
-    `LocalFileSystem`; files over 10 MiB by a multipart upload that
-    completes only if every byte sent verifies). The write is then
-    checked: an ETag equal to the md5, else a read back, else
-    `Error::WriteUnverified`. Returns `Replaced::{Replaced { quarantined },
+    `quarantine/<key>.<UTC time, colon-free>` in the same store (a hard
+    link on a `LocalFileSystem`), then writes in one atomic PUT (a temp
+    file renamed over the name on a `LocalFileSystem`; files over 10 MiB
+    by a multipart upload that completes only if every byte sent verifies,
+    and is aborted if a part fails). The write is then checked: an ETag
+    equal to the md5, else a read back (`Error::WriteUnverified` if it is
+    not what its name says, `Error::Unreadable` if it cannot be read).
+    Returns `Replaced::{Replaced { quarantined },
     Placed, HealedByOther}`. Concurrent replaces of one key converge on
     good bytes.
   - `quarantine(store, key)` moves a damaged object or manifest to
     quarantine, leaving its name absent: `Quarantined::{Moved {
     quarantined }, Good, Absent}`. A record is refused
-    (`Error::RecordKept`): records are never made absent.
+    (`Error::RecordKept`): records are never made absent. On S3 the move
+    is a copy then a delete: it needs delete permission, and without it
+    the copy lands and the damaged file stays.
   - Each has an `_async` twin; `integrity::QUARANTINE` is `"quarantine/"`.
     Quarantine keys are `Kind::Other`: never scrubbed, listed or synced.
 - **`Completeness::keys`**: every store file a version needs (its record,
@@ -47,13 +51,16 @@
   `Client::heal(key, file)`, which sends verified bytes for one key: the
   far side checks them as they arrive, then does what `integrity::replace`
   does (`HealedByOther` if its copy reads good, `Code::Unreadable` if it
-  cannot be read, quarantine and an atomic replace if it is damaged). A
+  cannot be read, quarantine and an atomic replace if it is damaged,
+  `Code::Unverified` if that write does not read back right). A
   version 1 session (a far side before 0.6) works as before; scrub and
   heal are `exchange::Error::Unsupported { version }` there, before
   anything is sent. NotFound (`Code::Missing`) and read errors (`Code::Io`)
   stay distinct.
 - **`ServeOptions::with_open_guard(f)`**: `f` gets the store directory
-  when the client opens it, before the store is read, created or written;
+  when the client opens it, before the store is read, created or written
+  (whether it exists is settled first, so a guard that makes its lock file
+  inside it does not make it exist);
   what it returns (`Box<dyn Send>`, say a lock on the store) is held until
   the session ends. An `Err` refuses the open as the new `Code::Busy`,
   which the client returns as `exchange::Error::Busy`; a version 1 client
@@ -61,15 +68,16 @@
 
 ### Changed
 
-- **`local://` stores fsync every write** (the file, then its directory):
-  `backend::store::build_local_store` sets `LocalFileSystem::with_fsync`.
+- **`local://` stores fsync every write** (the file, and on Unix its
+  directory): `backend::store::build_local_store` sets
+  `LocalFileSystem::with_fsync`.
 - **Breaking (library):** `exchange::VERSION` is gone for
   `exchange::VERSIONS` (`[2, 1]`); `exchange::Error::Version { ours }` is
   `[2, 1]`. `Completeness` has a `keys` field, `folder::Error` the
   `Unreadable`, `WriteUnverified` and `RecordKept` variants,
-  `exchange::Code` `Busy` and `Unreadable`, `exchange::Error` `Busy` and
-  `Unsupported` (all `#[non_exhaustive]`). `ServeOptions` implements
-  `Debug` by hand (the guard is not printed).
+  `exchange::Code` `Busy`, `Unreadable` and `Unverified`, and
+  `exchange::Error` `Busy` and `Unsupported` (all `#[non_exhaustive]`).
+  `ServeOptions` implements `Debug` by hand (the guard is not printed).
 
 ## 0.5.0 — 2026-10-01
 

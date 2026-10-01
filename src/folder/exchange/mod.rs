@@ -126,6 +126,9 @@ pub enum Code {
     /// The far copy of a file to heal cannot be read whole, so it was left
     /// as it is.
     Unreadable,
+    /// A heal's write did not read back as what its name says. Version 2
+    /// only.
+    Unverified,
 }
 
 impl Code {
@@ -141,6 +144,7 @@ impl Code {
             Self::Protocol => "protocol",
             Self::Busy => "busy",
             Self::Unreadable => "unreadable",
+            Self::Unverified => "unverified",
         }
     }
 
@@ -151,6 +155,7 @@ impl Code {
             Some(FolderError::Integrity { .. }) => Self::Integrity,
             Some(FolderError::OutOfScope { .. }) => Self::Scope,
             Some(FolderError::Unreadable { .. }) => Self::Unreadable,
+            Some(FolderError::WriteUnverified { .. }) => Self::Unverified,
             _ => Self::Io,
         }
     }
@@ -279,10 +284,13 @@ impl ServeOptions {
     }
 
     /// Call `guard` with the store directory when the client opens it,
-    /// before the store is read, created or written. The value it returns
-    /// is held until the session ends (`serve` returns), say a lock on the
-    /// store; an `Err` refuses the open as [`Code::Busy`], and the session
-    /// goes on with no store open.
+    /// before the store is read, created or written (only whether the
+    /// directory exists is looked at first, so a guard that creates its
+    /// lock file inside it does not make a store the client did not ask to
+    /// create). It is called whether or not the directory exists. The
+    /// value it returns is held until the session ends (`serve` returns),
+    /// say a lock on the store; an `Err` refuses the open as
+    /// [`Code::Busy`], and the session goes on with no store open.
     pub fn with_open_guard(
         mut self,
         guard: impl Fn(&Path) -> Result<Box<dyn Send>> + Send + Sync + 'static,
@@ -502,6 +510,14 @@ impl<W: Write> Server<'_, W> {
             return self.wire.send(&Frame::refusal(Code::Open, None));
         }
         let root = PathBuf::from(store);
+        // Whether the store exists is settled before the guard runs: a guard
+        // that makes its lock file inside it does not make it exist.
+        let existed = match std::fs::metadata(crate::types::long_path(&root)?) {
+            Ok(meta) if meta.is_dir() => true,
+            Ok(_) => return self.wire.send(&Frame::refusal(Code::Open, None)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return self.wire.send(&Frame::refusal(Code::Open, None)),
+        };
         let guard = match &self.open_guard {
             None => None,
             Some(open_guard) => match open_guard(&root) {
@@ -514,12 +530,6 @@ impl<W: Write> Server<'_, W> {
                     return self.wire.send(&Frame::refusal(code, None));
                 }
             },
-        };
-        let existed = match std::fs::metadata(crate::types::long_path(&root)?) {
-            Ok(meta) if meta.is_dir() => true,
-            Ok(_) => return self.wire.send(&Frame::refusal(Code::Open, None)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(_) => return self.wire.send(&Frame::refusal(Code::Open, None)),
         };
         if !existed && create {
             let made = crate::types::long_path(&root).and_then(std::fs::create_dir_all);

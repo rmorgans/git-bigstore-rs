@@ -1271,6 +1271,27 @@ fn an_open_guard_is_held_for_the_session_and_a_refusal_leaves_the_store_untouche
     served.join().unwrap().unwrap();
     assert!(released.load(Ordering::SeqCst), "never released");
 
+    // A guard that makes its lock file inside the store, as asset-store's
+    // does: a store opened without `create` still did not exist, lists as
+    // empty and refuses files.
+    let absent = tmp.path().join("absent");
+    let locking = ServeOptions::new("guarded").with_open_guard(|dir| {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join(".lock"), b"")?;
+        Ok(Box::new(()) as Box<dyn Send>)
+    });
+    let (reader, writer, served) = serve_in_process_with(locking);
+    let mut client = Client::connect(reader, writer).unwrap();
+    assert!(!client
+        .open(absent.to_str().unwrap(), &scope(), false)
+        .unwrap());
+    assert!(client.list().unwrap().is_empty());
+    assert!(client.scrub(false).unwrap().checked == 0);
+    let err = client.send(listing(&local), &local).unwrap_err();
+    assert_eq!(far_refusal(&err).0, Code::Open);
+    close(client, served);
+    assert_eq!(files(&absent).into_keys().collect::<Vec<_>>(), [".lock"]);
+
     // A guard that cannot be had: busy, and the store is not created.
     let busy = tmp.path().join("busy");
     let refusing = || {
