@@ -188,7 +188,10 @@ fn bigstore_pulls_what_dvc_pushed_and_repushes_identically() {
     // Re-pushing the same content from bigstore: the same pointer, byte for
     // byte, followed by the version it now is; nothing else new.
     let before = tree(&store).len();
-    let dvc_yaml = std::fs::read_to_string(project.join("views.dvc")).unwrap();
+    // bigstore writes its pointer with LF; DVC on Windows writes CRLF.
+    let dvc_yaml = std::fs::read_to_string(project.join("views.dvc"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let report = folder::push(
         &remote,
         &project.join("views"),
