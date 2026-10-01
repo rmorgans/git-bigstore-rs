@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.0 — 2026-10-01
+
+### Added
+
+- **Catch-up pull: `Overwrite::IfUnchanged`** (CLI: `folder pull
+  --if-unchanged`). A pull from history replaces a differing file only if
+  it still has the content the `.dvc` beside `into` records (its base),
+  and removes a file the base had, still unchanged, that the version
+  pulled does not; both are in the base version on the remote. Any other
+  differing file, and a removed file that changed locally, is
+  `PullConflict` before anything is written. Every file is hashed again
+  just before it is replaced or removed; one written meanwhile is left as
+  it is (`Refusal::ChangedWhilePulling`). With no `.dvc` beside `into`, or
+  from a `.dvc` source, it refuses like `Overwrite::Refuse`. So an output
+  `status` calls `RemoteAhead` can now be brought up to date in place.
+  `PullReport::removed` counts the removed files.
+- **Confinement to a root: `PushOptions::root` and `PullOptions::root`.**
+  The output (and pull's `into`, or a `.dvc` source) is then relative to
+  the root and must be plain names (`Refusal::OutsideRoot`); a symlink, or
+  on Windows any reparse point, from the root down to the output, at the
+  output or at its `.dvc`, is `Refusal::SymlinkedComponent`, checked before
+  anything is read or written. Without a root, paths are used as given.
+- **Typed errors for what a caller acts on:**
+  `folder::Error::CredentialsMissing` (an `s3://` remote whose access key
+  id or secret is unset or empty, including empty `Credentials::Static`;
+  `backend::Error::CredentialsMissing` from `build_strict_s3`),
+  `RemoteUnusable { url }` (any other failure of `Remote::open`, which
+  makes no request), `TooManyHeads { key, heads, max }` (a merge of more
+  than 8 heads) and `NoHead { key }` (a damaged history; `pull` of
+  `Latest` was `NoSuchVersion`). Each was an untyped error.
+
+### Changed
+
+- **Breaking (library): a push reports what it did to history as
+  `PushReport::outcome: Pushed`**, `AlreadyLatest`, `Published { record }`
+  or `Forked { record, with }`, replacing `history_record` and
+  `forked_with`. A push that forked the history published its version but
+  is not a plain success, and `PushReport` is `#[must_use]`. The CLI's
+  `folder push` now exits non-zero after a fork.
+- **Breaking (library):** `Overwrite`, `PushReport` and `PullReport` are
+  `#[non_exhaustive]`; `PushOptions` and `PullOptions` have a `root` field
+  (struct literals that end in `..PushOptions::new(key)` or
+  `..PullOptions::default()` are unaffected).
+- `folder::Error` messages no longer name a remedy that is a CLI flag
+  (`PullConflict` said "use force to replace", `Diverged` "pull one with
+  its id … push with merge", `StaleBase` what to redo); the CLI adds a
+  `hint:` line naming its own flags instead.
+
 ## 0.3.0 — 2026-10-01
 
 ### Added
