@@ -287,9 +287,13 @@ enum FolderCommand {
         /// Where to restore (default: beside the .dvc file)
         #[arg(long)]
         into: Option<PathBuf>,
-        /// Replace local files that differ
-        #[arg(long)]
+        /// Replace local files that differ, whatever they hold
+        #[arg(long, conflicts_with = "if_unchanged")]
         force: bool,
+        /// Catch up: replace (or remove) only local files still as the .dvc
+        /// beside --into records them; any other differing file is refused
+        #[arg(long, requires = "history")]
+        if_unchanged: bool,
         #[command(flatten)]
         remote: RemoteArgs,
         #[arg(short, long)]
@@ -342,7 +346,7 @@ fn main() -> Result<()> {
             patterns,
             force,
         } => cmd_import_dvc_dir(&source, &dest_root, &patterns, force),
-        Commands::Folder(cmd) => cmd_folder(cmd),
+        Commands::Folder(cmd) => cmd_folder(cmd).map_err(folder_hint),
         Commands::FilterClean { path } => filter::clean(path.as_deref()),
         Commands::FilterSmudge => filter::smudge(),
         Commands::FilterProcess => bigstore::filter_process::run(),
@@ -857,18 +861,17 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                 r.uploaded,
                 r.already_present,
                 r.pointer_path.display(),
-                if r.history_record.is_some() {
-                    "new version"
-                } else {
-                    "already the latest version,"
+                match r.outcome {
+                    folder::Pushed::AlreadyLatest => "already the latest version,",
+                    _ => "new version",
                 },
                 r.version
             );
-            if !r.forked_with.is_empty() {
-                eprintln!(
-                    "warning: history has forked: {} pushed from the same base meanwhile; \
+            if let folder::Pushed::Forked { with, .. } = &r.outcome {
+                anyhow::bail!(
+                    "pushed, but history has forked: {} pushed from the same base meanwhile; \
                      reconcile, then push --resolve merge",
-                    join_ids(&r.forked_with)
+                    join_ids(with)
                 );
             }
         }
@@ -900,7 +903,7 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                     println!("changed since the latest version; push to record it")
                 }
                 folder::SyncState::RemoteAhead { latest } => println!(
-                    "history has a newer version, {} pushed {}; pull to update",
+                    "history has a newer version, {} pushed {}; pull --if-unchanged to catch up",
                     latest.id,
                     when(latest)
                 ),
@@ -926,6 +929,7 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
             at,
             into,
             force,
+            if_unchanged,
             remote,
             jobs,
         } => {
@@ -951,17 +955,21 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                     into,
                     overwrite: if force {
                         Overwrite::Force
+                    } else if if_unchanged {
+                        Overwrite::IfUnchanged
                     } else {
                         Overwrite::Refuse
                     },
                     jobs: resolve_jobs(jobs)?.get(),
                     cancel: cancel_on_ctrl_c()?,
                     progress: progress_bars(),
+                    root: None,
                 },
             )?;
             eprintln!(
-                "{} file(s) written, {} already up to date, {} local file(s) not in this version (kept)",
-                r.written, r.unchanged, r.extra_local
+                "{} file(s) written, {} already up to date, {} removed, {} local file(s) not in \
+                 this version (kept)",
+                r.written, r.unchanged, r.removed, r.extra_local
             );
         }
         FolderCommand::Log {
@@ -1032,6 +1040,27 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `err` with what to do about it on this command line, for the folder
+/// errors whose remedy is one of its flags (the library names none).
+fn folder_hint(err: anyhow::Error) -> anyhow::Error {
+    use bigstore::folder::Error;
+    let hint = match err.downcast_ref::<Error>() {
+        Some(Error::PullConflict { .. }) => {
+            "--if-unchanged replaces only files unchanged since the .dvc beside them; set \
+             local changes aside first, or --force replaces whatever is there"
+        }
+        Some(Error::StaleBase { .. }) => {
+            "set local changes aside, pull the latest version, redo them and push again"
+        }
+        Some(Error::Diverged { .. }) => {
+            "pull one head with --at <id>, reconcile the others into it, then push --resolve merge"
+        }
+        Some(Error::CredentialsMissing) => "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
+        _ => return err,
+    };
+    anyhow::anyhow!("{err:#}\nhint: {hint}")
 }
 
 /// Record ids, comma-separated.

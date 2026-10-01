@@ -5,7 +5,7 @@ use bigstore::dvc::{BigstoreMeta, DvcOutput, DvcPointer, Manifest, ManifestEntry
 use bigstore::folder::{
     self, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey, HistoryRecord,
     LogOptions, Overwrite, Phase, PointerSource, Progress, ProgressEvent, PullOptions, PushOptions,
-    Refusal, Remote, RemoteConfig, Resolve, Selector, SyncState,
+    Pushed, Refusal, Remote, RemoteConfig, Resolve, Selector, SyncState,
 };
 use bigstore::hash::{hash_file, hash_reader};
 use bigstore::types::{HashFunction, Hexdigest, ManifestPath};
@@ -193,7 +193,11 @@ fn round_trip_restores_the_tree_and_repush_is_a_no_op() {
     let first = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     assert_eq!(first.files, 4);
     assert_eq!(first.uploaded, 4);
-    assert!(first.history_record.is_some());
+    assert!(
+        matches!(first.outcome, Pushed::Published { .. }),
+        "{:?}",
+        first.outcome
+    );
     assert_eq!(
         first.pointer_path,
         w.parent().unwrap().join("host=ricks-macbook-pro.dvc")
@@ -202,7 +206,11 @@ fn round_trip_restores_the_tree_and_repush_is_a_no_op() {
 
     let again = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     assert_eq!(again.uploaded, 0);
-    assert!(again.history_record.is_none(), "no-op push grew history");
+    assert_eq!(
+        again.outcome,
+        Pushed::AlreadyLatest,
+        "no-op push grew history"
+    );
     assert_eq!(std::fs::read(&again.pointer_path).unwrap(), pointer_bytes);
 
     let restore = e.data.parent().unwrap().join("restore");
@@ -729,7 +737,7 @@ fn an_equivalent_crlf_pointer_is_left_untouched() {
         .unwrap()
         .replace('\n', "\r\n");
     std::fs::write(&first.pointer_path, &crlf).unwrap();
-    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let _ = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     assert_eq!(std::fs::read_to_string(&first.pointer_path).unwrap(), crlf);
 }
 
@@ -858,9 +866,9 @@ fn at_or_before_restores_the_version_in_force_at_that_time() {
     let e = env();
     let w = writer_dir(&e);
     let labels = w.join("site=s1/date=2026-09-02/src_02/labels.jsonl");
-    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let _ = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     std::fs::write(&labels, b"{\"t\":4}\n").unwrap();
-    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let _ = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     let log = history_log(&e, KEY).unwrap();
     let [v1, v2] = &log[..] else {
         panic!("{log:?}")
@@ -1510,7 +1518,11 @@ fn os_junk_appearing_is_not_a_new_version() {
     let again = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     assert_eq!(again.pointer.output, first.pointer.output);
     assert_eq!((again.files, again.uploaded), (first.files, 0));
-    assert!(again.history_record.is_none(), "junk made a new version");
+    assert_eq!(
+        again.outcome,
+        Pushed::AlreadyLatest,
+        "junk made a new version"
+    );
     assert_eq!(std::fs::read(&again.pointer_path).unwrap(), pointer);
     let versions = history_log(&e, KEY).unwrap();
     assert_eq!(versions.len(), 1);
@@ -1764,7 +1776,7 @@ fn a_cancelled_push_publishes_nothing() {
     assert!(!pointer_path.exists(), "a .dvc was written");
     assert!(remote_keys(&e.store).is_empty(), "something was published");
 
-    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let _ = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     let pointer = std::fs::read(&pointer_path).unwrap();
     let keys = remote_keys(&e.store);
     write(&w.join("new.jsonl"), b"{}\n");
@@ -1780,7 +1792,7 @@ fn a_cancelled_push_publishes_nothing() {
 fn a_cancelled_pull_writes_nothing() {
     let e = env();
     let w = writer_dir(&e);
-    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let _ = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     let into = e.data.parent().unwrap().join("restore");
     let o = PullOptions {
         into: Some(into.clone()),
@@ -1835,7 +1847,7 @@ fn push_and_pull_report_progress_per_file_and_byte() {
     let w = writer_dir(&e);
     let total: u64 = tree(&w).iter().map(|(_, c)| c.len() as u64).sum();
     let (progress, events) = recorder();
-    folder::push(
+    let _ = folder::push(
         &e.remote,
         &w,
         &PushOptions {
@@ -1927,7 +1939,7 @@ fn a_pull_cancelled_mid_download_leaves_only_whole_files() {
     let e = env();
     let out = e.data.join("out");
     many_files(&out, 20);
-    folder::push(&e.remote, &out, &opts("ds/out")).unwrap();
+    let _ = folder::push(&e.remote, &out, &opts("ds/out")).unwrap();
     let into = e.data.parent().unwrap().join("restore");
     let cancel = CancelToken::new();
     let trigger = cancel.clone();
@@ -2055,7 +2067,7 @@ fn an_invalid_history_key_and_a_history_pull_without_a_destination_are_typed() {
 
     let e = env();
     let w = writer_dir(&e);
-    folder::push(&e.remote, &w, &opts(KEY)).unwrap();
+    let _ = folder::push(&e.remote, &w, &opts(KEY)).unwrap();
     let err =
         folder::pull(&e.remote, &history(KEY, Selector::Latest), &pull_opts(None)).unwrap_err();
     assert!(
@@ -2201,7 +2213,7 @@ fn pull_refuses_an_executable_mark_inside_a_directory() {
     let e = env();
     let tool = e.data.join("tool.sh");
     write(&tool, b"#!/bin/sh\n");
-    folder::push(&e.remote, &tool, &opts("ds/tool")).unwrap();
+    let _ = folder::push(&e.remote, &tool, &opts("ds/tool")).unwrap();
     let raw = br#"[{"isexec": true, "md5": "3e2b31c72181b87149ff995e7202c0e3", "relpath": "sub/run.sh"}]"#;
     let id = hash_reader(&mut &raw[..], HashFunction::Md5).unwrap();
     let id = id.to_string();
@@ -2280,7 +2292,11 @@ async fn async_fns_push_and_restore_on_a_current_thread_runtime() {
     let pushed = folder::push_async(&e.remote, &w, &opts(KEY)).await.unwrap();
     assert_eq!((pushed.files, pushed.uploaded), (4, 4));
     assert!(pushed.pointer_path.exists());
-    let written = pushed.history_record.clone().expect("a first version");
+    let written = pushed
+        .outcome
+        .record()
+        .expect("a first version")
+        .to_string();
 
     let status = folder::status_async(&e.remote, &w, &opts(KEY))
         .await
@@ -2488,7 +2504,7 @@ async fn file_work_runs_off_the_callers_runtime() {
         progress,
         ..opts(KEY)
     };
-    folder::push_async(&e.remote, &w, &o).await.unwrap();
+    let _ = folder::push_async(&e.remote, &w, &o).await.unwrap();
     responder.await.unwrap();
     assert!(
         answered.load(Ordering::SeqCst),
@@ -2749,8 +2765,15 @@ fn pushes_racing_from_one_base_both_land_as_a_fork_that_a_merge_joins() {
         .unwrap()
         .take()
         .expect("A pushed during B's push");
-    assert!(a_push.forked_with.is_empty(), "{:?}", a_push.forked_with);
-    assert_eq!(b_push.forked_with, std::slice::from_ref(&a_push.version));
+    assert!(
+        matches!(a_push.outcome, Pushed::Published { .. }),
+        "{:?}",
+        a_push.outcome
+    );
+    let Pushed::Forked { with, .. } = &b_push.outcome else {
+        panic!("B raced A from the same base: {:?}", b_push.outcome)
+    };
+    assert_eq!(with, std::slice::from_ref(&a_push.version));
     let log = history_log(&e, "k").unwrap();
     let mut forked: Vec<(RecordId, Vec<RecordId>, Option<String>)> = log[1..]
         .iter()
@@ -2927,18 +2950,17 @@ fn a_version_published_without_its_dvc_is_adopted_not_pushed_again() {
     assert!(matches!(s.sync, SyncState::InSync), "{:?}", s.sync);
     let again = folder::push(&e.remote, &f, &opts("k")).unwrap();
     assert_eq!(
-        (
-            again.history_record,
-            &again.version,
-            again.forked_with.len()
-        ),
-        (None, &v2, 0)
+        (again.outcome, &again.version),
+        (Pushed::AlreadyLatest, &v2)
     );
     assert_eq!(base_of(&dvc), Some(v2.clone()));
     // Or a crash before the first .dvc was written.
     std::fs::remove_file(&dvc).unwrap();
     let again = folder::push(&e.remote, &f, &opts("k")).unwrap();
-    assert_eq!((again.history_record, &again.version), (None, &v2));
+    assert_eq!(
+        (again.outcome, &again.version),
+        (Pushed::AlreadyLatest, &v2)
+    );
     assert_eq!(base_of(&dvc), Some(v2));
     assert_eq!(history_log(&e, "k").unwrap().len(), 2);
 }
@@ -3069,7 +3091,11 @@ fn an_output_0_2_pushed_as_the_head_follows_it_when_changed() {
     let s = folder::status(&e.remote, &f, &opts("k")).unwrap();
     assert!(matches!(s.sync, SyncState::LocalAhead), "{:?}", s.sync);
     let pushed = folder::push(&e.remote, &f, &opts("k")).unwrap();
-    assert!(pushed.history_record.is_some());
+    assert!(
+        matches!(pushed.outcome, Pushed::Published { .. }),
+        "{:?}",
+        pushed.outcome
+    );
     let log = history_log(&e, "k").unwrap();
     let last = log.last().unwrap();
     assert_eq!((&last.id, &last.parents), (&pushed.version, &vec![head]));
@@ -3210,7 +3236,7 @@ fn a_dvc_with_someone_elses_meta_is_never_replaced() {
     // Nor does a pull from history, before it writes anything.
     let g = e.data.join("g");
     write(&g, b"y");
-    folder::push(&e.remote, &g, &opts("k")).unwrap();
+    let _ = folder::push(&e.remote, &g, &opts("k")).unwrap();
     let o = PullOptions {
         overwrite: Overwrite::Force,
         ..pull_opts(Some(f.clone()))
@@ -3284,4 +3310,577 @@ fn a_pull_writes_its_base_last_so_a_cancelled_one_leaves_the_base() {
     write(&out.join("f000.txt"), b"edited on v1\n");
     let err = folder::push(&e.remote, &out, &opts("ds/out")).unwrap_err();
     assert_eq!(stale_base(&err), (Some(&v1), &[v2][..]));
+}
+
+/// Restore `key`'s latest version into `into`, beside a `.dvc` naming it.
+fn pull_latest(
+    e: &Env,
+    key: &str,
+    into: &Path,
+    overwrite: Overwrite,
+) -> anyhow::Result<folder::PullReport> {
+    folder::pull(
+        &e.remote,
+        &history(key, Selector::Latest),
+        &PullOptions {
+            overwrite,
+            ..pull_opts(Some(into.to_path_buf()))
+        },
+    )
+}
+
+/// Host A's output at v1, pushed to `key`, and host B's copy of it, pulled.
+fn two_hosts(e: &Env, key: &str) -> (PathBuf, PathBuf) {
+    let a = e.data.join(format!("a/{key}"));
+    write(&a.join("keep.txt"), b"same\n");
+    write(&a.join("edit.txt"), b"v1\n");
+    write(&a.join("gone.txt"), b"removed in v2\n");
+    write(&a.join("sub/deep.txt"), b"v1\n");
+    let _ = folder::push(&e.remote, &a, &opts(key)).unwrap();
+    let b = e.data.join(format!("b/{key}"));
+    pull_latest(e, key, &b, Overwrite::Refuse).unwrap();
+    (a, b)
+}
+
+/// A's second version: one file edited, one removed, one added, one deep
+/// file edited.
+fn push_v2(e: &Env, key: &str, a: &Path) -> RecordId {
+    write(&a.join("edit.txt"), b"v2\n");
+    std::fs::remove_file(a.join("gone.txt")).unwrap();
+    write(&a.join("sub/deep.txt"), b"v2\n");
+    write(&a.join("new.txt"), b"added in v2\n");
+    folder::push(&e.remote, a, &opts(key)).unwrap().version
+}
+
+fn dvc_beside(output: &Path) -> PathBuf {
+    let mut dvc = output.as_os_str().to_owned();
+    dvc.push(".dvc");
+    PathBuf::from(dvc)
+}
+
+#[test]
+fn a_catch_up_pull_brings_an_unchanged_output_to_the_latest_version() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    let v2 = push_v2(&e, "k", &a);
+    let s = folder::status(&e.remote, &b, &opts("k")).unwrap();
+    assert!(
+        matches!(&s.sync, SyncState::RemoteAhead { latest } if latest.id == v2),
+        "{:?}",
+        s.sync
+    );
+
+    // Without catching up, every changed file is a conflict.
+    let err = pull_latest(&e, "k", &b, Overwrite::Refuse).unwrap_err();
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths, &[b.join("edit.txt"), b.join("sub/deep.txt")]);
+
+    write(&b.join("notes.txt"), b"B's own, never pushed\n");
+    let r = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap();
+    assert_eq!(
+        (r.written, r.unchanged, r.removed, r.extra_local),
+        (3, 1, 1, 1)
+    );
+    let mut expected = tree(&a);
+    expected.push(("notes.txt".into(), b"B's own, never pushed\n".to_vec()));
+    expected.sort();
+    assert_eq!(tree(&b), expected);
+    assert_eq!(base_of(&dvc_beside(&b)), Some(v2));
+
+    std::fs::remove_file(b.join("notes.txt")).unwrap();
+    let s = folder::status(&e.remote, &b, &opts("k")).unwrap();
+    assert!(matches!(s.sync, SyncState::InSync), "{:?}", s.sync);
+}
+
+#[test]
+fn a_catch_up_pull_refuses_files_changed_since_the_base_and_writes_nothing() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    let v1 = base_of(&dvc_beside(&b)).unwrap();
+    // B edits a file A left alone, and one A removes.
+    write(&b.join("keep.txt"), b"B's edit\n");
+    write(&b.join("gone.txt"), b"B's edit\n");
+    push_v2(&e, "k", &a);
+
+    let before = tree(&b);
+    let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths, &[b.join("keep.txt"), b.join("gone.txt")]);
+    assert_eq!(tree(&b), before, "nothing written or removed");
+    assert_eq!(base_of(&dvc_beside(&b)), Some(v1));
+
+    // With no .dvc beside it, nothing is known to be unchanged.
+    write(&b.join("keep.txt"), b"same\n");
+    write(&b.join("gone.txt"), b"removed in v2\n");
+    std::fs::remove_file(dvc_beside(&b)).unwrap();
+    let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths, &[b.join("edit.txt"), b.join("sub/deep.txt")]);
+}
+
+#[test]
+fn a_catch_up_pull_leaves_a_file_written_while_it_runs() {
+    let e = env();
+    // Written between being checked and being replaced.
+    let (a, b) = two_hosts(&e, "replaced");
+    push_v2(&e, "replaced", &a);
+    let target = b.join("edit.txt");
+    let meanwhile = |path: PathBuf| {
+        Progress::new(move |event| {
+            if let ProgressEvent::Started {
+                phase: Phase::Downloading,
+                ..
+            } = event
+            {
+                std::fs::write(&path, b"written meanwhile\n").unwrap();
+            }
+        })
+    };
+    let pull = |key: &str, into: &Path, progress| {
+        folder::pull(
+            &e.remote,
+            &history(key, Selector::Latest),
+            &PullOptions {
+                overwrite: Overwrite::IfUnchanged,
+                progress,
+                ..pull_opts(Some(into.to_path_buf()))
+            },
+        )
+    };
+    let err = pull("replaced", &b, meanwhile(target.clone())).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (target.as_path(), &Refusal::ChangedWhilePulling)
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"written meanwhile\n");
+
+    // Written between being checked and being removed.
+    let (a, b) = two_hosts(&e, "removed");
+    std::fs::remove_file(a.join("gone.txt")).unwrap();
+    let _ = folder::push(&e.remote, &a, &opts("removed")).unwrap();
+    let gone = b.join("gone.txt");
+    let v1 = base_of(&dvc_beside(&b));
+    let err = pull("removed", &b, meanwhile(gone.clone())).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (gone.as_path(), &Refusal::ChangedWhilePulling)
+    );
+    assert_eq!(std::fs::read(&gone).unwrap(), b"written meanwhile\n");
+    assert_eq!(base_of(&dvc_beside(&b)), v1, "the base moved");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_root_confines_push_and_pull_against_symlinks_at_every_level() {
+    use std::os::unix::fs::symlink;
+    let e = env();
+    let root = e.data.join("dataset");
+    let outside = e.data.join("outside");
+    let secret = outside.join("private/secret.txt");
+    write(&secret, b"not the dataset's\n");
+    write(&root.join("real/out/f.txt"), b"x\n");
+    symlink(&outside, root.join("linked")).unwrap();
+    symlink(root.join("real/out"), root.join("aliased")).unwrap();
+    let push_in = |root: &Path, rel: &str| {
+        folder::push(
+            &e.remote,
+            Path::new(rel),
+            &PushOptions {
+                root: Some(root.to_path_buf()),
+                ..opts("k")
+            },
+        )
+    };
+    let status_in = |rel: &str| {
+        folder::status(
+            &e.remote,
+            Path::new(rel),
+            &PushOptions {
+                root: Some(root.clone()),
+                ..opts("k")
+            },
+        )
+    };
+    let refusal = |err: anyhow::Error| {
+        let (path, reason) = refused(&err);
+        (path.to_path_buf(), reason.clone())
+    };
+    let redirected = |at: PathBuf| (at, Refusal::SymlinkedComponent);
+
+    // A directory on the way, and the output itself.
+    for (rel, at) in [
+        ("linked/private", root.join("linked")),
+        ("aliased", root.join("aliased")),
+    ] {
+        assert_eq!(
+            refusal(push_in(&root, rel).unwrap_err()),
+            redirected(at.clone())
+        );
+        assert_eq!(refusal(status_in(rel).unwrap_err()), redirected(at));
+    }
+    // Its .dvc.
+    symlink(&secret, root.join("real/out.dvc")).unwrap();
+    assert_eq!(
+        refusal(push_in(&root, "real/out").unwrap_err()),
+        redirected(root.join("real/out.dvc"))
+    );
+    std::fs::remove_file(root.join("real/out.dvc")).unwrap();
+    // Paths that are not plain names below the root.
+    for rel in [
+        "../outside/private",
+        "./real/out",
+        "",
+        outside.join("private").to_str().unwrap(),
+    ] {
+        assert_eq!(
+            refusal(push_in(&root, rel).unwrap_err()),
+            (PathBuf::from(rel), Refusal::OutsideRoot)
+        );
+    }
+    assert_eq!(
+        refusal(push_in(&root, "real/out/f.txt/below").unwrap_err()),
+        (root.join("real/out/f.txt"), Refusal::NotADirectory)
+    );
+    assert!(remote_keys(&e.store).is_empty(), "something was published");
+    assert!(!outside.join("private.dvc").exists());
+
+    // The root itself may be a symlink.
+    symlink(&root, e.data.join("root-link")).unwrap();
+    let pushed = push_in(&e.data.join("root-link"), "real/out").unwrap();
+    assert!(
+        matches!(pushed.outcome, Pushed::Published { .. }),
+        "{:?}",
+        pushed.outcome
+    );
+
+    let pull_in = |source: PointerSource, into: Option<&str>| {
+        folder::pull(
+            &e.remote,
+            &source,
+            &PullOptions {
+                root: Some(root.clone()),
+                ..pull_opts(into.map(PathBuf::from))
+            },
+        )
+    };
+    let latest = || history("k", Selector::Latest);
+    assert_eq!(
+        refusal(pull_in(latest(), Some("linked/restored")).unwrap_err()),
+        redirected(root.join("linked"))
+    );
+    assert!(!outside.join("restored").exists());
+    assert_eq!(
+        refusal(pull_in(latest(), Some("aliased")).unwrap_err()),
+        redirected(root.join("aliased"))
+    );
+    symlink(&secret, root.join("restored.dvc")).unwrap();
+    assert_eq!(
+        refusal(pull_in(latest(), Some("restored")).unwrap_err()),
+        redirected(root.join("restored.dvc"))
+    );
+    assert_eq!(std::fs::read(&secret).unwrap(), b"not the dataset's\n");
+    std::fs::remove_file(root.join("restored.dvc")).unwrap();
+    // A .dvc source reached through a symlinked directory.
+    std::fs::copy(root.join("real/out.dvc"), outside.join("out.dvc")).unwrap();
+    assert_eq!(
+        refusal(pull_in(PointerSource::File("linked/out.dvc".into()), None).unwrap_err()),
+        redirected(root.join("linked"))
+    );
+    assert!(!outside.join("out").exists());
+
+    pull_in(latest(), Some("restored")).unwrap();
+    assert_eq!(tree(&root.join("restored")), tree(&root.join("real/out")));
+    std::fs::remove_dir_all(root.join("real/out")).unwrap();
+    pull_in(PointerSource::File("real/out.dvc".into()), None).unwrap();
+    assert_eq!(tree(&root.join("real/out")), tree(&root.join("restored")));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_root_refuses_a_junction_on_the_way_to_the_output() {
+    let e = env();
+    let root = e.data.join("dataset");
+    let outside = e.data.join("outside");
+    write(&outside.join("private/secret.txt"), b"not the dataset's\n");
+    std::fs::create_dir_all(&root).unwrap();
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(root.join("linked"))
+        .arg(&outside)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let err = folder::push(
+        &e.remote,
+        Path::new("linked/private"),
+        &PushOptions {
+            root: Some(root.clone()),
+            ..opts("k")
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (root.join("linked").as_path(), &Refusal::SymlinkedComponent)
+    );
+    write(&e.data.join("src/f.txt"), b"x\n");
+    let _ = folder::push(&e.remote, &e.data.join("src"), &opts("k")).unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &history("k", Selector::Latest),
+        &PullOptions {
+            root: Some(root.clone()),
+            ..pull_opts(Some("linked/restored".into()))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (root.join("linked").as_path(), &Refusal::SymlinkedComponent)
+    );
+    assert!(!outside.join("restored").exists());
+    assert!(!outside.join("restored.dvc").exists());
+}
+
+#[test]
+fn a_remote_that_cannot_be_opened_is_typed() {
+    let err = Remote::open(&RemoteConfig {
+        url: "s3://bucket/prefix".into(),
+        endpoint: Some("https://s3.example.invalid".into()),
+        region: None,
+        credentials: Credentials::Static {
+            access_key_id: String::new(),
+            secret_access_key: "s".into(),
+        },
+    })
+    .err()
+    .expect("must refuse");
+    assert!(
+        matches!(folder_error(&err), FolderError::CredentialsMissing),
+        "{err:#}"
+    );
+
+    let e = env();
+    let file = e.data.join("a-file");
+    write(&file, b"x");
+    let url = format!("local://{}", file.join("remote").display());
+    let err = Remote::open(&RemoteConfig {
+        url: url.clone(),
+        endpoint: None,
+        region: None,
+        credentials: Credentials::FromEnv,
+    })
+    .err()
+    .expect("must refuse");
+    assert!(
+        matches!(folder_error(&err), FolderError::RemoteUnusable { url: u } if *u == url),
+        "{err:#}"
+    );
+}
+
+/// Put a version on `e`'s remote directly: a first version of `key`
+/// holding `content`, as a push would have written it.
+fn first_version(e: &Env, key: &str, content: &[u8]) {
+    let pointer = DvcPointer {
+        output: DvcOutput::File {
+            md5: hash_reader(&mut &content[..], HashFunction::Md5).unwrap(),
+            size: content.len() as u64,
+        },
+        path: "f".into(),
+        meta: Some(BigstoreMeta::Record {
+            parents: Vec::new(),
+            writer: "test".into(),
+            time: chrono::Utc::now(),
+        }),
+    };
+    let bytes = pointer.to_yaml();
+    let id = record_id(bytes.as_bytes());
+    write(
+        &e.store
+            .join(format!("bigstore-history/{key}/root/{id}.dvc")),
+        bytes.as_bytes(),
+    );
+}
+
+#[test]
+fn a_history_with_no_head_or_too_many_to_merge_is_typed() {
+    let e = env();
+    let key = HistoryKey::new("k").unwrap();
+    // Two records each naming the other as its parent: no head.
+    let (x, y) = (record_id(b"x"), record_id(b"y"));
+    write(
+        &e.store.join(format!("bigstore-history/k/{y}/{x}.dvc")),
+        b"x",
+    );
+    write(
+        &e.store.join(format!("bigstore-history/k/{x}/{y}.dvc")),
+        b"y",
+    );
+    let f = e.data.join("f");
+    write(&f, b"local\n");
+    let err = folder::status(&e.remote, &f, &opts("k")).unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::NoHead { key: k } if *k == key),
+        "{err:#}"
+    );
+    let err = pull_latest(&e, "k", &e.data.join("r"), Overwrite::Refuse).unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::NoHead { key: k } if *k == key),
+        "{err:#}"
+    );
+
+    // Nine first versions: one more head than a version can follow.
+    let key = HistoryKey::new("nine").unwrap();
+    for i in 0..9 {
+        first_version(&e, "nine", format!("version {i}\n").as_bytes());
+    }
+    let heads = history_log(&e, "nine").unwrap();
+    let base = DvcPointer {
+        meta: Some(BigstoreMeta::Base(heads[0].id.clone())),
+        ..heads[0].pointer.clone()
+    };
+    std::fs::write(e.data.join("f.dvc"), base.to_yaml()).unwrap();
+    let before = remote_keys(&e.store);
+    let err = folder::push(
+        &e.remote,
+        &f,
+        &PushOptions {
+            resolve: Resolve::Merge,
+            ..opts("nine")
+        },
+    )
+    .unwrap_err();
+    let FolderError::TooManyHeads {
+        key: k,
+        heads: h,
+        max,
+    } = folder_error(&err)
+    else {
+        panic!("{err:#}")
+    };
+    assert_eq!((k, h.len(), *max), (&key, 9, 8));
+    assert_eq!(remote_keys(&e.store), before, "something was published");
+}
+
+#[test]
+fn a_catch_up_pull_never_discards_content_the_remote_lacks() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    push_v2(&e, "k", &a);
+    // v1's manifest stays, but the object of a file v2 removed is gone.
+    let md5 = hash_reader(&mut &b"removed in v2\n"[..], HashFunction::Md5)
+        .unwrap()
+        .to_string();
+    let object = e
+        .store
+        .join(format!("files/md5/{}/{}", &md5[..2], &md5[2..]));
+    std::fs::remove_file(&object).unwrap();
+
+    let before = tree(&b);
+    let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+    let gone = b.join("gone.txt");
+    assert_eq!(refused(&err), (gone.as_path(), &Refusal::BaseNotOnRemote));
+    assert_eq!(tree(&b), before, "nothing written or removed");
+}
+
+#[test]
+fn a_catch_up_refuses_a_file_deleted_here_but_a_restore_writes_it_again() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    std::fs::remove_file(b.join("keep.txt")).unwrap();
+    // Pulling the version B is based on restores what B deleted.
+    let r = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap();
+    assert_eq!(r.written, 1);
+    assert!(b.join("keep.txt").is_file());
+
+    // Catching up never undoes a deletion made here.
+    std::fs::remove_file(b.join("keep.txt")).unwrap();
+    let v1 = base_of(&dvc_beside(&b));
+    push_v2(&e, "k", &a);
+    let before = tree(&b);
+    let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths, &[b.join("keep.txt")]);
+    assert_eq!(tree(&b), before, "nothing written or removed");
+    assert_eq!(base_of(&dvc_beside(&b)), v1);
+}
+
+#[test]
+fn a_catch_up_refuses_a_rename_that_changes_only_case() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    // Case-only, in two steps so it works on a case-insensitive disk.
+    std::fs::rename(a.join("keep.txt"), a.join("tmp")).unwrap();
+    std::fs::rename(a.join("tmp"), a.join("Keep.txt")).unwrap();
+    let _ = folder::push(&e.remote, &a, &opts("k")).unwrap();
+
+    let before = tree(&b);
+    let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (
+            Path::new("keep.txt"),
+            &Refusal::CaseCollision {
+                other: "Keep.txt".into()
+            }
+        )
+    );
+    assert_eq!(tree(&b), before, "nothing written or removed");
+}
+
+#[test]
+fn a_catch_up_never_replaces_content_the_remote_lacks_or_has_at_another_size() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    push_v2(&e, "k", &a);
+    // "v1\n": the base content of edit.txt and sub/deep.txt, both replaced.
+    let md5 = hash_reader(&mut &b"v1\n"[..], HashFunction::Md5)
+        .unwrap()
+        .to_string();
+    let object = e
+        .store
+        .join(format!("files/md5/{}/{}", &md5[..2], &md5[2..]));
+    let replaced = [b.join("edit.txt"), b.join("sub/deep.txt")];
+    let before = tree(&b);
+    for damage in [Some(&b"truncated"[..]), None] {
+        match damage {
+            Some(bytes) => std::fs::write(&object, bytes).unwrap(),
+            None => std::fs::remove_file(&object).unwrap(),
+        }
+        let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+        let (path, reason) = refused(&err);
+        assert_eq!(reason, &Refusal::BaseNotOnRemote, "{err:#}");
+        assert!(replaced.iter().any(|p| p == path), "{}", path.display());
+        assert_eq!(tree(&b), before, "nothing written or removed");
+    }
+}
+
+#[test]
+fn a_catch_up_from_a_dvc_file_refuses_like_refuse() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    push_v2(&e, "k", &a);
+    // A copy of A's .dvc (at v2) beside B's output, still at v1 content.
+    std::fs::copy(dvc_beside(&a), dvc_beside(&b)).unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(dvc_beside(&b)),
+        &PullOptions {
+            overwrite: Overwrite::IfUnchanged,
+            ..pull_opts(None)
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::PullConflict { .. }),
+        "{err:#}"
+    );
 }

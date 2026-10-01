@@ -123,7 +123,8 @@ impl std::fmt::Debug for Credentials {
 /// An S3 client that talks only to `endpoint`, with explicit credentials.
 /// Unlike [`build_object_store`] it never defaults to AWS and never falls
 /// back to instance metadata (which stalls for seconds off-cloud): missing
-/// credentials fail here, before any request.
+/// or empty credentials fail here, before any request, as
+/// [`Error::CredentialsMissing`](super::Error::CredentialsMissing).
 pub fn build_strict_s3(
     bucket: &str,
     endpoint: &str,
@@ -136,19 +137,18 @@ pub fn build_strict_s3(
         Credentials::Static {
             access_key_id,
             secret_access_key,
-        } => (access_key_id.clone(), secret_access_key.clone()),
+        } => (Some(access_key_id.clone()), Some(secret_access_key.clone())),
         Credentials::FromEnv => {
             let env = AmazonS3Builder::from_env();
-            match (
+            (
                 env.get_config_value(&Key::AccessKeyId),
                 env.get_config_value(&Key::SecretAccessKey),
-            ) {
-                (Some(k), Some(s)) if !k.is_empty() && !s.is_empty() => (k, s),
-                _ => anyhow::bail!(
-                    "S3 credentials missing: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-                ),
-            }
+            )
         }
+    };
+    let (key_id, secret) = match (key_id, secret) {
+        (Some(k), Some(s)) if !k.is_empty() && !s.is_empty() => (k, s),
+        _ => return Err(super::Error::CredentialsMissing.into()),
     };
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)

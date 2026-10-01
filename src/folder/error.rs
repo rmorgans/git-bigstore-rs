@@ -3,15 +3,17 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::HistoryRecord;
+use super::{HistoryKey, HistoryRecord};
 use crate::dvc::RecordId;
 
 /// A refusal, or another outcome a caller may want to handle by kind, from
 /// any `bigstore::folder` function. Find it with
 /// `err.downcast_ref::<folder::Error>()`: it stays reachable whatever
 /// context is added above it. Everything else (I/O, network, a corrupt
-/// remote) is a plain [`anyhow::Error`]. `Display` is the message the CLI
-/// prints.
+/// remote) is a plain [`anyhow::Error`]. `Display` names what happened and
+/// never a command-line flag, a request URL or what the remote answered:
+/// what to do about it is the caller's to say. The ids and paths a caller
+/// needs are fields.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -33,10 +35,14 @@ pub enum Error {
         path: PathBuf,
         reason: Refusal,
     },
-    /// Local files differ from the version being pulled, under
-    /// [`Overwrite::Refuse`](super::Overwrite::Refuse). Nothing was written.
+    /// Local files differ from the version being pulled, and
+    /// [`PullOptions::overwrite`](super::PullOptions::overwrite) does not
+    /// allow replacing them: under [`Overwrite::Refuse`](super::Overwrite::Refuse)
+    /// any differing file, under [`Overwrite::IfUnchanged`](super::Overwrite::IfUnchanged)
+    /// one changed since the `.dvc`'s base. Nothing was written.
     PullConflict { paths: Vec<PathBuf> },
-    /// No version in the history matches the selector (or it is empty).
+    /// No version in the history matches the selector, or the history is
+    /// empty.
     NoSuchVersion,
     /// A version id prefix matches more than one version.
     AmbiguousId {
@@ -54,6 +60,17 @@ pub enum Error {
     /// An `s3://` remote without an endpoint: folder mode never defaults to
     /// AWS.
     EndpointRequired,
+    /// An `s3://` remote without credentials: with
+    /// [`Credentials::FromEnv`](super::Credentials::FromEnv),
+    /// `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` is unset or empty; with
+    /// [`Credentials::Static`](super::Credentials::Static), either string
+    /// is empty. No request was made.
+    CredentialsMissing,
+    /// [`Remote::open`](super::Remote::open) could not make a client for
+    /// `url` (a URL it cannot parse, no TLS crypto compiled in, a `local://`
+    /// directory it cannot create…). No request was made. The reason is the
+    /// next error in the chain.
+    RemoteUnusable { url: String },
     /// An exclude pattern that cannot be compiled (see
     /// [`Excludes`](super::Excludes)). The reason is the next error in the
     /// chain.
@@ -92,9 +109,21 @@ pub enum Error {
     },
     /// The history has forked: pushes from one base raced, and each landed.
     /// A pull of `Latest`, or a push, would have to pick one; nothing was
-    /// written or published. Pull one head by id, reconcile the others into
-    /// it, and push with [`Resolve::Merge`](super::Resolve::Merge).
+    /// written or published. To join them, pull one head by id, reconcile
+    /// the others into it, and push with [`Resolve::Merge`](super::Resolve::Merge).
     Diverged { heads: Vec<RecordId> },
+    /// A push with [`Resolve::Merge`](super::Resolve::Merge) of a history
+    /// with more heads than one version can follow (`max`). Nothing was
+    /// published.
+    TooManyHeads {
+        key: HistoryKey,
+        heads: Vec<RecordId>,
+        max: usize,
+    },
+    /// The history has versions, but each follows another, so none is the
+    /// latest: the remote's history is damaged. Nothing was written or
+    /// published.
+    NoHead { key: HistoryKey },
 }
 
 /// Why a path was refused.
@@ -177,6 +206,25 @@ pub enum Refusal {
     ExecutableInDirectory,
     /// A file appeared at a path while pulling; it was left untouched.
     AppearedWhilePulling,
+    /// Under [`Overwrite::IfUnchanged`](super::Overwrite::IfUnchanged), a
+    /// file the pull would replace or remove holds base content that is
+    /// not on the remote (missing, or not the size it has here): the local
+    /// file may be its only copy. Nothing was written.
+    BaseNotOnRemote,
+    /// Under [`Overwrite::IfUnchanged`](super::Overwrite::IfUnchanged), a
+    /// file changed or vanished between being checked and being replaced
+    /// or removed; it was left as it is.
+    ChangedWhilePulling,
+
+    // Push and pull with a `root`.
+    /// A path given relative to [`PushOptions::root`](super::PushOptions::root)
+    /// or [`PullOptions::root`](super::PullOptions::root) that is absolute,
+    /// empty, or holds `.` or `..`.
+    OutsideRoot,
+    /// A symlink, junction or other reparse point on the way from the root
+    /// to the output, at the output itself, or at its `.dvc`: following it
+    /// could read or write outside the root.
+    SymlinkedComponent,
 }
 
 impl fmt::Display for Error {
@@ -189,8 +237,7 @@ impl fmt::Display for Error {
             Self::PullConflict { paths } => {
                 write!(
                     f,
-                    "{} local file(s) differ from the version being pulled (nothing written; \
-                     use force to replace):",
+                    "{} local file(s) differ from the version being pulled; nothing written:",
                     paths.len()
                 )?;
                 for p in paths {
@@ -214,6 +261,11 @@ impl fmt::Display for Error {
                 "S3 remote needs an endpoint (e.g. https://s3.ap-southeast-2.wasabisys.com); \
                  folder mode never defaults to AWS",
             ),
+            Self::CredentialsMissing => f.write_str(
+                "S3 credentials missing: the access key id or the secret access key is unset or \
+                 empty",
+            ),
+            Self::RemoteUnusable { url } => write!(f, "cannot open remote {url}"),
             Self::InvalidExclude { pattern } => write!(f, "invalid exclude pattern {pattern:?}"),
             Self::UnsupportedRemote { url } => write!(
                 f,
@@ -235,18 +287,24 @@ impl fmt::Display for Error {
                         "this output has no base version (no .dvc from a push or pull), ",
                     )?,
                 }
-                write!(
-                    f,
-                    "but the latest is {}: nothing pushed; set local changes aside, pull the \
-                     latest version, redo them and push again",
-                    heads_list(heads)
-                )
+                write!(f, "but the latest is {}: nothing pushed", heads_list(heads))
             }
             Self::Diverged { heads } => write!(
                 f,
-                "history has forked: versions {} were each pushed from the same base; pull one \
-                 with its id, reconcile the others into it, then push with merge",
+                "history has forked: versions {} were each pushed from the same base; nothing \
+                 written or published",
                 heads_list(heads)
+            ),
+            Self::TooManyHeads { key, heads, max } => write!(
+                f,
+                "history {} has {} heads; one version can follow at most {max}",
+                key.as_str(),
+                heads.len()
+            ),
+            Self::NoHead { key } => write!(
+                f,
+                "history {} has no latest version: each of its versions follows another",
+                key.as_str()
             ),
         }
     }
@@ -319,10 +377,26 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
             path.to_string_lossy()
         ),
         Refusal::AppearedWhilePulling => write!(f, "{p} appeared while pulling; left untouched"),
+        Refusal::BaseNotOnRemote => write!(
+            f,
+            "{p} would be replaced or removed, but its content is not on the remote; \
+             refusing to discard what may be its only copy"
+        ),
         Refusal::ExecutableInDirectory => write!(
             f,
             "{p} is marked executable (`isexec`) inside a directory output; pull restores \
              modes only for a single-file output, so it refuses rather than drop the mark"
+        ),
+        Refusal::ChangedWhilePulling => {
+            write!(f, "{p} changed while pulling; left as it is")
+        }
+        Refusal::OutsideRoot => write!(
+            f,
+            "{p} is not a relative path of plain names, so it may lead outside the root"
+        ),
+        Refusal::SymlinkedComponent => write!(
+            f,
+            "{p} is a symlink or another reparse point; refusing to read or write through it"
         ),
     }
 }

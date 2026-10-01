@@ -99,15 +99,20 @@ pub struct Remote {
 
 impl Remote {
     /// Refuses, as [`Error::UnsupportedRemote`], any URL but `s3://`,
-    /// `local://` (`file://`) and `rclone://`, and, as
-    /// [`Error::EndpointRequired`], `s3://` without an endpoint.
+    /// `local://` (`file://`) and `rclone://`; as [`Error::EndpointRequired`],
+    /// `s3://` without an endpoint; and as [`Error::CredentialsMissing`],
+    /// `s3://` without credentials. Any other failure to make a client is
+    /// [`Error::RemoteUnusable`].
     pub fn open(config: &RemoteConfig) -> Result<Self> {
         let unsupported = || Error::UnsupportedRemote {
             url: config.url.clone(),
         };
+        let unusable = || Error::RemoteUnusable {
+            url: config.url.clone(),
+        };
         let cfg = match config.url.split_once("://") {
             Some(("s3" | "local" | "file" | "rclone", _)) => {
-                BigstoreConfig::from_url(&config.url, None)?
+                BigstoreConfig::from_url(&config.url, None).with_context(unusable)?
             }
             _ => return Err(unsupported().into()),
         };
@@ -119,11 +124,15 @@ impl Remote {
                     endpoint,
                     config.region.as_deref(),
                     &config.credentials,
-                )?;
+                )
+                .map_err(|err| match err.downcast_ref::<backend::Error>() {
+                    Some(backend::Error::CredentialsMissing) => Error::CredentialsMissing.into(),
+                    _ => err.context(unusable()),
+                })?;
                 (Store::from_object_store(store.into()), prefix.clone())
             }
             BackendConfig::Local { .. } | BackendConfig::Rclone { .. } => {
-                (Store::open(&cfg)?, String::new())
+                (Store::open(&cfg).with_context(unusable)?, String::new())
             }
             _ => return Err(unsupported().into()),
         };
@@ -418,11 +427,21 @@ pub struct PushOptions {
     pub resolve: Resolve,
     /// Who pushes, recorded in each version: this host's name by default.
     pub writer: String,
+    /// The directory the output must stay inside. When set, the output
+    /// path given to [`push`] and [`status`] is relative to it, of plain
+    /// names only, and nothing from `root` down to the output, nor the
+    /// output or its `.dvc`, may be a symlink, junction or other reparse
+    /// point ([`Refusal::OutsideRoot`], [`Refusal::SymlinkedComponent`]).
+    /// `root` itself may be one. Inside a directory output, a symlink to a
+    /// file is still backed up with its target's content, as DVC does.
+    /// `None` (the default): the output path is used as given.
+    pub root: Option<PathBuf>,
 }
 
 impl PushOptions {
     /// Push to `history` with 8 jobs, the default excludes, a token nobody
-    /// else can cancel, no progress reports, forks refused, as this host.
+    /// else can cancel, no progress reports, forks refused, as this host,
+    /// with no root.
     pub fn new(history: HistoryKey) -> Self {
         Self {
             history,
@@ -432,6 +451,7 @@ impl PushOptions {
             progress: Progress::default(),
             resolve: Resolve::default(),
             writer: gethostname::gethostname().to_string_lossy().into_owned(),
+            root: None,
         }
     }
 }
@@ -449,8 +469,14 @@ pub enum Resolve {
     Merge,
 }
 
+/// What [`push`] did. Look at [`outcome`](Self::outcome): a push that
+/// forked the history published its version, but is not a plain success.
 #[derive(Debug)]
+#[non_exhaustive]
+#[must_use = "a push may have forked the history: check `outcome`"]
 pub struct PushReport {
+    /// What the push did to history.
+    pub outcome: Pushed,
     /// The pointer written, with the version as its base.
     pub pointer: DvcPointer,
     /// The `.dvc` file written (or already identical) next to the output.
@@ -467,13 +493,33 @@ pub struct PushReport {
     /// The version the output now is: the one published, or the head it
     /// already was.
     pub version: RecordId,
-    /// Remote key of the history record published; `None` if the output
-    /// already was the latest version.
-    pub history_record: Option<String>,
-    /// Versions another push published from the same base while this one
-    /// ran: the history has forked, and the next push is refused until a
-    /// push with [`Resolve::Merge`] joins it. Empty normally.
-    pub forked_with: Vec<RecordId>,
+}
+
+/// What a push did to its output's history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Pushed {
+    /// The output already was the latest version: nothing was published.
+    AlreadyLatest,
+    /// A version was published, under the remote key `record`, and is the
+    /// latest.
+    Published { record: String },
+    /// A version was published under `record` and the `.dvc` written, but
+    /// the versions `with` were published from the same base while this
+    /// push ran: the history has forked. Until a push with
+    /// [`Resolve::Merge`] joins the heads, every push of this output is
+    /// [`Error::Diverged`], and so is a pull of [`Selector::Latest`].
+    Forked { record: String, with: Vec<RecordId> },
+}
+
+impl Pushed {
+    /// The remote key of the history record published, if one was.
+    pub fn record(&self) -> Option<&str> {
+        match self {
+            Self::AlreadyLatest => None,
+            Self::Published { record } | Self::Forked { record, .. } => Some(record),
+        }
+    }
 }
 
 /// Back up `output` (a directory or a single file).
@@ -493,7 +539,7 @@ pub struct PushReport {
 /// record, under a name never written before, then the local `.dvc` with
 /// the new base. A failure at any step leaves at most unreferenced objects
 /// behind, or a record the next push adopts. Last, history is listed again
-/// to report a push that raced this one ([`PushReport::forked_with`]).
+/// to report a push that raced this one ([`Pushed::Forked`]).
 /// Files are snapshotted while hashed, so an append during the push can
 /// never produce an object whose content does not match its key.
 ///
@@ -506,6 +552,7 @@ pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushRe
 
 /// [`push`] on the caller's tokio runtime (see [the module docs](self)).
 pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
+    let output = &confine(opts.root.as_deref(), output).await?;
     let (name, pointer_path, local) = locate(output).await?;
     let mut scratch = stage(output, name, opts, |s| s).await?;
     let published = publish(
@@ -518,6 +565,7 @@ pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> R
     .await;
     let staged = &scratch.get().0;
     let report = published.map(|p| PushReport {
+        outcome: p.outcome,
         pointer: p.pointer,
         pointer_path,
         files: staged.files,
@@ -526,8 +574,6 @@ pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> R
         empty_dirs: staged.empty_dirs,
         warnings: staged.warnings.clone(),
         version: p.version,
-        history_record: p.history_record,
-        forked_with: p.forked_with,
     });
     scratch.delete().await;
     report
@@ -535,12 +581,11 @@ pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> R
 
 /// What [`publish`] did.
 struct Published {
+    outcome: Pushed,
     pointer: DvcPointer,
     uploaded: usize,
     already_present: usize,
     version: RecordId,
-    history_record: Option<String>,
-    forked_with: Vec<RecordId>,
 }
 
 /// Publish a staged output, whose `.dvc` is `local`, in push's order:
@@ -598,20 +643,23 @@ async fn publish(
         ..staged.pointer.clone()
     };
     write_pointer_file(pointer_path, &pointer).await?;
-    let (history_record, forked_with) = match published {
-        Some((key, parents)) => {
-            let raced = history::forked_with(remote, &opts.history, &version, &parents).await?;
-            (Some(key), raced)
+    let outcome = match published {
+        Some((record, parents)) => {
+            let with = history::forked_with(remote, &opts.history, &version, &parents).await?;
+            if with.is_empty() {
+                Pushed::Published { record }
+            } else {
+                Pushed::Forked { record, with }
+            }
         }
-        None => (None, Vec::new()),
+        None => Pushed::AlreadyLatest,
     };
     Ok(Published {
+        outcome,
         pointer,
         uploaded,
         already_present,
         version,
-        history_record,
-        forked_with,
     })
 }
 
@@ -653,8 +701,9 @@ pub enum SyncState {
     /// version.
     LocalAhead,
     /// The history has a newer version than the output's base, and the
-    /// output has not changed since its `.dvc`: pull to catch up. Push
-    /// refuses ([`Error::StaleBase`]).
+    /// output has not changed since its `.dvc`: a pull with
+    /// [`Overwrite::IfUnchanged`] catches up. Push refuses
+    /// ([`Error::StaleBase`]).
     RemoteAhead { latest: HistoryRecord },
     /// The output changed, and the latest version is not its base (or it
     /// has none): push refuses ([`Error::StaleBase`]). Set the changes
@@ -685,6 +734,7 @@ pub async fn status_async(
     output: &Path,
     opts: &PushOptions,
 ) -> Result<StatusReport> {
+    let output = &confine(opts.root.as_deref(), output).await?;
     let (name, _, local) = locate(output).await?;
     let scratch = stage(output, name, opts, |s| Hashed {
         md5: s.md5().clone(),
@@ -761,6 +811,81 @@ async fn locate(output: &Path) -> Result<(String, PathBuf, Option<DvcPointer>)> 
         Ok((name, pointer_path, existing))
     })
     .await
+}
+
+/// Where `path` is: with a `root`, `path` is relative to it and confined
+/// to it (see [`PushOptions::root`]); without one, `path` as given.
+async fn confine(root: Option<&Path>, path: &Path) -> Result<PathBuf> {
+    match root {
+        None => Ok(path.to_path_buf()),
+        Some(root) => {
+            let (root, path) = (root.to_path_buf(), path.to_path_buf());
+            backend::blocking(move || confine_in(&root, &path)).await
+        }
+    }
+}
+
+/// `root.join(rel)`, once `rel` is checked to be relative, plain names
+/// only, and nothing from `root` down to it, nor it or `<it>.dvc`, is a
+/// symlink, junction or other reparse point. Something other than a
+/// directory on the way is refused; a directory that does not exist yet
+/// ends the check (a pull creates it, and what it holds). Blocks.
+fn confine_in(root: &Path, rel: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let refused = |path: PathBuf, reason| Error::Refused { path, reason };
+    let names = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| refused(rel.to_path_buf(), Refusal::OutsideRoot))?;
+    let full = root.join(rel);
+    let mut cur = root.to_path_buf();
+    for (i, name) in names.iter().enumerate() {
+        cur.push(name);
+        let last = i + 1 == names.len();
+        let meta = match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && last => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(full),
+            Err(e) => return Err(e).with_context(|| format!("failed to stat {}", cur.display())),
+        };
+        if redirects(&meta) {
+            return Err(refused(cur, Refusal::SymlinkedComponent).into());
+        }
+        if !last && !meta.is_dir() {
+            return Err(refused(cur, Refusal::NotADirectory).into());
+        }
+    }
+    let mut dvc = full.clone().into_os_string();
+    dvc.push(".dvc");
+    let dvc = PathBuf::from(dvc);
+    match std::fs::symlink_metadata(&dvc) {
+        Ok(meta) if redirects(&meta) => Err(refused(dvc, Refusal::SymlinkedComponent).into()),
+        Ok(_) => Ok(full),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(full),
+        Err(e) => Err(e).with_context(|| format!("failed to stat {}", dvc.display())),
+    }
+}
+
+/// Whether this entry is a redirect the root confinement refuses: a symlink,
+/// or on Windows any reparse point. That is stricter than needed: besides
+/// symlinks, junctions and mount points, it refuses cloud placeholders
+/// (OneDrive Files-On-Demand) and compressed or deduplicated files, which
+/// lead nowhere else, on the way to the output.
+fn redirects(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
 }
 
 enum Retry {
@@ -1193,16 +1318,32 @@ pub enum PointerSource {
     History { key: HistoryKey, at: Selector },
 }
 
+/// What pull does with a local file that differs from the version being
+/// restored. Every file it replaces or removes is hashed again just before,
+/// so one written meanwhile is left as it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Overwrite {
-    /// Refuse if any local file differs from the version being restored.
+    /// Refuse if any local file differs, as [`Error::PullConflict`].
     Refuse,
-    /// Replace differing files.
+    /// Catch up: replace a differing file only if it still has the content
+    /// the `.dvc` beside the output records (its base: the version it was
+    /// last pushed or pulled as), and remove a file that version had, still
+    /// unchanged, that the version being restored does not; both are in
+    /// the base version on the remote. Any other differing file, and a file
+    /// the version removed but that changed locally, is
+    /// [`Error::PullConflict`]. A pull from a `.dvc` file
+    /// ([`PointerSource::File`]) has no other record of the local content,
+    /// so there this is [`Overwrite::Refuse`]; so is a pull with no `.dvc`
+    /// beside `into`, or one whose content is not on the remote.
+    IfUnchanged,
+    /// Replace differing files, whatever they hold.
     Force,
 }
 
 /// How to pull. `PullOptions::default()` restores beside the `.dvc`,
-/// refuses to replace differing files, runs 8 jobs and cannot be cancelled.
+/// refuses to replace differing files, runs 8 jobs, cannot be cancelled
+/// and has no root.
 #[derive(Debug, Clone)]
 pub struct PullOptions {
     /// Where to restore. Defaults to the `.dvc` file's `<dir>/<path>`;
@@ -1214,6 +1355,14 @@ pub struct PullOptions {
     /// fully restored, never partly written.
     pub cancel: CancelToken,
     pub progress: Progress,
+    /// The directory the pull must stay inside. When set, `into` and a
+    /// [`PointerSource::File`] are relative to it and confined to it as
+    /// [`PushOptions::root`] says: nothing from `root` down to the output,
+    /// nor the output or its `.dvc`, may be a symlink, junction or other
+    /// reparse point. Below the output, as without a root, every directory
+    /// must be a real one and every file a regular one. `None` (the
+    /// default): paths are used as given.
+    pub root: Option<PathBuf>,
 }
 
 impl Default for PullOptions {
@@ -1224,31 +1373,37 @@ impl Default for PullOptions {
             jobs: crate::transfer::DEFAULT_CONCURRENCY,
             cancel: CancelToken::default(),
             progress: Progress::default(),
+            root: None,
         }
     }
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct PullReport {
     /// The pointer restored: for a pull from history, as written beside the
     /// output, with the version as its base.
     pub pointer: DvcPointer,
     pub written: usize,
     pub unchanged: usize,
-    /// Local files not in the version pulled. Never deleted.
+    /// Under [`Overwrite::IfUnchanged`], files removed: in the `.dvc`'s
+    /// base and unchanged since, but not in the version pulled.
+    pub removed: usize,
+    /// Local files not in the version pulled, left as they are.
     pub extra_local: usize,
 }
 
 /// Restore an output. Every target is classified before anything is written:
 /// a symlinked or non-regular path is always refused ([`Error::Refused`]);
-/// differing files are refused (as [`Error::PullConflict`]) unless forced;
-/// for a pull from history, so is a `.dvc` beside `into` that push would
-/// refuse to replace. Files are downloaded to a temp file beside their
-/// target, verified, then renamed into place — never linked. Local files
-/// not in the version are left alone. A pull from history writes its
-/// `.dvc` last, once every file is in place. A history selector that
-/// matches nothing is [`Error::NoSuchVersion`]; `Latest` in a forked
-/// history is [`Error::Diverged`].
+/// differing files are refused (as [`Error::PullConflict`]) unless
+/// [`PullOptions::overwrite`] allows replacing them; for a pull from
+/// history, so is a `.dvc` beside `into` that push would refuse to replace.
+/// Files are downloaded to a temp file beside their target, verified, then
+/// renamed into place — never linked. Local files not in the version are
+/// left alone, except as [`Overwrite::IfUnchanged`] says. A pull from
+/// history writes its `.dvc` last, once every file is in place. A history
+/// selector that matches nothing is [`Error::NoSuchVersion`]; `Latest` in a
+/// forked history is [`Error::Diverged`].
 pub fn pull(remote: &Remote, source: &PointerSource, opts: &PullOptions) -> Result<PullReport> {
     block_on("pull", pull_async(remote, source, opts))?
 }
@@ -1261,9 +1416,10 @@ pub async fn pull_async(
 ) -> Result<PullReport> {
     // The mode restored files get. Only a `.dvc` DVC wrote can mark one
     // (`isexec`); push records none, so history never does.
+    let root = opts.root.as_deref();
     let (pointer, mode, default_into, version) = match source {
         PointerSource::File(path) => {
-            let path = path.clone();
+            let path = confine(root, path).await?;
             let (pointer, mode, into) = backend::blocking(move || read_pointer_file(&path)).await?;
             (pointer, mode, Some(into), None)
         }
@@ -1272,23 +1428,30 @@ pub async fn pull_async(
             (record.pointer, WorktreeMode::Regular, None, Some(record.id))
         }
     };
-    let into = opts
-        .into
-        .clone()
-        .or(default_into)
-        .ok_or(Error::DestinationRequired)?;
-    // The `.dvc` a pull from history writes, checked before anything is.
-    let beside = match version {
+    let into = match (&opts.into, default_into, root) {
+        (Some(into), _, _) => confine(root, into).await?,
+        // Beside a `.dvc` already confined: its output name is one plain
+        // name (see `pointer_output`), checked like any other.
+        (None, Some(into), Some(root)) => {
+            let rel = into.strip_prefix(root).context("output outside its root")?;
+            confine(Some(root), rel).await?
+        }
+        (None, Some(into), None) => into,
+        (None, None, _) => return Err(Error::DestinationRequired.into()),
+    };
+    // The `.dvc` a pull from history writes, checked before anything is,
+    // and the base its old content records.
+    let (beside, base) = match version {
         Some(version) => {
-            let (path, pointer_path, _) = locate(&into).await?;
+            let (path, pointer_path, existing) = locate(&into).await?;
             let pointer = DvcPointer {
                 path,
                 meta: Some(BigstoreMeta::Base(version)),
                 ..pointer.clone()
             };
-            Some((pointer_path, pointer))
+            (Some((pointer_path, pointer)), existing)
         }
-        None => None,
+        None => (None, None),
     };
     opts.cancel.check()?;
 
@@ -1311,10 +1474,18 @@ pub async fn pull_async(
                 .await
                 .map_err(archived)?
                 .with_context(|| format!("manifest {manifest}.dir is not on the remote"))?;
-            let (root, id) = (into.clone(), manifest.clone());
-            backend::blocking(move || manifest_targets(&root, &raw, &id)).await?
+            let (at, id) = (into.clone(), manifest.clone());
+            backend::blocking(move || manifest_targets(&at, &raw, &id)).await?
         }
         DvcOutput::File { md5, .. } => vec![(into.clone(), md5.clone())],
+    };
+    // Pulling the version the output is based on catches up with nothing:
+    // it restores, as `Refuse` does (a file deleted here is written again).
+    let base = match (opts.overwrite, base) {
+        (Overwrite::IfUnchanged, Some(base)) if base.output != pointer.output => {
+            Some(base_targets(remote, &into, &base).await?)
+        }
+        _ => None,
     };
 
     let dir = matches!(pointer.output, DvcOutput::Dir { .. });
@@ -1324,9 +1495,10 @@ pub async fn pull_async(
             cancel: cancel.clone(),
             ..owned
         };
-        check_targets(&into, targets, dir, mode, &opts)
+        check_targets(&into, targets, base, dir, mode, &opts)
     })
     .await?;
+    base_on_remote(remote, &checked, opts.jobs.max(1)).await?;
     opts.progress.emit(|| ProgressEvent::Started {
         phase: Phase::Downloading,
         files: checked.by_object.values().map(|p| p.len() as u64).sum(),
@@ -1336,6 +1508,10 @@ pub async fn pull_async(
         },
     });
     let written = fetch_and_place(remote, checked.by_object, opts, mode).await?;
+    opts.cancel.check()?;
+    let remove = checked.remove;
+    let removed = remove.len();
+    backend::blocking(move || remove_unchanged(&remove)).await?;
     let pointer = match beside {
         Some((path, pointer)) => {
             let dir = path.parent().context("pointer path has no parent")?;
@@ -1350,6 +1526,7 @@ pub async fn pull_async(
         pointer,
         written,
         unchanged: checked.unchanged,
+        removed,
         extra_local: checked.extra_local,
     })
 }
@@ -1407,27 +1584,106 @@ fn manifest_targets(into: &Path, raw: &[u8], id: &Hexdigest) -> Result<Vec<(Path
         .collect()
 }
 
+/// The files of `base`, the pointer a `.dvc` beside `into` records, as
+/// their paths under `into` and md5s: what [`Overwrite::IfUnchanged`] may
+/// replace or remove. A directory whose manifest is not on the remote has
+/// none (nothing can be proven unchanged).
+async fn base_targets(
+    remote: &Remote,
+    into: &Path,
+    base: &DvcPointer,
+) -> Result<Vec<(PathBuf, Hexdigest)>> {
+    match &base.output {
+        DvcOutput::File { md5, .. } => Ok(vec![(into.to_path_buf(), md5.clone())]),
+        DvcOutput::Dir { manifest, .. } => {
+            let raw = remote
+                .store
+                .get(&remote.manifest_key(manifest), MAX_MANIFEST_BYTES)
+                .await
+                .map_err(archived)?;
+            match raw {
+                None => Ok(Vec::new()),
+                Some(raw) => {
+                    let (at, id) = (into.to_path_buf(), manifest.clone());
+                    backend::blocking(move || manifest_targets(&at, &raw, &id)).await
+                }
+            }
+        }
+    }
+}
+
+/// Refuse ([`Refusal::BaseNotOnRemote`]) unless every file
+/// [`Overwrite::IfUnchanged`] would replace or remove has its content on the
+/// remote, at the size it has here: only then is discarding the local copy
+/// recoverable. A `.dir` manifest on the remote does not prove its objects
+/// are (they can be deleted behind it), so each is asked for.
+async fn base_on_remote(remote: &Remote, checked: &Checked, jobs: usize) -> Result<()> {
+    let replaced = checked
+        .by_object
+        .values()
+        .flatten()
+        .filter_map(|(path, r)| match r {
+            Replace::Unchanged(md5) => Some((path, md5)),
+            _ => None,
+        });
+    let removed = checked.remove.iter().map(|(path, md5)| (path, md5));
+    let discarded: Vec<(&PathBuf, &Hexdigest)> = replaced.chain(removed).collect();
+    let missing = each_in_order(&discarded, jobs, |(path, md5)| async move {
+        let size = tokio::fs::metadata(long_path(path)?).await?.len();
+        let there = remote.store.head(&remote.object_key(md5)).await?;
+        Ok(there.is_none_or(|m| m.size != size).then_some(*path))
+    })
+    .await?;
+    match missing.into_iter().flatten().next() {
+        Some(path) => Err(Error::Refused {
+            path: path.clone(),
+            reason: Refusal::BaseNotOnRemote,
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
 /// What pull found locally, before downloading anything.
 struct Checked {
-    /// Each object to download, with every path to place it at and whether
-    /// the file there is replaced.
-    by_object: BTreeMap<Hexdigest, Vec<(PathBuf, bool)>>,
+    /// Each object to download, with every path to place it at and what may
+    /// be there.
+    by_object: BTreeMap<Hexdigest, Vec<(PathBuf, Replace)>>,
+    /// Files to remove once every file is placed, with the content each
+    /// must still have.
+    remove: Vec<(PathBuf, Hexdigest)>,
     unchanged: usize,
     extra_local: usize,
+}
+
+/// What placing a file may replace.
+#[derive(Clone)]
+enum Replace {
+    /// Nothing: the path must still be free.
+    Nothing,
+    /// A file still holding this content (hashed again first).
+    Unchanged(Hexdigest),
+    /// Whatever is there.
+    Anything,
 }
 
 /// Classify every target under `into`, hashing the local files a pull may
 /// replace, and refuse (or report every conflict) before anything is
 /// written; `dir` says `into` is a directory output, whose extra files are
-/// counted. Blocks.
+/// counted. `base`, for [`Overwrite::IfUnchanged`], is the content the
+/// `.dvc` beside `into` records; `None` allows replacing nothing. Blocks.
 fn check_targets(
     into: &Path,
     targets: Vec<(PathBuf, Hexdigest)>,
+    base: Option<Vec<(PathBuf, Hexdigest)>>,
     dir: bool,
     mode: WorktreeMode,
     opts: &PullOptions,
 ) -> Result<Checked> {
-    // Per target: `None` if it is already right, else whether to replace it.
+    let base = base.unwrap_or_default();
+    let in_base: std::collections::HashMap<&Path, &Hexdigest> =
+        base.iter().map(|(p, md5)| (p.as_path(), md5)).collect();
+    // Per target: `None` if it is already right, else what may be replaced.
     let mut fetch = Vec::with_capacity(targets.len());
     let mut conflicts = Vec::new();
     let mut unchanged = 0;
@@ -1444,7 +1700,7 @@ fn check_targets(
             files: 1,
             bytes: match target {
                 Target::Missing => 0,
-                Target::Same | Target::Differs => std::fs::metadata(path).map_or(0, |m| m.len()),
+                Target::Same | Target::Differs(_) => std::fs::metadata(path).map_or(0, |m| m.len()),
             },
         });
         fetch.push(match target {
@@ -1455,23 +1711,72 @@ fn check_targets(
                 }
                 None
             }
-            Target::Missing => Some(false),
-            Target::Differs => match opts.overwrite {
-                Overwrite::Refuse => {
+            // Deleted here since the base: a local change, not to undo.
+            Target::Missing if in_base.contains_key(path.as_path()) => {
+                conflicts.push(path.clone());
+                None
+            }
+            Target::Missing => Some(Replace::Nothing),
+            Target::Differs(local) => match opts.overwrite {
+                Overwrite::Force => Some(Replace::Anything),
+                Overwrite::IfUnchanged if in_base.get(path.as_path()) == Some(&&local) => {
+                    Some(Replace::Unchanged(local))
+                }
+                _ => {
                     conflicts.push(path.clone());
                     None
                 }
-                Overwrite::Force => Some(true),
             },
         });
+    }
+    // What the base had and this version does not: removed if unchanged.
+    // A name that differs from a target's only by case or normalization is
+    // the same file on macOS and Windows; removing it would remove the
+    // target, so it is refused on every OS, before anything is written.
+    let rel = |p: &Path| {
+        p.strip_prefix(into)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    let wanted: std::collections::HashSet<&Path> =
+        targets.iter().map(|(p, _)| p.as_path()).collect();
+    let folded: std::collections::HashMap<String, String> = match base.is_empty() {
+        true => Default::default(),
+        false => targets
+            .iter()
+            .map(|(p, _)| (fold_name(&rel(p)), rel(p)))
+            .collect(),
+    };
+    let mut remove = Vec::new();
+    for (path, md5) in base.iter().filter(|(p, _)| !wanted.contains(p.as_path())) {
+        opts.cancel.check()?;
+        if let Some(other) = folded.get(&fold_name(&rel(path))) {
+            return Err(Error::Refused {
+                path: PathBuf::from(rel(path)),
+                reason: Refusal::CaseCollision {
+                    other: other.clone(),
+                },
+            }
+            .into());
+        }
+        match classify_target(into, path, md5)? {
+            Target::Missing => {}
+            Target::Same => remove.push((path.clone(), md5.clone())),
+            Target::Differs(_) => conflicts.push(path.clone()),
+        }
     }
     if !conflicts.is_empty() {
         return Err(Error::PullConflict { paths: conflicts }.into());
     }
-    let extra_local = if dir { count_extra(into, &targets) } else { 0 };
+    let extra_local = if dir {
+        count_extra(into, &targets, &remove)
+    } else {
+        0
+    };
 
     // Fetch each object once, then place it at every path that needs it.
-    let mut by_object: BTreeMap<Hexdigest, Vec<(PathBuf, bool)>> = BTreeMap::new();
+    let mut by_object: BTreeMap<Hexdigest, Vec<(PathBuf, Replace)>> = BTreeMap::new();
     for ((path, md5), replace) in targets.into_iter().zip(fetch) {
         if let Some(replace) = replace {
             by_object.entry(md5).or_default().push((path, replace));
@@ -1479,9 +1784,39 @@ fn check_targets(
     }
     Ok(Checked {
         by_object,
+        remove,
         unchanged,
         extra_local,
     })
+}
+
+/// Refuse unless `path` is still a regular file holding `md5`, as
+/// [`Refusal::ChangedWhilePulling`]. Blocks.
+fn still_unchanged(path: &Path, md5: &Hexdigest) -> Result<()> {
+    let same = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => crate::hash::hash_file(path, md5.hash_fn())? == *md5,
+        Ok(_) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("failed to stat {}", path.display())),
+    };
+    if !same {
+        return Err(Error::Refused {
+            path: path.to_path_buf(),
+            reason: Refusal::ChangedWhilePulling,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Remove each file, once it is seen to still hold its content. Blocks.
+fn remove_unchanged(files: &[(PathBuf, Hexdigest)]) -> Result<()> {
+    for (path, md5) in files {
+        still_unchanged(path, md5)?;
+        std::fs::remove_file(long_path(path)?)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Where a `.dvc` file's output lives: `pointer.path` beside it. That must
@@ -1508,7 +1843,8 @@ fn pointer_output(dvc: &Path, pointer: &DvcPointer) -> Result<PathBuf> {
 enum Target {
     Missing,
     Same,
-    Differs,
+    /// A regular file with other content: its md5.
+    Differs(Hexdigest),
 }
 
 /// Classify one target. Every ancestor between `root` and the target must be
@@ -1538,10 +1874,11 @@ fn classify_target(root: &Path, path: &Path, md5: &Hexdigest) -> Result<Target> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Target::Missing),
         Err(e) => Err(e.into()),
         Ok(m) if m.is_file() => {
-            if crate::hash::hash_file(path, md5.hash_fn())? == *md5 {
+            let local = crate::hash::hash_file(path, md5.hash_fn())?;
+            if local == *md5 {
                 Ok(Target::Same)
             } else {
-                Ok(Target::Differs)
+                Ok(Target::Differs(local))
             }
         }
         Ok(_) => Err(Error::Refused {
@@ -1557,13 +1894,9 @@ fn classify_target(root: &Path, path: &Path, md5: &Hexdigest) -> Result<Target> 
 /// file on macOS (APFS, HFS+) and Windows. Refused on every OS, so a version
 /// restores the same everywhere.
 fn check_case_collisions(manifest: &Manifest) -> Result<()> {
-    use unicode_normalization::UnicodeNormalization;
     let mut seen = std::collections::HashMap::new();
     for e in manifest.entries() {
-        // Lowercasing can decompose (`İ` → `i` + dot), so normalize again.
-        let lower = e.relpath.as_str().nfc().collect::<String>().to_lowercase();
-        let folded: String = lower.nfc().collect();
-        if let Some(other) = seen.insert(folded, e.relpath.as_str()) {
+        if let Some(other) = seen.insert(fold_name(e.relpath.as_str()), e.relpath.as_str()) {
             return Err(Error::Refused {
                 path: PathBuf::from(e.relpath.as_str()),
                 reason: Refusal::CaseCollision {
@@ -1576,9 +1909,25 @@ fn check_case_collisions(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn count_extra(root: &Path, targets: &[(PathBuf, Hexdigest)]) -> usize {
-    let wanted: std::collections::HashSet<&Path> =
-        targets.iter().map(|(p, _)| p.as_path()).collect();
+/// `name` as macOS and Windows compare names: case-folded and NFC.
+fn fold_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    // Lowercasing can decompose (`İ` → `i` + dot), so normalize again.
+    let lower = name.nfc().collect::<String>().to_lowercase();
+    lower.nfc().collect()
+}
+
+/// Files under `root` that are neither targets nor about to be removed.
+fn count_extra(
+    root: &Path,
+    targets: &[(PathBuf, Hexdigest)],
+    remove: &[(PathBuf, Hexdigest)],
+) -> usize {
+    let wanted: std::collections::HashSet<&Path> = targets
+        .iter()
+        .chain(remove)
+        .map(|(p, _)| p.as_path())
+        .collect();
     walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -1593,7 +1942,7 @@ fn count_extra(root: &Path, targets: &[(PathBuf, Hexdigest)]) -> usize {
 /// even if the future is dropped meanwhile.
 async fn fetch_and_place(
     remote: &Remote,
-    by_object: BTreeMap<Hexdigest, Vec<(PathBuf, bool)>>,
+    by_object: BTreeMap<Hexdigest, Vec<(PathBuf, Replace)>>,
     opts: &PullOptions,
     mode: WorktreeMode,
 ) -> Result<usize> {
@@ -1621,7 +1970,7 @@ async fn fetch_and_place(
 /// first, then the temp file itself. Blocks.
 fn place_all(
     tmp: tempfile::NamedTempFile,
-    places: &[(PathBuf, bool)],
+    places: &[(PathBuf, Replace)],
     mode: WorktreeMode,
     progress: &Progress,
 ) -> Result<usize> {
@@ -1631,10 +1980,10 @@ fn place_all(
         std::fs::create_dir_all(parent)?;
         let mut copy = tempfile::NamedTempFile::new_in(long_path(parent)?)?;
         std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut copy)?;
-        place(copy, path, *replace, mode)?;
+        place(copy, path, replace, mode)?;
     }
     let (first, replace) = &places[0];
-    place(tmp, first, *replace, mode)?;
+    place(tmp, first, replace, mode)?;
     progress.emit(|| ProgressEvent::Advanced {
         phase: Phase::Downloading,
         files: places.len() as u64,
@@ -1645,11 +1994,12 @@ fn place_all(
 
 /// Move a verified temp file into place with `mode`'s permissions (the
 /// umask applies): never replacing a file that appeared since
-/// classification unless the caller forced replacement.
+/// classification, nor one that changed since, unless the caller forced
+/// replacement.
 fn place(
     tmp: tempfile::NamedTempFile,
     path: &Path,
-    replace: bool,
+    replace: &Replace,
     mode: WorktreeMode,
 ) -> Result<()> {
     #[cfg(unix)]
@@ -1665,7 +2015,10 @@ fn place(
     // Windows has no execute bit.
     #[cfg(not(unix))]
     let _ = mode;
-    if replace {
+    if let Replace::Unchanged(md5) = replace {
+        still_unchanged(path, md5)?;
+    }
+    if !matches!(replace, Replace::Nothing) {
         tmp.persist(long_path(path)?)
             .with_context(|| format!("failed to write {}", path.display()))?;
     } else {
