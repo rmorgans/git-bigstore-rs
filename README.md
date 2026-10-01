@@ -729,10 +729,10 @@ itself or its `.dvc`, may be a symlink or, on Windows, any reparse point
 (`Refusal::SymlinkedComponent`). That is stricter than confinement needs:
 besides symlinks, junctions and mount points it refuses OneDrive
 placeholders and compressed or deduplicated files on that path. The root
-itself may be one. Use it when the caller owns a boundary, such as a dataset folder,
-that an output named inside it must not leave. Below the output nothing
-changes: pull never writes through a symlink, and push backs up a symlink
-to a file with its target's content, as DVC does.
+itself may be one. Use it when the caller owns a boundary, such as a
+dataset folder, that an output named inside it must not leave. Below the
+output nothing changes: pull never writes through a symlink, and push
+backs up a symlink to a file with its target's content, as DVC does.
 
 Build options from `PushOptions::new(history)`, `PullOptions::default()` or
 `LogOptions::default()` and override fields with `..`, as above: options
