@@ -616,9 +616,13 @@ pulled. It replaces a differing file only if the file still has the
 content the base records, and removes a file the base had, still
 unchanged, that the version pulled does not; every other differing file,
 and a file the version removed but that changed locally, is
-`PullConflict`, before anything is written. Each file is hashed again just
-before it is replaced or removed, and one written meanwhile is left as it
-is (`Refusal::ChangedWhilePulling`). Files the base never had are kept.
+`PullConflict`, before anything is written. So is discarding content the
+remote lacks: before anything is written, each file to be replaced or
+removed must have its object on the remote at its local size (a `.dir`
+manifest does not prove its objects are there), else
+`Refusal::BaseNotOnRemote`. Each file is hashed again just before it is
+replaced or removed, and one written meanwhile is left as it is
+(`Refusal::ChangedWhilePulling`). Files the base never had are kept.
 Only a pull from history has a base (the `.dvc` beside `into`); from a
 `.dvc` file, or with none beside `into`, this refuses like
 `Overwrite::Refuse`. It never falls back to `Force`.
@@ -890,7 +894,7 @@ ids and paths are fields. Both enums are `#[non_exhaustive]`.
 | `ControlFile` (`.git`, `.hg`, `.dvc`, `.dvcignore`, `*.dvc`), `SymlinkToDirectory`, `BrokenSymlink`, `SpecialFile`, `NonPortableName { detail }`, `NotUtf8Name` | push, inside a directory | relative to the output, `/`-separated |
 | `PointerPathEscapes { output }` | pull, a `.dvc` naming an output outside its directory | the `.dvc` |
 | `UnrestorablePointer` (not a DVC 3 pointer to one md5-addressed output: `cache: false`, etag-only, several outputs, `wdir:`…; stage fields and annotations are fine) | pull, the `.dvc` | the `.dvc` |
-| `SymlinkedOutput`, `NotADirectory`, `NotRegularFile`, `AppearedWhilePulling`, `ChangedWhilePulling` (`IfUnchanged`: written between check and replace or remove) | pull, the destination | the filesystem path |
+| `SymlinkedOutput`, `NotADirectory`, `NotRegularFile`, `AppearedWhilePulling`, `ChangedWhilePulling` (`IfUnchanged`: written between check and replace or remove), `BaseNotOnRemote` (`IfUnchanged`: the content a replace or remove would discard is not on the remote) | pull, the destination | the filesystem path |
 | `OutsideRoot` | push and pull with a `root`, a path that is absolute or holds `.`/`..` | the path as given |
 | `SymlinkedComponent` | push and pull with a `root`: a symlink or reparse point from the root to the output, at the output or at its `.dvc` | the filesystem path |
 | `CaseCollision { other }`, `UnwritableName` (`\` or `:` on Windows) | pull, the manifest | the manifest name |

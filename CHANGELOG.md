@@ -8,9 +8,11 @@
   --if-unchanged`). A pull from history replaces a differing file only if
   it still has the content the `.dvc` beside `into` records (its base),
   and removes a file the base had, still unchanged, that the version
-  pulled does not; both are in the base version on the remote. Any other
-  differing file, and a removed file that changed locally, is
-  `PullConflict` before anything is written. Every file is hashed again
+  pulled does not. Each such file's object must be on the remote at its
+  local size, else `Refusal::BaseNotOnRemote`, so no discarded content is
+  lost. Any other differing file, and a removed file that changed
+  locally, is `PullConflict`; both refusals come before anything is
+  written. Every file is hashed again
   just before it is replaced or removed; one written meanwhile is left as
   it is (`Refusal::ChangedWhilePulling`). With no `.dvc` beside `into`, or
   from a `.dvc` source, it refuses like `Overwrite::Refuse`. So an output
