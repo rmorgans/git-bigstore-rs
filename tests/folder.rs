@@ -3969,6 +3969,21 @@ fn objects_lost_behind_a_manifest_are_found_by_verify_and_restored_by_repair() {
     let manifest = format!("files/md5/{}/{}.dir", manifest.prefix(), manifest.rest());
     let complete = verified(&e, KEY, &v1);
     assert_eq!((complete.objects, complete.is_complete()), (4, true));
+    // The keys a version needs: here every store file, the record included.
+    let store_files: Vec<String> = walkdir::WalkDir::new(&e.store)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|f| f.file_type().is_file())
+        .map(|f| {
+            let rel = f.path().strip_prefix(&e.store).unwrap();
+            rel.to_str().unwrap().replace('\\', "/")
+        })
+        .filter(|k| bigstore::folder::layout::kind(k) != bigstore::folder::layout::Kind::Other)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(store_files.len(), 6);
+    assert_eq!(complete.keys, store_files);
     let object = object_key(b"PAR1 geometry");
     std::fs::remove_file(e.store.join(&object)).unwrap();
 
@@ -4006,6 +4021,11 @@ fn objects_lost_behind_a_manifest_are_found_by_verify_and_restored_by_repair() {
         (lost.objects, &lost.missing[..]),
         (0, std::slice::from_ref(&manifest))
     );
+    let record = store_files
+        .iter()
+        .find(|k| k.starts_with("bigstore-history/"))
+        .unwrap();
+    assert_eq!(lost.keys, [record.clone(), manifest.clone()]);
     let repaired = folder::push(&e.remote, &w, &repair(KEY)).unwrap();
     assert_eq!(
         (repaired.outcome, repaired.uploaded),

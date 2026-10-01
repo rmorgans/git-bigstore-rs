@@ -53,6 +53,30 @@ pub(super) enum Frame {
         stored: usize,
         present: usize,
     },
+    /// Client (version 2): scrub the store, reading every file if `deep`.
+    /// Server: `scrubbed`, the damaged keys and a flush, then one
+    /// `unreadable` per unreadable file; or an `error`.
+    Scrub {
+        deep: bool,
+    },
+    Scrubbed {
+        checked: usize,
+        damaged: usize,
+        unreadable: usize,
+    },
+    Unreadable {
+        key: String,
+        reason: String,
+    },
+    /// Client (version 2): replace `key` with the bytes that follow (a
+    /// body of `size` bytes). Server: `healed`, or an `error`.
+    Heal {
+        key: String,
+        size: u64,
+    },
+    Healed {
+        outcome: Outcome,
+    },
     /// Client: the session is over.
     Close {},
     /// A refusal: what kind, and of which key. Never a message: what the far
@@ -65,6 +89,18 @@ pub(super) enum Frame {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         versions: Vec<u32>,
     },
+}
+
+/// What a heal did on the far side.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Outcome {
+    /// The damaged file went to `quarantined`; the verified bytes replaced it.
+    Replaced { quarantined: String },
+    /// The name was absent: the verified bytes were placed.
+    Placed {},
+    /// The far copy read good: nothing was written.
+    HealedByOther {},
 }
 
 impl Frame {

@@ -840,8 +840,10 @@ remote still holds every file a version needs, without downloading them
 manifest, then every object it names. `Completeness::missing` lists the
 keys it lacks, relative to the remote (a manifest gone, or whose bytes are
 not the manifest named, hides the objects behind it: `objects` is then 0).
-A damaged object shows only when it is restored. An id that is not a
-version of `key` is `NoSuchVersion`.
+Objects are asked for, not read: `Completeness::keys` lists every store
+file the version needs (record, manifest, objects), to look up in a
+scrub's report ([below](#damaged-files-scrub-and-heal)). An id that is not
+a version of `key` is `NoSuchVersion`.
 
 ```rust
 let c = folder::verify(&remote, &key, &s.heads[0])?;
@@ -919,9 +921,12 @@ ids and paths are fields. Both enums are `#[non_exhaustive]`.
 | `DestinationRequired` | a pull from history without `PullOptions::into` |
 | `Cancelled` | the caller's `CancelToken` was cancelled; a push published no history record or `.dvc`, a pull wrote no partial file and left its `.dvc` |
 | `Archived { key }` | the remote says object `key` (file, `.dir` manifest or history record) is archived and not restored (S3 `InvalidObjectState`); restore it and retry |
-| `InvalidStoreKey { key }` | `layout::verify`, or an exchange, of a key that is not a store file's |
+| `InvalidStoreKey { key }` | `layout::verify`, `integrity`, or an exchange, of a key that is not a store file's |
 | `Integrity { key }` | a store file whose bytes are not what its name says, over its size limit, or not the size announced; nothing placed |
 | `OutOfScope { key, history }` | an exchange of a record outside the history the session was opened for; nothing placed |
+| `Unreadable { key, reason }` | `integrity::replace` or `quarantine` found the file there unreadable (I/O, permission, short read); left as it is |
+| `WriteUnverified { key }` | `integrity::replace` wrote, and the file did not read back as its name says |
+| `RecordKept { key }` | `integrity::quarantine` of a history record: records are never made absent, only replaced |
 
 | `folder::Refusal` | Refused by | `path` is |
 | --- | --- | --- |
@@ -965,6 +970,54 @@ record's id (and the parents its name gives), a 0.2 record's size only;
 a manifest is at most 64 MiB and a record 64 KiB (`Error::Integrity`,
 `Error::InvalidStoreKey`).
 
+### Damaged files: scrub and heal
+
+`folder::integrity` works on any `object_store::ObjectStore` holding a
+store: a local store directory (`LocalFileSystem::new_with_prefix(dir)`,
+best `.with_fsync(true)`, as `local://` remotes are built), or an S3 prefix
+(`PrefixStore`). A store file is *good* (it verifies, or an object's or
+manifest's ETag is the md5 its name gives), *damaged* (hash-proven: read
+to exactly the size the store reported, or over its kind's limit, and not
+what its name says), *absent*, or *unreadable* (an I/O, permission or
+network error, or a read that ended short). An unreadable file is never
+changed.
+
+```rust
+use bigstore::folder::integrity::{self, ScrubOptions, Source};
+let report = integrity::scrub(&*store, &ScrubOptions::default())?; // trusts md5 ETags; `deep: true` reads everything
+for key in &report.damaged {
+    // Good bytes from a working copy, or a peer's verified copy:
+    integrity::replace(&*store, key, Source::File(good_copy))?; // Replaced | Placed | HealedByOther
+}
+integrity::quarantine(&*store, &damaged_object)?; // objects and manifests only: the name is left absent
+```
+
+- **`scrub`** lists once and ignores `Kind::Other` keys. An object or
+  manifest whose listed ETag is its name's md5 is good unread (the
+  provider hashed what it stored); everything else (records, a
+  `LocalFileSystem` ETag, multipart, a mismatch) is read and checked.
+  `deep` reads everything. `ScrubReport { checked, damaged, unreadable }`,
+  each `Unreadable { key, reason }`.
+- **`replace`** refuses bytes that are not what the key names, then reads
+  the file there again: good, it writes nothing (`HealedByOther`);
+  unreadable, nothing (`Error::Unreadable`); damaged, it copies it to
+  `quarantine/<key>.<UTC time>` in the same store (on a
+  `LocalFileSystem` a hard link, so not on FAT or exFAT), then writes the
+  new bytes in one atomic PUT (on a `LocalFileSystem`, a temp file renamed
+  over the name; files over 10 MiB by multipart upload, checked as they
+  go, aborted if any part fails). Last it checks the write: an ETag equal
+  to the md5, else a read back: not what its name says,
+  `Error::WriteUnverified`; unreadable, `Error::Unreadable` (the write may
+  be fine). Concurrent heals of one key converge on good bytes.
+- **`quarantine`** moves a damaged object or manifest to quarantine,
+  leaving the name absent (sync and `push --repair` refill names). A
+  record is refused (`Error::RecordKept`): records are never made absent.
+  On S3 the move is a copy then a delete, so it needs delete permission:
+  without it the copy lands and the damaged file stays.
+- Quarantine keys are `Kind::Other`: never scrubbed, listed or synced.
+
+Each has an `_async` twin.
+
 `folder::exchange` copies store files between two store directories over
 one byte stream, built for `ssh` the way git uses it: the far end runs
 `exchange::serve(stdin, stdout, &ServeOptions::new(build))`, this end a
@@ -974,12 +1027,14 @@ one byte stream, built for `ssh` the way git uses it: the far end runs
 use bigstore::folder::exchange::Client;
 let mut ssh = std::process::Command::new("ssh");
 ssh.args(["-T", "-o", "BatchMode=yes", "xeno", "asset-store", "backup", "serve", "--stdio"]);
-let mut far = Client::spawn(ssh)?;                    // agrees protocol version 1
+let mut far = Client::spawn(ssh)?;                    // agrees protocol version 2 (or 1)
 far.open("D:/data/.backup-store", &history, true)?;   // a path on the far machine
 let theirs = far.list()?;                             // every store file it holds
 let ours = /* the local store's keys */;
 far.send(ours.difference(&theirs), local_store)?;     // objects, then manifests, then records
 far.fetch(theirs.difference(&ours), local_store)?;
+let report = far.scrub(false)?;                       // the far side scrubs its own store
+far.heal(&key, &local_store.join(&key))?;              // replace a damaged far copy (version 2)
 far.close()?;
 ```
 
@@ -998,10 +1053,26 @@ far.close()?;
   both before anything travels, either way (`Error::OutOfScope`,
   `Error::InvalidStoreKey`).
 - **A version handshake first.** The client's first line names the
-  versions it speaks, the server's names its build; with no common version
-  both sides fail (`exchange::Error::Version`, naming the far build) before
-  any store is opened. A program that does not answer with the server's
-  line (not installed, or a banner on stdout) is `exchange::Error::NotAServer`.
+  versions it speaks (`2 1`), the server's names its build, and the server
+  picks the highest both speak (`Client::version`). With none, both sides
+  fail (`exchange::Error::Version`, naming the far build) before any store
+  is opened. A program that does not answer with the server's line (not
+  installed, or a banner on stdout) is `exchange::Error::NotAServer`.
+- **Version 2: scrub and heal.** `Client::scrub(deep)` returns the far
+  store's `ScrubReport`; `Client::heal(key, file)` sends verified bytes,
+  and the far side does what `integrity::replace` does (`HealedByOther`
+  if its copy reads good, `Code::Unreadable` if it cannot be read,
+  `Code::Unverified` if its write does not read back right). A
+  version 1 session (a far side before 0.6) works as before; scrub and heal
+  are `exchange::Error::Unsupported`, and its store's integrity is the
+  caller's to call unverified.
+- **An open guard.** `ServeOptions::with_open_guard(|dir| …)` is called
+  with the store directory on `open`, before the store is read, created or
+  written (only whether it exists is looked at first, so a guard making
+  its lock file there does not make a store the client did not create);
+  what it returns (say a lock) is held until the session ends. An `Err`
+  refuses the open as `Code::Busy`, which the client returns as
+  `exchange::Error::Busy` (a version 1 client is told `Code::Open`).
 - **The server does not outlive its client.** A thread reads its input;
   when that ends outside the client's `close` (the client was killed, the
   connection dropped), the session stops at its next step, removes the
@@ -1009,7 +1080,9 @@ far.close()?;
   the caller to exit non-zero.
 - **Errors carry codes and keys only**: a far refusal is
   `exchange::Error::Refused { code, key }` (`Code::Integrity`, `Missing`,
-  `Scope`, `Key`, `Open`, `Io`…), never text the far side wrote; its
+  `Scope`, `Key`, `Open`, `Io`, `Unreadable`…), never text the far side
+  wrote (a far scrub's report does carry each unreadable file's reason,
+  at most 1024 characters); its
   stderr is wherever the command sends it. `Client::canceller()` gives a
   handle that kills the far program from another thread; the call under
   way returns `Error::Cancelled`.

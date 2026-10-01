@@ -41,8 +41,9 @@
 //! the directory) and has one form.
 //!
 //! [`layout`] names a store's files and checks them against their names;
-//! [`exchange`] copies them between two stores over one byte stream (an
-//! `ssh` session), and only blocks.
+//! [`integrity`] finds damaged files in a store and heals them;
+//! [`exchange`] copies, scrubs and heals them between two stores over one
+//! byte stream (an `ssh` session), and only blocks.
 //!
 //! Nothing here calls git.
 
@@ -50,6 +51,7 @@ mod completeness;
 mod error;
 pub mod exchange;
 mod history;
+pub mod integrity;
 pub mod layout;
 mod snapshot;
 mod walk;

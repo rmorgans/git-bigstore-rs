@@ -23,6 +23,12 @@ pub struct Completeness {
     /// (`files/md5/xx/<30 hex>`, with `.dir` for the manifest). Empty when
     /// the version is complete.
     pub missing: Vec<String>,
+    /// Every store file the version needs, sorted, in the same form: its
+    /// history record, its manifest (a directory version), and its objects
+    /// (for a directory, those the manifest names, so none while the
+    /// manifest is missing). What to look up in an
+    /// [`integrity::ScrubReport`](super::integrity::ScrubReport).
+    pub keys: Vec<String>,
 }
 
 impl Completeness {
@@ -37,9 +43,10 @@ impl Completeness {
 /// for being there: one whose bytes do not hash to its name is reported
 /// missing, as is one that is gone (then the objects behind it are not
 /// asked for). Objects are asked for, not read: a damaged one shows only
-/// when it is restored. One listing, the record, the manifest, then the
-/// objects 8 at a time. An id that is not a version of `key` is
-/// [`Error::NoSuchVersion`](super::Error::NoSuchVersion).
+/// in a scrub ([`integrity::scrub`](super::integrity::scrub)), whose
+/// report a caller checks [`Completeness::keys`] against. One listing, the
+/// record, the manifest, then the objects 8 at a time. An id that is not a
+/// version of `key` is [`Error::NoSuchVersion`](super::Error::NoSuchVersion).
 pub fn verify(remote: &Remote, key: &HistoryKey, version: &RecordId) -> Result<Completeness> {
     block_on("verify", verify_async(remote, key, version))?
 }
@@ -51,18 +58,28 @@ pub async fn verify_async(
     version: &RecordId,
 ) -> Result<Completeness> {
     let record = history::find(remote, key, version).await?;
+    let root = remote.key("");
+    let record_rel = record
+        .key
+        .strip_prefix(&root)
+        .unwrap_or(&record.key)
+        .to_string();
+    let mut keys = vec![record_rel];
     let md5s: BTreeSet<Hexdigest> = match &record.pointer.output {
         DvcOutput::File { md5, .. } => BTreeSet::from([md5.clone()]),
         DvcOutput::Dir { manifest, .. } => {
             let rel = format!("{}.dir", object_rel(manifest));
+            keys.push(rel.clone());
             let raw = remote
                 .store
                 .get(&remote.key(&rel), MAX_MANIFEST_BYTES)
                 .await
                 .map_err(archived)?;
+            keys.sort();
             let gone = Completeness {
                 objects: 0,
                 missing: vec![rel.clone()],
+                keys: keys.clone(),
             };
             let Some(raw) = raw else {
                 return Ok(gone);
@@ -90,9 +107,12 @@ pub async fn verify_async(
         Ok((!there).then_some(rel))
     })
     .await?;
+    keys.extend(md5s.iter().map(object_rel));
+    keys.sort();
     Ok(Completeness {
         objects: md5s.len(),
         missing: missing.into_iter().flatten().collect(),
+        keys,
     })
 }
 

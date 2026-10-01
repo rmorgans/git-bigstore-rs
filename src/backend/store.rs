@@ -88,11 +88,13 @@ pub fn build_object_store(backend: &BackendConfig) -> Result<Box<dyn ObjectStore
 
 /// Build a `LocalFileSystem` store rooted at `path`, creating the directory if
 /// it does not exist yet so a fresh `local:///new/dir` works on first push.
+/// Every write is fsynced (the file, then its directory) before it returns.
 pub fn build_local_store(path: &str) -> Result<Box<dyn ObjectStore>> {
     std::fs::create_dir_all(path)
         .with_context(|| format!("failed to create local storage directory {path}"))?;
     let store = LocalFileSystem::new_with_prefix(path)
-        .context("failed to create local filesystem backend")?;
+        .context("failed to create local filesystem backend")?
+        .with_fsync(true);
     Ok(Box::new(store))
 }
 
