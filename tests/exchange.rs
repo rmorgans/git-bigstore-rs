@@ -87,6 +87,14 @@ const TESTS: &[Test] = &[
         "a_cancelled_client_stops_a_call_blocked_on_the_far_program",
         a_cancelled_client_stops_a_call_blocked_on_the_far_program,
     ),
+    (
+        "a_request_out_of_order_ends_the_session_on_both_sides",
+        a_request_out_of_order_ends_the_session_on_both_sides,
+    ),
+    (
+        "a_record_over_its_size_limit_is_refused_and_the_session_goes_on",
+        a_record_over_its_size_limit_is_refused_and_the_session_goes_on,
+    ),
 ];
 
 fn main() {
@@ -936,4 +944,61 @@ fn a_cancelled_client_stops_a_call_blocked_on_the_far_program() {
         matches!(folder_error(&err), FolderError::Cancelled),
         "{err:#}"
     );
+}
+
+fn a_request_out_of_order_ends_the_session_on_both_sides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut client, served) = session(&tmp.path().join("far"));
+    // A store is opened once per session.
+    let err = client
+        .open(tmp.path().to_str().unwrap(), &scope(), true)
+        .unwrap_err();
+    assert_eq!(far_refusal(&err), (Code::Protocol, None));
+    let err = client.list().unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<exchange::Error>(),
+            Some(exchange::Error::SessionBroken)
+        ),
+        "{err:#}"
+    );
+    let err = served.join().unwrap().unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<exchange::Error>(),
+            Some(exchange::Error::SessionBroken)
+        ),
+        "{err:#}"
+    );
+}
+
+fn a_record_over_its_size_limit_is_refused_and_the_session_goes_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (far, local) = (tmp.path().join("far"), tmp.path().join("local"));
+    push_versions(&local, &tmp.path().join("work"), "annotations", &["a\n"]);
+    let record = keys_of(&local, Kind::Record)[0].clone();
+    let (reader, writer, served) = serve_in_process();
+    let mut raw = Raw::new(reader, writer);
+    raw.open(&far, SCOPE);
+    let oversized = vec![b'x'; (64 << 10) + 1];
+    raw.json(serde_json::json!({"put": {}}));
+    raw.json(serde_json::json!({"file": {"key": record, "size": oversized.len()}}));
+    raw.body(&oversized);
+    // A valid file after it: nothing is placed after a refusal.
+    let object = keys_of(&local, Kind::Object)[0].clone();
+    let bytes = std::fs::read(local.join(&object)).unwrap();
+    raw.json(serde_json::json!({"file": {"key": object, "size": bytes.len()}}));
+    raw.body(&bytes);
+    raw.json(serde_json::json!({"end": {}}));
+    assert_eq!(
+        raw.recv(),
+        serde_json::json!({"error": {"code": "integrity", "key": record}})
+    );
+    assert!(!far.join(&record).exists() && !far.join(&object).exists());
+    assert_eq!(temps(&far), Vec::<String>::new());
+    raw.json(serde_json::json!({"list": {}}));
+    assert_eq!(raw.recv(), serde_json::json!({"listing": {}}));
+    assert!(matches!(raw.r.packet().unwrap(), Some(Packet::Flush)));
+    raw.json(serde_json::json!({"close": {}}));
+    served.join().unwrap().unwrap();
 }

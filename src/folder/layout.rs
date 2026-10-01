@@ -263,4 +263,33 @@ mod tests {
             assert!(!encoded_component(bad), "{bad}");
         }
     }
+
+    fn integrity_error(err: &anyhow::Error) -> bool {
+        matches!(err.downcast_ref::<Error>(), Some(Error::Integrity { .. }))
+    }
+
+    #[test]
+    fn a_legacy_record_is_a_record_checked_for_size_only() {
+        let key = format!(
+            "bigstore-history/a/k/20260901T000000.000000000Z-{}.dvc",
+            "f".repeat(32)
+        );
+        assert_eq!(kind(&key), Kind::Record);
+        verify(&key, b"anything at all").unwrap();
+        verify(&key, &vec![0; MAX_RECORD_BYTES as usize]).unwrap();
+        let over = vec![0; MAX_RECORD_BYTES as usize + 1];
+        assert!(integrity_error(&verify(&key, &over).unwrap_err()));
+    }
+
+    #[test]
+    fn sizes_over_a_kind_s_limit_are_refused_before_any_byte() {
+        let manifest = format!("files/md5/ab/{}.dir", "c".repeat(30));
+        let record = format!("bigstore-history/k/root/{}.dvc", "d".repeat(32));
+        let object = format!("files/md5/ab/{}", "c".repeat(30));
+        for (key, limit) in [(&manifest, MAX_MANIFEST_BYTES), (&record, MAX_RECORD_BYTES)] {
+            assert!(integrity_error(&Check::new(key, limit + 1).err().unwrap()));
+            assert!(Check::new(key, limit).is_ok());
+        }
+        assert!(Check::new(&object, u64::MAX).is_ok());
+    }
 }

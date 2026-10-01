@@ -142,29 +142,43 @@ pub(super) fn open(root: &Path, key: &str) -> Result<(File, u64)> {
     Ok((file, meta.len()))
 }
 
-/// Send `size` bytes of `file` as one body. A file that turns out shorter
-/// sends what it has: the receiver refuses it, and the session goes on.
+/// Send `size` bytes of `file`, the store file `key`, as one body. A file
+/// that cannot be read to its size sends what it had, which the receiver
+/// refuses, so the session goes on; the inner error says why it fell
+/// short. The outer one is the session's.
 pub(super) fn send_body<W: Write>(
     w: &mut PktWriter<W>,
     file: &mut File,
+    key: &str,
     size: u64,
     live: Live,
-) -> Result<()> {
+) -> Result<Option<anyhow::Error>> {
     let mut body = w.content();
     let mut buf = vec![0u8; CHUNK];
     let mut left = size;
+    let mut short = None;
     while left > 0 {
         live()?;
         let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
         let n = match file.read(&mut buf[..want]) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                short = Some(anyhow::anyhow!(
+                    "{key} ended {left} bytes short of its {size} while being sent"
+                ));
+                break;
+            }
             Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                short = Some(anyhow::Error::from(e).context(format!("failed to read {key}")));
+                break;
+            }
         };
         body.write_all(&buf[..n]).map_err(broken)?;
         left -= n as u64;
     }
     body.finish().map_err(broken)?;
-    Ok(())
+    Ok(short)
 }
 
 /// What became of a file received.

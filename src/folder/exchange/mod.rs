@@ -109,21 +109,32 @@ impl Code {
         }
     }
 
-    /// The code a local failure travels as.
+    /// The code a local failure to read or place a file travels as.
     fn of(err: &anyhow::Error) -> Self {
         match err.downcast_ref::<FolderError>() {
             Some(FolderError::InvalidStoreKey { .. }) => Self::Key,
             Some(FolderError::Integrity { .. }) => Self::Integrity,
             Some(FolderError::OutOfScope { .. }) => Self::Scope,
-            _ if err.chain().any(|e| {
-                e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-            }) =>
-            {
-                Self::Missing
-            }
             _ => Self::Io,
         }
+    }
+
+    /// The code a file asked for and not sent travels as: [`Self::Missing`]
+    /// if the store does not hold it.
+    fn of_get(err: &anyhow::Error) -> Self {
+        let absent = err.chain().any(|e| {
+            e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        });
+        match absent {
+            true => Self::Missing,
+            false => Self::of(err),
+        }
+    }
+
+    /// Whether the side that sent it ended the session with it.
+    fn ends_session(self) -> bool {
+        matches!(self, Self::Version | Self::Protocol)
     }
 }
 
@@ -452,13 +463,14 @@ impl<W: Write> Server<'_, W> {
             };
             let (mut file, size) = match opened {
                 Ok(opened) => opened,
-                Err(e) => return self.wire.send(&Frame::refusal(Code::of(&e), Some(key))),
+                Err(e) => return self.wire.send(&Frame::refusal(Code::of_get(&e), Some(key))),
             };
             self.wire.send(&Frame::File {
                 key: key.clone(),
                 size,
             })?;
-            store::send_body(&mut self.wire.w, &mut file, size, self.live)?;
+            // A file that falls short is refused by the client, which says so.
+            let _ = store::send_body(&mut self.wire.w, &mut file, &key, size, self.live)?;
         }
         self.wire.send(&Frame::Done {})
     }
@@ -544,9 +556,11 @@ pub struct Canceller {
 }
 
 impl Canceller {
-    /// Kill the far program (for a spawned client) and fail the call under
-    /// way, and every later one, with
-    /// [`folder::Error::Cancelled`](FolderError::Cancelled). Idempotent.
+    /// Fail the call under way, and every later one, with
+    /// [`folder::Error::Cancelled`](FolderError::Cancelled); for a spawned
+    /// client, kill the far program, which ends a call blocked on it. A
+    /// [`connect`](Client::connect)ed client has no program to kill: a call
+    /// blocked reading stops when its stream does. Idempotent.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         if let Some(child) = &self.child {
@@ -563,7 +577,8 @@ impl Client {
     /// version. Its stderr is left as `command` sets it (inherited by
     /// default). A program that does not answer as a server is
     /// [`Error::NotAServer`]; one speaking another version,
-    /// [`Error::Version`].
+    /// [`Error::Version`]. A command that cannot be started at all (no
+    /// `ssh` here) is the plain I/O error, not an [`Error`].
     pub fn spawn(mut command: Command) -> Result<Self> {
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = command
@@ -748,7 +763,8 @@ impl Client {
     /// key that is not a store file's, a record outside the opened history.
     /// A file the far side refuses is [`Error::Refused`] (say
     /// [`Code::Integrity`]), and nothing after it is placed there; a file
-    /// missing here stops the sending with the I/O error.
+    /// missing here, or that cannot be read whole, stops the sending with
+    /// that local error.
     pub fn send<I, S>(&mut self, keys: I, from: &Path) -> Result<Transferred>
     where
         I: IntoIterator<Item = S>,
@@ -776,7 +792,10 @@ impl Client {
                     key: key.clone(),
                     size,
                 })?;
-                store::send_body(&mut wire.w, &mut file, size, &live)?;
+                if let Some(short) = store::send_body(&mut wire.w, &mut file, key, size, &live)? {
+                    failure = Some(short);
+                    break;
+                }
             }
             wire.send(&Frame::End {})?;
             wire.flush()?;
@@ -850,7 +869,8 @@ impl Client {
     }
 
     /// Run one request on the wire. The outer `Err` ends the session (it
-    /// stays broken); the inner one is a refusal that leaves it usable.
+    /// stays broken); the inner one is a refusal that leaves it usable,
+    /// unless the far side ended the session with it.
     fn call<T>(
         &mut self,
         request: impl FnOnce(&mut Wire<Reader, Writer>) -> Result<Result<T>>,
@@ -860,7 +880,16 @@ impl Client {
             return Err(broken(()));
         };
         match request(wire) {
-            Ok(answer) => answer,
+            Ok(answer) => {
+                if let Err(e) = &answer {
+                    if let Some(Error::Refused { code, .. }) = e.downcast_ref::<Error>() {
+                        if code.ends_session() {
+                            self.wire = None;
+                        }
+                    }
+                }
+                answer
+            }
             Err(e) => {
                 self.wire = None;
                 cancel_check(&self.cancelled)?;

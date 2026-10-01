@@ -989,11 +989,14 @@ far.close()?;
   cannot rename so): a name already there is `present` (same name, same
   content). A cut session leaves no partial file under a store name, and
   a receiver places nothing after the first file it refuses. Windows paths
-  go verbatim, past `MAX_PATH`.
-- **The server refuses** a record outside the history given to `open`
-  and any key that is not a store file's (`..`, `\`, `C:`, a leading `/`,
-  a temp name). The client refuses both before anything travels
-  (`Error::OutOfScope`, `Error::InvalidStoreKey`).
+  go verbatim, past `MAX_PATH`. A store must be on a filesystem that can
+  rename without replacing or hard-link (NTFS, APFS, ext4 and the like),
+  not FAT or exFAT.
+- **The server refuses** a record sent to it outside the history given to
+  `open`, and any key that is not a store file's (`..`, `\`, `C:`, a
+  leading `/`, a temp name), whether sent or asked for. The client refuses
+  both before anything travels, either way (`Error::OutOfScope`,
+  `Error::InvalidStoreKey`).
 - **A version handshake first.** The client's first line names the
   versions it speaks, the server's names its build; with no common version
   both sides fail (`exchange::Error::Version`, naming the far build) before

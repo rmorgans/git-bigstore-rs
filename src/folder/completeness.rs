@@ -19,7 +19,7 @@ pub struct Completeness {
     /// are unknown).
     pub objects: usize,
     /// What the version needs and the remote lacks, sorted: keys relative
-    /// to the remote, as [`layout::kind`](super::layout::kind) takes them
+    /// to the remote, as [`layout::kind`] takes them
     /// (`files/md5/xx/<30 hex>`, with `.dir` for the manifest). Empty when
     /// the version is complete.
     pub missing: Vec<String>,
