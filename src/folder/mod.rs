@@ -1741,10 +1741,13 @@ fn check_targets(
     };
     let wanted: std::collections::HashSet<&Path> =
         targets.iter().map(|(p, _)| p.as_path()).collect();
-    let folded: std::collections::HashMap<String, String> = targets
-        .iter()
-        .map(|(p, _)| (fold_name(&rel(p)), rel(p)))
-        .collect();
+    let folded: std::collections::HashMap<String, String> = match base.is_empty() {
+        true => Default::default(),
+        false => targets
+            .iter()
+            .map(|(p, _)| (fold_name(&rel(p)), rel(p)))
+            .collect(),
+    };
     let mut remove = Vec::new();
     for (path, md5) in base.iter().filter(|(p, _)| !wanted.contains(p.as_path())) {
         opts.cancel.check()?;
