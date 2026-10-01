@@ -14,7 +14,8 @@
 //! | [`Kind::Other`] | anything else: a temp file (`#` in its name, `.partial`), a desktop's `.DS_Store`, an absolute or traversing key (`..`, `\`, `C:`), … |
 //!
 //! Every name is fixed by its content, so a store only ever gains files, and
-//! a file already present under its name never needs replacing.
+//! a file already present under its name never needs replacing, unless it
+//! is damaged: [`integrity`](super::integrity) finds and heals that.
 
 use anyhow::Result;
 

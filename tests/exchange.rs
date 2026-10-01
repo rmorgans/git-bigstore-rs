@@ -4,6 +4,7 @@
 //! writes to stdout, which a subprocess server needs for the protocol.
 
 use bigstore::folder::exchange::{self, Client, Code, ServeOptions};
+use bigstore::folder::integrity::Replaced;
 use bigstore::folder::layout::{self, Kind};
 use bigstore::folder::{
     self, Credentials, Error as FolderError, HistoryKey, PushOptions, Remote, RemoteConfig,
@@ -11,8 +12,10 @@ use bigstore::folder::{
 use bigstore::pktline::{self, Packet, PktReader};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Set in a subprocess of this binary: what it does instead of testing.
@@ -94,6 +97,22 @@ const TESTS: &[Test] = &[
     (
         "a_record_over_its_size_limit_is_refused_and_the_session_goes_on",
         a_record_over_its_size_limit_is_refused_and_the_session_goes_on,
+    ),
+    (
+        "versions_negotiate_to_the_highest_both_sides_speak",
+        versions_negotiate_to_the_highest_both_sides_speak,
+    ),
+    (
+        "a_far_scrub_finds_damage_and_heal_replaces_it",
+        a_far_scrub_finds_damage_and_heal_replaces_it,
+    ),
+    (
+        "an_unreadable_far_copy_is_reported_and_never_healed",
+        an_unreadable_far_copy_is_reported_and_never_healed,
+    ),
+    (
+        "an_open_guard_is_held_for_the_session_and_a_refusal_leaves_the_store_untouched",
+        an_open_guard_is_held_for_the_session_and_a_refusal_leaves_the_store_untouched,
     ),
 ];
 
@@ -273,11 +292,13 @@ type Served = std::thread::JoinHandle<anyhow::Result<()>>;
 
 /// A server on a thread, and the two pipe ends that talk to it.
 fn serve_in_process() -> (std::io::PipeReader, std::io::PipeWriter, Served) {
+    serve_in_process_with(ServeOptions::new("in-process"))
+}
+
+fn serve_in_process_with(opts: ServeOptions) -> (std::io::PipeReader, std::io::PipeWriter, Served) {
     let (to_server, client_writes) = std::io::pipe().unwrap();
     let (client_reads, from_server) = std::io::pipe().unwrap();
-    let served = std::thread::spawn(move || {
-        exchange::serve(to_server, from_server, &ServeOptions::new("in-process"))
-    });
+    let served = std::thread::spawn(move || exchange::serve(to_server, from_server, &opts));
     (client_reads, client_writes, served)
 }
 
@@ -733,24 +754,27 @@ fn an_unknown_version_fails_on_both_sides() {
     assert_eq!(raw.recv_line(), "bigstore-exchange-server in-process");
     assert_eq!(
         raw.recv(),
-        serde_json::json!({"error": {"code": "version", "versions": [1]}})
+        serde_json::json!({"error": {"code": "version", "versions": [2, 1]}})
     );
     let err = served.join().unwrap().unwrap_err();
     match err.downcast_ref::<exchange::Error>() {
         Some(exchange::Error::Version { ours, theirs, .. }) => {
-            assert_eq!((ours.as_slice(), theirs.as_slice()), (&[1][..], &[99][..]));
+            assert_eq!(
+                (ours.as_slice(), theirs.as_slice()),
+                (&[2, 1][..], &[99][..])
+            );
         }
         _ => panic!("{err:#}"),
     }
 
-    // A server speaking only version 2: the client fails naming its build.
+    // A server speaking only version 3: the client fails naming its build.
     let (client_reads, from_server) = std::io::pipe().unwrap();
     let (to_server, client_writes) = std::io::pipe().unwrap();
     let fake = std::thread::spawn(move || {
         let mut raw = Raw::new(to_server, from_server);
-        assert_eq!(raw.recv_line(), "bigstore-exchange-client 1");
+        assert_eq!(raw.recv_line(), "bigstore-exchange-client 2 1");
         raw.line("bigstore-exchange-server future-build");
-        raw.json(serde_json::json!({"error": {"code": "version", "versions": [2]}}));
+        raw.json(serde_json::json!({"error": {"code": "version", "versions": [3]}}));
     });
     let err = Client::connect(client_reads, client_writes)
         .err()
@@ -762,7 +786,10 @@ fn an_unknown_version_fails_on_both_sides() {
             theirs,
             far_build,
         }) => {
-            assert_eq!((ours.as_slice(), theirs.as_slice()), (&[1][..], &[2][..]));
+            assert_eq!(
+                (ours.as_slice(), theirs.as_slice()),
+                (&[2, 1][..], &[3][..])
+            );
             assert_eq!(far_build.as_deref(), Some("future-build"));
         }
         _ => panic!("{err:#}"),
@@ -1001,4 +1028,281 @@ fn a_record_over_its_size_limit_is_refused_and_the_session_goes_on() {
     assert!(matches!(raw.r.packet().unwrap(), Some(Packet::Flush)));
     raw.json(serde_json::json!({"close": {}}));
     served.join().unwrap().unwrap();
+}
+
+fn versions_negotiate_to_the_highest_both_sides_speak() {
+    let tmp = tempfile::tempdir().unwrap();
+    let far = tmp.path().join("far");
+
+    // This build on both sides: version 2.
+    let (client, served) = session(&far);
+    assert_eq!(client.version(), 2);
+    close(client, served);
+
+    // A client offering versions in any order gets the highest.
+    let (reader, writer, served) = serve_in_process();
+    let mut raw = Raw::new(reader, writer);
+    raw.line("bigstore-exchange-client 1 2");
+    raw.recv_line();
+    assert_eq!(raw.recv(), serde_json::json!({"version": {"version": 2}}));
+    raw.json(serde_json::json!({"close": {}}));
+    served.join().unwrap().unwrap();
+
+    // A 0.5 client (version 1 only) gets version 1, which has no scrub.
+    let (reader, writer, served) = serve_in_process();
+    let mut raw = Raw::new(reader, writer);
+    raw.open(&far, SCOPE);
+    raw.json(serde_json::json!({"scrub": {"deep": false}}));
+    assert_eq!(
+        raw.recv(),
+        serde_json::json!({"error": {"code": "protocol"}})
+    );
+    assert!(served.join().unwrap().is_err());
+
+    // A 0.5 server (version 1 only): the session works as it did, and
+    // scrub and heal are refused here, before anything is sent.
+    let (client_reads, from_server) = std::io::pipe().unwrap();
+    let (to_server, client_writes) = std::io::pipe().unwrap();
+    let far_str = far.to_str().unwrap().to_string();
+    let old = std::thread::spawn(move || {
+        let mut raw = Raw::new(to_server, from_server);
+        assert_eq!(raw.recv_line(), "bigstore-exchange-client 2 1");
+        raw.line("bigstore-exchange-server 0.5.0");
+        raw.json(serde_json::json!({"version": {"version": 1}}));
+        assert_eq!(
+            raw.recv(),
+            serde_json::json!({"open": {"store": far_str, "history": SCOPE, "create": true}})
+        );
+        raw.json(serde_json::json!({"opened": {"existed": true}}));
+        assert_eq!(raw.recv(), serde_json::json!({"close": {}}));
+    });
+    let mut client = Client::connect(client_reads, client_writes).unwrap();
+    assert_eq!(client.version(), 1);
+    assert_eq!(client.far_build(), "0.5.0");
+    client.open(far.to_str().unwrap(), &scope(), true).unwrap();
+    let unsupported = |err: anyhow::Error| {
+        assert!(
+            matches!(
+                err.downcast_ref::<exchange::Error>(),
+                Some(exchange::Error::Unsupported { version: 1 })
+            ),
+            "{err:#}"
+        )
+    };
+    unsupported(client.scrub(false).unwrap_err());
+    let object = format!("files/md5/ab/{}", "c".repeat(30));
+    unsupported(client.heal(&object, tmp.path()).unwrap_err());
+    client.close().unwrap();
+    old.join().unwrap();
+}
+
+fn a_far_scrub_finds_damage_and_heal_replaces_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (far, local) = (tmp.path().join("far"), tmp.path().join("local"));
+    push_versions(
+        &local,
+        &tmp.path().join("work"),
+        "annotations",
+        &["a\n", "b\n"],
+    );
+    let (mut client, served) = session(&far);
+    let all = listing(&local);
+    client.send(&all, &local).unwrap();
+    let report = client.scrub(false).unwrap();
+    assert_eq!(report.checked, all.len());
+    assert!(report.is_clean());
+
+    // Damage an object (truncated) and a record (one byte) on the far side,
+    // and leave entries there that are no store files.
+    let object = keys_of(&local, Kind::Object)[0].clone();
+    let record = keys_of(&local, Kind::Record)[0].clone();
+    let at = |root: &Path, key: &str| {
+        let mut path = root.to_path_buf();
+        path.extend(key.split('/'));
+        path
+    };
+    let good_object = std::fs::read(at(&local, &object)).unwrap();
+    let good_record = std::fs::read(at(&local, &record)).unwrap();
+    std::fs::write(at(&far, &object), &good_object[..good_object.len() - 1]).unwrap();
+    let mut bad_record = good_record.clone();
+    bad_record[0] ^= 1;
+    std::fs::write(at(&far, &record), &bad_record).unwrap();
+    for other in [
+        format!("quarantine/{object}.20261001T000000.000000000Z"),
+        format!("{object}#a1b2c3d4"),
+        format!("{object}.partial"),
+        ".lock".to_string(),
+    ] {
+        write(&at(&far, &other), b"not what any name says");
+    }
+
+    assert_eq!(client.list().unwrap(), all);
+    let report = client.scrub(false).unwrap();
+    assert_eq!(report.checked, all.len());
+    let mut damaged = vec![object.clone(), record.clone()];
+    damaged.sort();
+    assert_eq!(report.damaged, damaged);
+    assert!(report.unreadable.is_empty());
+
+    // Bytes that are not what the key names: refused, nothing changed.
+    let wrong = tmp.path().join("wrong");
+    std::fs::write(&wrong, b"wrong").unwrap();
+    let before = files(&far);
+    let err = client.heal(&object, &wrong).unwrap_err();
+    assert_eq!(far_refusal(&err), (Code::Integrity, Some(object.as_str())));
+    assert_eq!(files(&far), before);
+    // A record outside the session's history: refused before sending.
+    let (outside, _) = record_outside();
+    let err = client.heal(&outside, &wrong).unwrap_err();
+    assert!(matches!(folder_error(&err), FolderError::OutOfScope { .. }));
+
+    for (key, damaged_bytes) in [
+        (&object, &good_object[..good_object.len() - 1]),
+        (&record, &bad_record[..]),
+    ] {
+        let healed = client.heal(key, &at(&local, key)).unwrap();
+        let Replaced::Replaced { quarantined } = healed else {
+            panic!("{healed:?}")
+        };
+        assert!(
+            quarantined.starts_with(&format!("quarantine/{key}.")),
+            "{quarantined}"
+        );
+        assert_eq!(
+            std::fs::read(at(&far, &quarantined)).unwrap(),
+            damaged_bytes
+        );
+        assert_eq!(
+            std::fs::read(at(&far, key)).unwrap(),
+            std::fs::read(at(&local, key)).unwrap()
+        );
+    }
+    assert!(client.scrub(true).unwrap().is_clean());
+
+    // The far copy is good now: a heal is refused as healed by another,
+    // and writes nothing.
+    let before = files(&far);
+    assert_eq!(
+        client.heal(&record, &at(&local, &record)).unwrap(),
+        Replaced::HealedByOther
+    );
+    assert_eq!(files(&far), before);
+    assert_eq!(client.list().unwrap(), all);
+    close(client, served);
+    assert_eq!(temps(&far), vec![format!("{object}#a1b2c3d4")]);
+}
+
+/// A record of another dataset than `SCOPE`.
+fn record_outside() -> (String, Vec<u8>) {
+    let (key, bytes) = record("annotations", &[]);
+    (key.replace(SCOPE, "ST999_Elsewhere/dataset"), bytes)
+}
+
+fn an_unreadable_far_copy_is_reported_and_never_healed() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (far, local) = (tmp.path().join("far"), tmp.path().join("local"));
+        push_versions(&local, &tmp.path().join("work"), "annotations", &["a\n"]);
+        let (mut client, served) = session(&far);
+        client.send(listing(&local), &local).unwrap();
+        let object = keys_of(&local, Kind::Object)[0].clone();
+        let mut path = far.clone();
+        path.extend(object.split('/'));
+        std::fs::write(&path, b"damaged").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            eprintln!("skipped: permissions do not stop this user (root?)");
+            return;
+        }
+        let report = client.scrub(true).unwrap();
+        assert!(report.damaged.is_empty());
+        assert_eq!(report.unreadable.len(), 1);
+        assert_eq!(report.unreadable[0].key, object);
+        assert!(report.unreadable[0]
+            .reason
+            .to_lowercase()
+            .contains("permission denied"));
+
+        let mut good = local.clone();
+        good.extend(object.split('/'));
+        let err = client.heal(&object, &good).unwrap_err();
+        assert_eq!(far_refusal(&err), (Code::Unreadable, Some(object.as_str())));
+        close(client, served);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"damaged");
+        assert!(!far.join("quarantine").exists());
+        assert!(temps(&far).is_empty());
+    }
+}
+
+/// Set when dropped.
+struct Held(Arc<AtomicBool>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn an_open_guard_is_held_for_the_session_and_a_refusal_leaves_the_store_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (far, local) = (tmp.path().join("far"), tmp.path().join("local"));
+    push_versions(&local, &tmp.path().join("work"), "annotations", &["a\n"]);
+
+    let released = Arc::new(AtomicBool::new(false));
+    let opened: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+    let opts = {
+        let (released, opened) = (Arc::clone(&released), Arc::clone(&opened));
+        ServeOptions::new("guarded").with_open_guard(move |dir| {
+            opened.lock().unwrap().push(dir.to_path_buf());
+            Ok(Box::new(Held(Arc::clone(&released))) as Box<dyn Send>)
+        })
+    };
+    let (reader, writer, served) = serve_in_process_with(opts);
+    let mut client = Client::connect(reader, writer).unwrap();
+    client.open(far.to_str().unwrap(), &scope(), true).unwrap();
+    assert_eq!(*opened.lock().unwrap(), vec![far.clone()]);
+    client.send(listing(&local), &local).unwrap();
+    assert!(client.scrub(false).unwrap().is_clean());
+    assert!(!released.load(Ordering::SeqCst), "released mid-session");
+    client.close().unwrap();
+    served.join().unwrap().unwrap();
+    assert!(released.load(Ordering::SeqCst), "never released");
+
+    // A guard that cannot be had: busy, and the store is not created.
+    let busy = tmp.path().join("busy");
+    let refusing = || {
+        ServeOptions::new("guarded").with_open_guard(|_| anyhow::bail!("locked by another backup"))
+    };
+    let (reader, writer, served) = serve_in_process_with(refusing());
+    let mut client = Client::connect(reader, writer).unwrap();
+    let err = client
+        .open(busy.to_str().unwrap(), &scope(), true)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<exchange::Error>(),
+            Some(exchange::Error::Busy)
+        ),
+        "{err:#}"
+    );
+    assert!(client.list().is_err());
+    close(client, served);
+    assert!(!busy.exists());
+
+    // A 0.5 client, which has no `busy`, is told `open`.
+    let (reader, writer, served) = serve_in_process_with(refusing());
+    let mut raw = Raw::new(reader, writer);
+    raw.line("bigstore-exchange-client 1");
+    raw.recv_line();
+    assert_eq!(raw.recv(), serde_json::json!({"version": {"version": 1}}));
+    raw.json(serde_json::json!({"open": {
+        "store": busy.to_str().unwrap(), "history": SCOPE, "create": true
+    }}));
+    assert_eq!(raw.recv(), serde_json::json!({"error": {"code": "open"}}));
+    raw.json(serde_json::json!({"close": {}}));
+    served.join().unwrap().unwrap();
+    assert!(!busy.exists());
 }

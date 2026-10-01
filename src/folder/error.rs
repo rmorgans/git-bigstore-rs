@@ -135,6 +135,17 @@ pub enum Error {
     /// An exchange received the history record `key`, which is outside the
     /// history the session was opened for (`history`). Nothing was placed.
     OutOfScope { key: String, history: HistoryKey },
+    /// The store file `key` could not be read whole (an I/O or permission
+    /// error, a read that ended short, a network failure: `reason`), so
+    /// whether it is damaged is unknown. It was left as it is.
+    Unreadable { key: String, reason: String },
+    /// A write to store file `key` finished, but the file did not read back
+    /// as what its name says (and its ETag was not its md5). The
+    /// quarantined copy, if any, stays.
+    WriteUnverified { key: String },
+    /// [`integrity::quarantine`](super::integrity::quarantine) of the
+    /// history record `key`: a record is never made absent, only replaced.
+    RecordKept { key: String },
 }
 
 /// Why a path was refused.
@@ -322,6 +333,17 @@ impl fmt::Display for Error {
             Self::OutOfScope { key, history } => {
                 write!(f, "{key} is a record outside history {}", history.as_str())
             }
+            Self::Unreadable { key, reason } => write!(f, "cannot read {key}: {reason}"),
+            Self::WriteUnverified { key } => {
+                write!(
+                    f,
+                    "{key} was written but does not read back as what its name says"
+                )
+            }
+            Self::RecordKept { key } => write!(
+                f,
+                "{key} is a history record, which is never moved aside, only replaced"
+            ),
         }
     }
 }

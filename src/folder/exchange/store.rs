@@ -201,6 +201,30 @@ pub(super) fn receive<R: Read>(
     size: u64,
     live: Live,
 ) -> Result<Option<Result<Landed>>> {
+    receive_with(r, into, key, size, live, Incoming::place)
+}
+
+/// [`receive`], but the file is left in its temp file beside its final
+/// name, checked and synced, for the caller to place: deleted when the
+/// returned handle is dropped.
+pub(super) fn receive_unplaced<R: Read>(
+    r: &mut PktReader<R>,
+    into: Option<&Path>,
+    key: &str,
+    size: u64,
+    live: Live,
+) -> Result<Option<Result<tempfile::NamedTempFile>>> {
+    receive_with(r, into, key, size, live, Incoming::checked)
+}
+
+fn receive_with<R: Read, T>(
+    r: &mut PktReader<R>,
+    into: Option<&Path>,
+    key: &str,
+    size: u64,
+    live: Live,
+    end: fn(Incoming) -> Result<T>,
+) -> Result<Option<Result<T>>> {
     let mut refusal = None;
     let mut incoming = match into.map(|root| Incoming::begin(root, key, size)) {
         None => None,
@@ -225,7 +249,7 @@ pub(super) fn receive<R: Read>(
     }
     Ok(match (refusal, incoming) {
         (Some(e), _) => Some(Err(e)),
-        (None, Some(incoming)) => Some(incoming.place()),
+        (None, Some(incoming)) => Some(end(incoming)),
         (None, None) => None,
     })
 }
@@ -275,21 +299,31 @@ impl Incoming {
     /// filesystem cannot rename so), so it appears whole or not at all. A
     /// name already there is [`Landed::Present`].
     fn place(self) -> Result<Landed> {
-        self.check.finish()?;
-        let file = self.tmp.as_file();
-        file.sync_all()
-            .with_context(|| format!("failed to write {}", self.tmp.path().display()))?;
+        let (path, key) = (self.path.clone(), self.key.clone());
+        let tmp = self.checked()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o666 & !umask()))?;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o666 & !umask()))?;
         }
-        match self.tmp.persist_noclobber(long_path(&self.path)?) {
+        match tmp.persist_noclobber(long_path(&path)?) {
             Ok(_) => Ok(Landed::Stored),
             Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Landed::Present),
-            Err(e) => Err(anyhow::Error::from(e.error))
-                .with_context(|| format!("failed to place {}", self.key)),
+            Err(e) => {
+                Err(anyhow::Error::from(e.error)).with_context(|| format!("failed to place {key}"))
+            }
         }
+    }
+
+    /// The temp file, once it is what its key names and is on disk.
+    fn checked(self) -> Result<tempfile::NamedTempFile> {
+        self.check.finish()?;
+        self.tmp
+            .as_file()
+            .sync_all()
+            .with_context(|| format!("failed to write {}", self.tmp.path().display()))?;
+        Ok(self.tmp)
     }
 }
 
