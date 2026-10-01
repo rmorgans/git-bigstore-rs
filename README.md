@@ -614,17 +614,22 @@ adopts it, publishing nothing.
 brings an output that has not changed since its base to the version
 pulled. It replaces a differing file only if the file still has the
 content the base records, and removes a file the base had, still
-unchanged, that the version pulled does not; every other differing file,
-and a file the version removed but that changed locally, is
-`PullConflict`, before anything is written. So is discarding content the
-remote lacks: before anything is written, each file to be replaced or
-removed must have its object on the remote at its local size (a `.dir`
-manifest does not prove its objects are there), else
-`Refusal::BaseNotOnRemote`. Each file is hashed again just before it is
+unchanged, that the version pulled does not (directories it leaves empty
+stay). Every other differing file, a file the version removed but that
+changed here, and a base file deleted here that the version still has
+(catching up never undoes a local deletion), is `PullConflict`, before
+anything is written. So is discarding content the remote lacks: each file
+to be replaced or removed must have its object on the remote at its local
+size (a `.dir` manifest does not prove its objects are there), else
+`Refusal::BaseNotOnRemote`. A file to be removed whose name differs from
+one in the version only by case or Unicode normalization is the same file
+on macOS and Windows, so that rename is refused on every OS as
+`Refusal::CaseCollision`. Each file is hashed again just before it is
 replaced or removed, and one written meanwhile is left as it is
 (`Refusal::ChangedWhilePulling`). Files the base never had are kept.
 Only a pull from history has a base (the `.dvc` beside `into`); from a
-`.dvc` file, or with none beside `into`, this refuses like
+`.dvc` file, with none beside `into`, or of the very version the output
+is based on (a restore: a file deleted here is written again), this is
 `Overwrite::Refuse`. It never falls back to `Force`.
 
 `Selector::Id` (`--at <hex>`) matches a record id prefix as `folder log`
@@ -720,9 +725,11 @@ its version but is not a plain success, so look at `outcome`.
 set, the output (and pull's `into`, or its `.dvc` source) is a path
 relative to the root, of plain names only (`Refusal::OutsideRoot`
 otherwise), and nothing from the root down to the output, nor the output
-itself or its `.dvc`, may be a symlink or, on Windows, a junction or any
-other reparse point (`Refusal::SymlinkedComponent`). The root itself may
-be one. Use it when the caller owns a boundary, such as a dataset folder,
+itself or its `.dvc`, may be a symlink or, on Windows, any reparse point
+(`Refusal::SymlinkedComponent`). That is stricter than confinement needs:
+besides symlinks, junctions and mount points it refuses OneDrive
+placeholders and compressed or deduplicated files on that path. The root
+itself may be one. Use it when the caller owns a boundary, such as a dataset folder,
 that an output named inside it must not leave. Below the output nothing
 changes: pull never writes through a symlink, and push backs up a symlink
 to a file with its target's content, as DVC does.
@@ -878,7 +885,7 @@ ids and paths are fields. Both enums are `#[non_exhaustive]`.
 | `NoHead { key }` | the history has versions but none is the latest (each follows another): a damaged remote |
 | `InvalidVersionId { prefix }`, `InvalidTime { time }` | a `Selector::Id` that is not 8+ hex characters; a `Selector::AtOrBefore` that is not RFC 3339 |
 | `EndpointRequired` | an `s3://` remote without an endpoint |
-| `CredentialsMissing` | an `s3://` remote without both an access key id and a secret (unset or empty); no request made |
+| `CredentialsMissing` | an `s3://` remote without both an access key id and a secret (unset or empty, from the environment or `Credentials::Static`); no request made |
 | `RemoteUnusable { url }` | `Remote::open` cannot make a client for `url` (a URL it cannot parse, no TLS crypto compiled in, a `local://` directory it cannot create); no request made |
 | `UnsupportedRemote { url }` | anything but `s3://`, `local://` (`file://`) and `rclone://` |
 | `InvalidExclude { pattern }` | an exclude pattern that does not compile (or uses `!`) |

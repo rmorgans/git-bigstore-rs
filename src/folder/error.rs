@@ -62,8 +62,9 @@ pub enum Error {
     EndpointRequired,
     /// An `s3://` remote without credentials: with
     /// [`Credentials::FromEnv`](super::Credentials::FromEnv),
-    /// `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` is unset or empty.
-    /// No request was made.
+    /// `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` is unset or empty; with
+    /// [`Credentials::Static`](super::Credentials::Static), either string
+    /// is empty. No request was made.
     CredentialsMissing,
     /// [`Remote::open`](super::Remote::open) could not make a client for
     /// `url` (a URL it cannot parse, no TLS crypto compiled in, a `local://`
@@ -261,7 +262,8 @@ impl fmt::Display for Error {
                  folder mode never defaults to AWS",
             ),
             Self::CredentialsMissing => f.write_str(
-                "S3 credentials missing: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must both be set",
+                "S3 credentials missing: the access key id or the secret access key is unset or \
+                 empty",
             ),
             Self::RemoteUnusable { url } => write!(f, "cannot open remote {url}"),
             Self::InvalidExclude { pattern } => write!(f, "invalid exclude pattern {pattern:?}"),
@@ -285,11 +287,7 @@ impl fmt::Display for Error {
                         "this output has no base version (no .dvc from a push or pull), ",
                     )?,
                 }
-                write!(
-                    f,
-                    "but the latest is {}: nothing pushed",
-                    heads_list(heads)
-                )
+                write!(f, "but the latest is {}: nothing pushed", heads_list(heads))
             }
             Self::Diverged { heads } => write!(
                 f,
@@ -398,7 +396,7 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
         ),
         Refusal::SymlinkedComponent => write!(
             f,
-            "{p} is a symlink or another redirect; refusing to read or write through it"
+            "{p} is a symlink or another reparse point; refusing to read or write through it"
         ),
     }
 }

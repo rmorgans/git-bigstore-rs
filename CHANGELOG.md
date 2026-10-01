@@ -10,12 +10,15 @@
   and removes a file the base had, still unchanged, that the version
   pulled does not. Each such file's object must be on the remote at its
   local size, else `Refusal::BaseNotOnRemote`, so no discarded content is
-  lost. Any other differing file, and a removed file that changed
-  locally, is `PullConflict`; both refusals come before anything is
-  written. Every file is hashed again
-  just before it is replaced or removed; one written meanwhile is left as
-  it is (`Refusal::ChangedWhilePulling`). With no `.dvc` beside `into`, or
-  from a `.dvc` source, it refuses like `Overwrite::Refuse`. So an output
+  lost; a removal whose name matches a file of the version but for case
+  or Unicode normalization (one file on macOS and Windows) is
+  `Refusal::CaseCollision`. Any other differing file, a removed file that
+  changed locally, and a base file deleted locally that the version still
+  has, is `PullConflict`; every refusal comes before anything is written.
+  Every file is hashed again just before it is replaced or removed; one
+  written meanwhile is left as it is (`Refusal::ChangedWhilePulling`).
+  With no `.dvc` beside `into`, from a `.dvc` source, or pulling the very
+  version the output is based on, it is `Overwrite::Refuse`. So an output
   `status` calls `RemoteAhead` can now be brought up to date in place.
   `PullReport::removed` counts the removed files.
 - **Confinement to a root: `PushOptions::root` and `PullOptions::root`.**

@@ -3788,3 +3788,99 @@ fn a_catch_up_pull_never_discards_content_the_remote_lacks() {
     assert_eq!(refused(&err), (gone.as_path(), &Refusal::BaseNotOnRemote));
     assert_eq!(tree(&b), before, "nothing written or removed");
 }
+
+#[test]
+fn a_catch_up_refuses_a_file_deleted_here_but_a_restore_writes_it_again() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    std::fs::remove_file(b.join("keep.txt")).unwrap();
+    // Pulling the version B is based on restores what B deleted.
+    let r = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap();
+    assert_eq!(r.written, 1);
+    assert!(b.join("keep.txt").is_file());
+
+    // Catching up never undoes a deletion made here.
+    std::fs::remove_file(b.join("keep.txt")).unwrap();
+    let v1 = base_of(&dvc_beside(&b));
+    push_v2(&e, "k", &a);
+    let before = tree(&b);
+    let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+    let FolderError::PullConflict { paths } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(paths, &[b.join("keep.txt")]);
+    assert_eq!(tree(&b), before, "nothing written or removed");
+    assert_eq!(base_of(&dvc_beside(&b)), v1);
+}
+
+#[test]
+fn a_catch_up_refuses_a_rename_that_changes_only_case() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    // Case-only, in two steps so it works on a case-insensitive disk.
+    std::fs::rename(a.join("keep.txt"), a.join("tmp")).unwrap();
+    std::fs::rename(a.join("tmp"), a.join("Keep.txt")).unwrap();
+    let _ = folder::push(&e.remote, &a, &opts("k")).unwrap();
+
+    let before = tree(&b);
+    let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+    assert_eq!(
+        refused(&err),
+        (
+            Path::new("keep.txt"),
+            &Refusal::CaseCollision {
+                other: "Keep.txt".into()
+            }
+        )
+    );
+    assert_eq!(tree(&b), before, "nothing written or removed");
+}
+
+#[test]
+fn a_catch_up_never_replaces_content_the_remote_lacks_or_has_at_another_size() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    push_v2(&e, "k", &a);
+    // "v1\n": the base content of edit.txt and sub/deep.txt, both replaced.
+    let md5 = hash_reader(&mut &b"v1\n"[..], HashFunction::Md5)
+        .unwrap()
+        .to_string();
+    let object = e
+        .store
+        .join(format!("files/md5/{}/{}", &md5[..2], &md5[2..]));
+    let replaced = [b.join("edit.txt"), b.join("sub/deep.txt")];
+    let before = tree(&b);
+    for damage in [Some(&b"truncated"[..]), None] {
+        match damage {
+            Some(bytes) => std::fs::write(&object, bytes).unwrap(),
+            None => std::fs::remove_file(&object).unwrap(),
+        }
+        let err = pull_latest(&e, "k", &b, Overwrite::IfUnchanged).unwrap_err();
+        let (path, reason) = refused(&err);
+        assert_eq!(reason, &Refusal::BaseNotOnRemote, "{err:#}");
+        assert!(replaced.iter().any(|p| p == path), "{}", path.display());
+        assert_eq!(tree(&b), before, "nothing written or removed");
+    }
+}
+
+#[test]
+fn a_catch_up_from_a_dvc_file_refuses_like_refuse() {
+    let e = env();
+    let (a, b) = two_hosts(&e, "k");
+    push_v2(&e, "k", &a);
+    // A copy of A's .dvc (at v2) beside B's output, still at v1 content.
+    std::fs::copy(dvc_beside(&a), dvc_beside(&b)).unwrap();
+    let err = folder::pull(
+        &e.remote,
+        &PointerSource::File(dvc_beside(&b)),
+        &PullOptions {
+            overwrite: Overwrite::IfUnchanged,
+            ..pull_opts(None)
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(folder_error(&err), FolderError::PullConflict { .. }),
+        "{err:#}"
+    );
+}

@@ -1057,6 +1057,7 @@ fn folder_hint(err: anyhow::Error) -> anyhow::Error {
         Some(Error::Diverged { .. }) => {
             "pull one head with --at <id>, reconcile the others into it, then push --resolve merge"
         }
+        Some(Error::CredentialsMissing) => "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
         _ => return err,
     };
     anyhow::anyhow!("{err:#}\nhint: {hint}")

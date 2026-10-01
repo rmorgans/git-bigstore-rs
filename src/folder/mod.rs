@@ -871,9 +871,11 @@ fn confine_in(root: &Path, rel: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Whether opening this entry could lead somewhere else: a symlink, or on
-/// Windows any reparse point (a junction, a mount point, a cloud
-/// placeholder…).
+/// Whether this entry is a redirect the root confinement refuses: a symlink,
+/// or on Windows any reparse point. That is stricter than needed: besides
+/// symlinks, junctions and mount points, it refuses cloud placeholders
+/// (OneDrive Files-On-Demand) and compressed or deduplicated files, which
+/// lead nowhere else, on the way to the output.
 fn redirects(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -1477,11 +1479,12 @@ pub async fn pull_async(
         }
         DvcOutput::File { md5, .. } => vec![(into.clone(), md5.clone())],
     };
+    // Pulling the version the output is based on catches up with nothing:
+    // it restores, as `Refuse` does (a file deleted here is written again).
     let base = match (opts.overwrite, base) {
-        (Overwrite::IfUnchanged, Some(base)) if base.output == pointer.output => {
-            Some(targets.clone())
+        (Overwrite::IfUnchanged, Some(base)) if base.output != pointer.output => {
+            Some(base_targets(remote, &into, &base).await?)
         }
-        (Overwrite::IfUnchanged, Some(base)) => Some(base_targets(remote, &into, &base).await?),
         _ => None,
     };
 
@@ -1708,6 +1711,11 @@ fn check_targets(
                 }
                 None
             }
+            // Deleted here since the base: a local change, not to undo.
+            Target::Missing if in_base.contains_key(path.as_path()) => {
+                conflicts.push(path.clone());
+                None
+            }
             Target::Missing => Some(Replace::Nothing),
             Target::Differs(local) => match opts.overwrite {
                 Overwrite::Force => Some(Replace::Anything),
@@ -1722,11 +1730,33 @@ fn check_targets(
         });
     }
     // What the base had and this version does not: removed if unchanged.
+    // A name that differs from a target's only by case or normalization is
+    // the same file on macOS and Windows; removing it would remove the
+    // target, so it is refused on every OS, before anything is written.
+    let rel = |p: &Path| {
+        p.strip_prefix(into)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
     let wanted: std::collections::HashSet<&Path> =
         targets.iter().map(|(p, _)| p.as_path()).collect();
+    let folded: std::collections::HashMap<String, String> = targets
+        .iter()
+        .map(|(p, _)| (fold_name(&rel(p)), rel(p)))
+        .collect();
     let mut remove = Vec::new();
     for (path, md5) in base.iter().filter(|(p, _)| !wanted.contains(p.as_path())) {
         opts.cancel.check()?;
+        if let Some(other) = folded.get(&fold_name(&rel(path))) {
+            return Err(Error::Refused {
+                path: PathBuf::from(rel(path)),
+                reason: Refusal::CaseCollision {
+                    other: other.clone(),
+                },
+            }
+            .into());
+        }
         match classify_target(into, path, md5)? {
             Target::Missing => {}
             Target::Same => remove.push((path.clone(), md5.clone())),
@@ -1861,13 +1891,9 @@ fn classify_target(root: &Path, path: &Path, md5: &Hexdigest) -> Result<Target> 
 /// file on macOS (APFS, HFS+) and Windows. Refused on every OS, so a version
 /// restores the same everywhere.
 fn check_case_collisions(manifest: &Manifest) -> Result<()> {
-    use unicode_normalization::UnicodeNormalization;
     let mut seen = std::collections::HashMap::new();
     for e in manifest.entries() {
-        // Lowercasing can decompose (`İ` → `i` + dot), so normalize again.
-        let lower = e.relpath.as_str().nfc().collect::<String>().to_lowercase();
-        let folded: String = lower.nfc().collect();
-        if let Some(other) = seen.insert(folded, e.relpath.as_str()) {
+        if let Some(other) = seen.insert(fold_name(e.relpath.as_str()), e.relpath.as_str()) {
             return Err(Error::Refused {
                 path: PathBuf::from(e.relpath.as_str()),
                 reason: Refusal::CaseCollision {
@@ -1878,6 +1904,14 @@ fn check_case_collisions(manifest: &Manifest) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `name` as macOS and Windows compare names: case-folded and NFC.
+fn fold_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    // Lowercasing can decompose (`İ` → `i` + dot), so normalize again.
+    let lower = name.nfc().collect::<String>().to_lowercase();
+    lower.nfc().collect()
 }
 
 /// Files under `root` that are neither targets nor about to be removed.
