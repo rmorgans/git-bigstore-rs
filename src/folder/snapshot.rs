@@ -1,7 +1,8 @@
-//! Point-in-time copies of files that may be appended to while we read them.
+//! Point-in-time copies of files that may be appended to while we read them,
+//! and point-in-time digests of files hashed where they are.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::hash::Hasher;
@@ -81,7 +82,10 @@ pub fn snapshot(path: &Path, tmp_dir: &Path) -> std::result::Result<Snapshot, Sn
     )))
 }
 
-fn stamp(path: &Path) -> std::result::Result<(u64, SystemTime), SnapshotError> {
+/// A file's length and modification time.
+type Stamp = (u64, SystemTime);
+
+fn stamp(path: &Path) -> std::result::Result<Stamp, SnapshotError> {
     match std::fs::metadata(path) {
         Ok(m) => Ok((
             m.len(),
@@ -102,8 +106,78 @@ fn try_snapshot(
     tmp_dir: &Path,
 ) -> std::result::Result<Option<Snapshot>, SnapshotError> {
     let before = stamp(path)?;
-    let mut source = match std::fs::File::open(path) {
-        Ok(f) => f,
+    let mut source = open(path)?;
+    let io = |e: std::io::Error| SnapshotError::Io(e.into());
+    let mut file = tempfile::NamedTempFile::new_in(tmp_dir).map_err(io)?;
+    let read = read_all(&mut source, |chunk| file.write_all(chunk)).map_err(io)?;
+    file.flush().map_err(io)?;
+    let after = stamp(path)?;
+    if before != after || after.0 != read.size {
+        return Ok(None);
+    }
+    Ok(Some(Snapshot {
+        file: file.into_temp_path(),
+        md5: read.md5,
+        size: read.size,
+        unterminated_line: read.unterminated_line,
+    }))
+}
+
+/// A file hashed where it is, with no copy: its digest, the length and
+/// modification time it had both before and after it was read, and
+/// whether the path is a symlink (read through).
+#[derive(Debug, Clone)]
+pub struct InPlace {
+    path: PathBuf,
+    md5: Hexdigest,
+    stamp: Stamp,
+    unterminated_line: bool,
+    symlink: bool,
+}
+
+impl InPlace {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn md5(&self) -> &Hexdigest {
+        &self.md5
+    }
+
+    pub fn size(&self) -> u64 {
+        self.stamp.0
+    }
+
+    /// The file is non-empty and does not end in `\n`.
+    pub fn unterminated_line(&self) -> bool {
+        self.unterminated_line
+    }
+
+    /// The path is a symlink, hashed through: its target may be anything
+    /// anywhere, so it is never linked, only copied.
+    pub fn symlink(&self) -> bool {
+        self.symlink
+    }
+
+    /// Whether the file still has the length and modification time it had
+    /// when hashed.
+    pub fn unchanged(&self) -> std::result::Result<bool, SnapshotError> {
+        match stamp(&self.path) {
+            Ok(now) => Ok(now == self.stamp),
+            Err(SnapshotError::Changed(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Hash `path` where it is. Its length and mtime are checked before and
+/// after the read: if either changed, or fewer or more bytes were read than
+/// the file ends with, it is [`SnapshotError::Changed`] at once (the caller
+/// restarts). Meant for write-once files: nothing protects the bytes
+/// between this and their use, so whoever uses them checks them again.
+pub fn hash_in_place(path: &Path) -> std::result::Result<InPlace, SnapshotError> {
+    let symlink = match std::fs::symlink_metadata(path) {
+        Ok(m) => m.file_type().is_symlink(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(SnapshotError::Changed(format!(
                 "{} disappeared while being read",
@@ -112,37 +186,78 @@ fn try_snapshot(
         }
         Err(e) => {
             return Err(SnapshotError::Io(
-                anyhow::Error::from(e).context(format!("failed to open {}", path.display())),
+                anyhow::Error::from(e).context(format!("failed to stat {}", path.display())),
             ))
         }
     };
-    let io = |e: std::io::Error| SnapshotError::Io(e.into());
-    let mut file = tempfile::NamedTempFile::new_in(tmp_dir).map_err(io)?;
+    let before = stamp(path)?;
+    let mut source = open(path)?;
+    let read = read_all(&mut source, |_| Ok(()))
+        .map_err(|e| SnapshotError::Io(anyhow::Error::from(e).context(failed_read(path))))?;
+    let after = stamp(path)?;
+    if before != after || after.0 != read.size {
+        return Err(SnapshotError::Changed(format!(
+            "{} changed while being hashed",
+            path.display()
+        )));
+    }
+    Ok(InPlace {
+        path: path.to_path_buf(),
+        md5: read.md5,
+        stamp: after,
+        unterminated_line: read.unterminated_line,
+        symlink,
+    })
+}
+
+fn failed_read(path: &Path) -> String {
+    format!("failed to read {}", path.display())
+}
+
+fn open(path: &Path) -> std::result::Result<std::fs::File, SnapshotError> {
+    match std::fs::File::open(path) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(SnapshotError::Changed(format!(
+            "{} disappeared while being read",
+            path.display()
+        ))),
+        Err(e) => Err(SnapshotError::Io(
+            anyhow::Error::from(e).context(format!("failed to open {}", path.display())),
+        )),
+    }
+}
+
+/// What [`read_all`] read.
+struct Whole {
+    md5: Hexdigest,
+    size: u64,
+    unterminated_line: bool,
+}
+
+/// Read `source` to its end, hashing it and handing each chunk to `sink`.
+fn read_all(
+    source: &mut std::fs::File,
+    mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<Whole> {
     let mut hasher = Hasher::new(HashFunction::Md5);
     let mut buf = vec![0u8; 64 * 1024];
     let mut size = 0u64;
     let mut last = None;
     loop {
-        let n = source.read(&mut buf).map_err(io)?;
+        let n = source.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
-        file.write_all(&buf[..n]).map_err(io)?;
+        sink(&buf[..n])?;
         size += n as u64;
         last = Some(buf[n - 1]);
     }
-    file.flush().map_err(io)?;
-    let after = stamp(path)?;
-    if before != after || after.0 != size {
-        return Ok(None);
-    }
-    Ok(Some(Snapshot {
-        file: file.into_temp_path(),
+    Ok(Whole {
         md5: hasher.finalize(),
         size,
         unterminated_line: last.is_some_and(|b| b != b'\n'),
-    }))
+    })
 }
 
 impl From<SnapshotError> for anyhow::Error {

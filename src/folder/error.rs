@@ -247,6 +247,12 @@ pub enum Refusal {
     /// to the output, at the output itself, or at its `.dvc`: following it
     /// could read or write outside the root.
     SymlinkedComponent,
+
+    // Push, status and pull with `Link::Place`.
+    /// [`Link::Place`](super::Link::Place) places files into and out of a
+    /// store directory, so it needs a `local://` remote; this one is not.
+    /// `path` is the output. Nothing was written.
+    PlaceNeedsLocalRemote,
 }
 
 impl fmt::Display for Error {
@@ -435,6 +441,10 @@ fn fmt_refusal(path: &Path, reason: &Refusal, f: &mut fmt::Formatter<'_>) -> fmt
         Refusal::SymlinkedComponent => write!(
             f,
             "{p} is a symlink or another reparse point; refusing to read or write through it"
+        ),
+        Refusal::PlaceNeedsLocalRemote => write!(
+            f,
+            "{p}: placing files by link needs a local:// remote, not this one"
         ),
     }
 }

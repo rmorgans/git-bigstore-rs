@@ -27,6 +27,12 @@
 //! same store (time as `20261001T120000.123456789Z`): a [`Kind::Other`]
 //! key, which no scrub, listing or transfer touches.
 //!
+//! Objects up to [`SINGLE_PUT_MAX`](backend::SINGLE_PUT_MAX) (1 GiB) are
+//! written with one PUT, so on S3 their ETag is their md5 and a scrub
+//! proves them from the listing alone. A larger object goes up in parts:
+//! its ETag never is its md5, so it is read back whole when written and
+//! again on every S3 scrub.
+//!
 //! Every call comes in a blocking form and an `_async` one, as the rest of
 //! [`folder`](super) does; hashing runs on the blocking pool.
 
@@ -38,15 +44,14 @@ use std::path::PathBuf;
 
 use super::layout::{self, Check, Kind};
 use super::{block_on, each_unordered, Error};
-use crate::backend;
+use crate::backend::{self, etag_value, SINGLE_PUT_MAX};
 use crate::hash::Hasher;
 use crate::types::HashFunction;
 
 /// Where quarantined bytes go, relative to the store.
 pub const QUARANTINE: &str = "quarantine/";
 
-/// Files up to this size are replaced with one PUT (an S3 ETag then is
-/// their md5); larger ones by multipart upload, in parts of this size.
+/// The part size of a multipart replace.
 const PART: u64 = 10 << 20;
 
 /// How [`scrub`] runs: `ScrubOptions { deep: true, ..Default::default() }`.
@@ -110,8 +115,10 @@ impl Unreadable {
 /// reads at a time): [`Kind::Other`] keys are ignored. Objects and
 /// manifests whose listed ETag is their name's md5 are good unread, unless
 /// `opts.deep`; every other file (records, any other ETag, none) is read
-/// and checked against its name. A listing that fails is the error; a file
-/// that fails is [`Unreadable`] in the report. Reads only.
+/// and checked against its name. So on S3 an object written by multipart
+/// upload (over 1 GiB, [the module docs](self)) is read whole on every
+/// scrub. A listing that fails is the error; a file that fails is
+/// [`Unreadable`] in the report. Reads only.
 pub fn scrub(store: &dyn ObjectStore, opts: &ScrubOptions) -> Result<ScrubReport> {
     block_on("integrity::scrub", scrub_async(store, opts))?
 }
@@ -174,11 +181,6 @@ fn named_md5(key: &str) -> Option<String> {
     let (shard, name) = rest.split_once('/')?;
     let name = name.strip_suffix(".dir").unwrap_or(name);
     Some(format!("{shard}{name}"))
-}
-
-/// An ETag as a bare value: quotes and a weak marker gone.
-fn etag_value(etag: &str) -> &str {
-    etag.strip_prefix("W/").unwrap_or(etag).trim_matches('"')
 }
 
 /// Whether `etag` is the md5 `key`'s name gives (objects and manifests).
@@ -300,10 +302,14 @@ pub enum Replaced {
 /// [quarantine](self) first (on a `LocalFileSystem`, a hard link: the
 /// store must be on a filesystem that has them). Then `source` replaces it
 /// in one atomic write (on a `LocalFileSystem`, a temp file renamed over
-/// the name). Last, the write is checked: an ETag equal to the bytes' md5,
-/// else the file read back and verified: not what its name says (or gone),
-/// [`Error::WriteUnverified`]; unreadable, [`Error::Unreadable`] (the write
-/// may be fine; a later scrub settles it).
+/// the name): one PUT up to 1 GiB, held in memory meanwhile within the
+/// process's single-PUT budget ([`SINGLE_PUT_MAX`]), else a multipart
+/// upload, streamed from a file or sent from `Source::Bytes` a part at a
+/// time ([the module docs](self)). Last, the write is checked: an ETag
+/// equal to the bytes' md5, else the file read back and verified: not
+/// what its name says (or gone), [`Error::WriteUnverified`]; unreadable,
+/// [`Error::Unreadable`] (the write may be fine; a later scrub settles
+/// it).
 ///
 /// Replacing a content-addressed name with bytes that verify is safe
 /// whatever is there, so concurrent heals of one key converge on good
@@ -314,8 +320,30 @@ pub fn replace(store: &dyn ObjectStore, key: &str, source: Source) -> Result<Rep
 
 /// [`replace`] on the caller's tokio runtime (see [the module docs](super)).
 pub async fn replace_async(store: &dyn ObjectStore, key: &str, source: Source) -> Result<Replaced> {
+    replace_with(store, key, source, SINGLE_PUT_MAX).await
+}
+
+/// [`replace_async`], with sources over `single_max` bytes uploaded in
+/// parts.
+async fn replace_with(
+    store: &dyn ObjectStore,
+    key: &str,
+    source: Source,
+    single_max: u64,
+) -> Result<Replaced> {
     let location = store_path(key)?;
-    let prepared = prepare(key, source).await?;
+    let size = match &source {
+        Source::Bytes(bytes) => bytes.len() as u64,
+        Source::File(path) => tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("failed to open {}", path.display()))?
+            .len(),
+    };
+    let budget = match size <= single_max {
+        true => Some(backend::put_budget(size).await),
+        false => None,
+    };
+    let prepared = prepare(key, source, single_max).await?;
     let quarantined = match examine(store, &location).await {
         State::Good => return Ok(Replaced::HealedByOther),
         State::Unreadable(reason) => {
@@ -341,11 +369,12 @@ pub async fn replace_async(store: &dyn ObjectStore, key: &str, source: Source) -
                 .put(&location, PutPayload::from(bytes))
                 .await
                 .with_context(|| format!("failed to write {key}"))?;
+            drop(budget);
             put.e_tag
                 .is_some_and(|etag| etag_value(&etag).eq_ignore_ascii_case(&md5))
         }
-        Prepared::File { path, size } => {
-            upload(store, &location, key, path, size).await?;
+        Prepared::Large { body, size } => {
+            upload(store, &location, key, body, size).await?;
             false
         }
     };
@@ -376,13 +405,22 @@ pub async fn replace_async(store: &dyn ObjectStore, key: &str, source: Source) -
 
 /// A source checked against its key.
 enum Prepared {
-    /// Its bytes, and their md5.
+    /// Its bytes, and their md5: one PUT.
     Bytes { bytes: Vec<u8>, md5: String },
-    /// A file over [`PART`], `size` bytes when checked.
-    File { path: PathBuf, size: u64 },
+    /// A source over the single-PUT ceiling, `size` bytes when checked:
+    /// multipart.
+    Large { body: Large, size: u64 },
 }
 
-async fn prepare(key: &str, source: Source) -> Result<Prepared> {
+/// What a multipart replace sends.
+enum Large {
+    /// A file, checked again as it is read.
+    File(PathBuf),
+    /// Bytes already checked.
+    Bytes(Vec<u8>),
+}
+
+async fn prepare(key: &str, source: Source, single_max: u64) -> Result<Prepared> {
     if layout::kind(key) == Kind::Other {
         return Err(Error::InvalidStoreKey {
             key: key.to_string(),
@@ -392,22 +430,36 @@ async fn prepare(key: &str, source: Source) -> Result<Prepared> {
     let key = key.to_string();
     backend::blocking(move || {
         let bytes = match source {
+            Source::Bytes(bytes) if bytes.len() as u64 > single_max => {
+                let size = bytes.len() as u64;
+                let mut check = Check::new(&key, size)?;
+                check.update(&bytes);
+                check.finish()?;
+                return Ok(Prepared::Large {
+                    body: Large::Bytes(bytes),
+                    size,
+                });
+            }
             Source::Bytes(bytes) => bytes,
             Source::File(path) => {
                 let file = std::fs::File::open(&path)
                     .with_context(|| format!("failed to open {}", path.display()))?;
                 let size = file.metadata()?.len();
-                if size > PART {
+                if size > single_max {
                     let mut check = Check::new(&key, size)?;
                     read_chunks(file, &path, |chunk| {
                         check.update(chunk);
                         Ok(())
                     })?;
                     check.finish()?;
-                    return Ok(Prepared::File { path, size });
+                    return Ok(Prepared::Large {
+                        body: Large::File(path),
+                        size,
+                    });
                 }
                 let mut bytes = Vec::with_capacity(size as usize);
-                std::io::Read::read_to_end(&mut std::io::Read::take(file, PART + 1), &mut bytes)
+                let mut limited = std::io::Read::take(file, single_max + 1);
+                std::io::Read::read_to_end(&mut limited, &mut bytes)
                     .with_context(|| format!("failed to read {}", path.display()))?;
                 bytes
             }
@@ -442,14 +494,14 @@ fn read_chunks(
     }
 }
 
-/// Upload the file at `path` to `location` by multipart upload, checking it
-/// against `key` as it goes: the upload completes only if every byte sent
-/// is what `key` names, and is aborted otherwise.
+/// Upload `body` to `location` by multipart upload; a file is checked
+/// against `key` again as it is read, so the upload completes only if
+/// every byte sent is what `key` names, and is aborted otherwise.
 async fn upload(
     store: &dyn ObjectStore,
     location: &StorePath,
     key: &str,
-    path: PathBuf,
+    body: Large,
     size: u64,
 ) -> Result<()> {
     let multipart = store
@@ -457,6 +509,35 @@ async fn upload(
         .await
         .with_context(|| format!("failed to write {key}"))?;
     let mut writer = WriteMultipart::new_with_chunk_size(multipart, PART as usize);
+    let sent = match body {
+        Large::File(path) => send_file(&mut writer, key, path, size).await,
+        Large::Bytes(bytes) => send_bytes(&mut writer, &bytes)
+            .await
+            .map_err(|e| anyhow::Error::from(e).context(format!("failed to write {key}"))),
+    };
+    if let Err(e) = sent {
+        let _ = writer.abort().await;
+        return Err(e);
+    }
+    writer
+        .finish()
+        .await
+        .with_context(|| format!("failed to write {key}"))?;
+    Ok(())
+}
+
+/// Send `bytes` through `writer`, a mebibyte at a time.
+async fn send_bytes(writer: &mut WriteMultipart, bytes: &[u8]) -> object_store::Result<()> {
+    for chunk in bytes.chunks(1 << 20) {
+        writer.wait_for_capacity(4).await?;
+        writer.write(chunk);
+    }
+    Ok(())
+}
+
+/// Send the file at `path` through `writer`, checking it against `key`
+/// (`size` bytes) as it is read on the blocking pool.
+async fn send_file(writer: &mut WriteMultipart, key: &str, path: PathBuf, size: u64) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
     let checked_key = key.to_string();
     let reading = backend::blocking(move || {
@@ -483,20 +564,11 @@ async fn upload(
     };
     let (read, sent) = tokio::join!(reading, sending);
     // A failed send stops the reader, so its error is the cause.
-    let failed = match (read, sent) {
-        (_, Err(e)) => Some(anyhow::Error::from(e).context(format!("failed to write {key}"))),
-        (Err(e), Ok(())) => Some(e),
-        (Ok(()), Ok(())) => None,
-    };
-    if let Some(e) = failed {
-        let _ = writer.abort().await;
-        return Err(e);
+    match (read, sent) {
+        (_, Err(e)) => Err(anyhow::Error::from(e).context(format!("failed to write {key}"))),
+        (Err(e), Ok(())) => Err(e),
+        (Ok(()), Ok(())) => Ok(()),
     }
-    writer
-        .finish()
-        .await
-        .with_context(|| format!("failed to write {key}"))?;
-    Ok(())
 }
 
 /// What [`quarantine`] did.
@@ -622,5 +694,121 @@ mod tests {
         assert!(!q.contains(':'));
         assert_eq!(layout::kind(&q), Kind::Other);
         assert_eq!(store_path(&q).unwrap().as_ref(), q);
+    }
+
+    /// `n` bytes of a pattern that does not repeat in step with a part.
+    fn patterned(n: u32) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn object_key(bytes: &[u8]) -> String {
+        let mut hasher = Hasher::new(HashFunction::Md5);
+        hasher.update(bytes);
+        let md5 = hasher.finalize().to_string();
+        format!("files/md5/{}/{}", &md5[..2], &md5[2..])
+    }
+
+    /// Sources over the single-PUT ceiling (1 MiB here, 1 GiB for real)
+    /// go up in parts, checked as they go and read back after.
+    const CEILING: u64 = 1 << 20;
+
+    #[tokio::test]
+    async fn a_source_over_the_ceiling_is_a_checked_multipart_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        let big = patterned(11 << 20);
+        let key = object_key(&big);
+        let on_disk = root.join(&key);
+        std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        std::fs::write(&on_disk, &big[..big.len() - 1]).unwrap();
+        let store = backend::store::build_local_store(root.to_str().unwrap()).unwrap();
+
+        // A file that is not the object is refused, the damaged copy kept.
+        let wrong = tmp.path().join("wrong");
+        let mut other = big.clone();
+        other[5 << 20] ^= 1;
+        std::fs::write(&wrong, &other).unwrap();
+        let err = replace_with(&*store, &key, Source::File(wrong), CEILING)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<Error>(),
+            Some(Error::Integrity { .. })
+        ));
+        assert_eq!(std::fs::read(&on_disk).unwrap().len(), big.len() - 1);
+
+        let good = tmp.path().join("good");
+        std::fs::write(&good, &big).unwrap();
+        let healed = replace_with(&*store, &key, Source::File(good), CEILING)
+            .await
+            .unwrap();
+        assert!(matches!(healed, Replaced::Replaced { .. }), "{healed:?}");
+        assert!(std::fs::read(&on_disk).unwrap() == big);
+        let temps = walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains('#'))
+            .count();
+        assert_eq!(temps, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_part_ends_a_multipart_replace_with_an_error_and_an_abort() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Six 10 MiB parts: more than the four in flight at once.
+        let big = patterned(55 << 20);
+        let key = object_key(&big);
+        let source = tmp.path().join("good");
+        std::fs::write(&source, &big).unwrap();
+        let store = backend::testing::WriteFaults {
+            fail_part: Some(1),
+            ..Default::default()
+        };
+        let location = store_path(&key).unwrap();
+        store
+            .inner
+            .put(&location, b"damaged".to_vec().into())
+            .await
+            .unwrap();
+        let err = replace_with(&store, &key, Source::File(source), CEILING)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("part failed"), "{err:#}");
+        assert_eq!(store.aborted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let kept = store.inner.get(&location).await.unwrap().bytes().await;
+        assert_eq!(&kept.unwrap()[..], b"damaged");
+    }
+
+    #[tokio::test]
+    async fn bytes_over_the_ceiling_go_up_in_parts_and_are_read_back() {
+        use std::sync::atomic::Ordering;
+        let big = patterned(3 << 20);
+        let key = object_key(&big);
+        let store = backend::testing::WriteFaults::default();
+        let placed = replace_with(&store, &key, Source::Bytes(big.clone()), CEILING)
+            .await
+            .unwrap();
+        assert_eq!(placed, Replaced::Placed);
+        assert_eq!(store.multiparts.load(Ordering::SeqCst), 1);
+        // One read finding it absent, one reading it back.
+        assert_eq!(store.gets.load(Ordering::SeqCst), 2);
+        let stored = store.inner.get(&store_path(&key).unwrap()).await.unwrap();
+        assert!(stored.bytes().await.unwrap() == big);
+
+        // A provider that damages what it keeps: the read back says so.
+        let damaging = backend::testing::WriteFaults {
+            corrupt: true,
+            ..Default::default()
+        };
+        let err = replace_with(&damaging, &key, Source::Bytes(big), CEILING)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<Error>(),
+                Some(Error::WriteUnverified { .. })
+            ),
+            "{err:#}"
+        );
     }
 }

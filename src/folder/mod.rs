@@ -53,6 +53,9 @@ pub mod exchange;
 mod history;
 pub mod integrity;
 pub mod layout;
+#[cfg(unix)]
+mod mode;
+mod place;
 mod snapshot;
 mod walk;
 
@@ -75,10 +78,11 @@ pub use error::{Error, Refusal};
 pub use history::{
     keys, keys_async, log, log_async, HistoryKey, HistoryRecord, LogOptions, Selector,
 };
+pub use place::Link;
 pub use walk::{Excludes, DEFAULT_EXCLUDES};
 
 use layout::MAX_MANIFEST_BYTES;
-use snapshot::{Snapshot, SnapshotError};
+use snapshot::{InPlace, Snapshot, SnapshotError};
 use walk::WalkError;
 
 /// How often push restarts when files change under it.
@@ -105,6 +109,9 @@ pub struct RemoteConfig {
 pub struct Remote {
     store: Store,
     prefix: String,
+    /// A `local://` remote's directory, resolved: where [`Link::Place`]
+    /// puts objects and takes them from.
+    local: Option<PathBuf>,
 }
 
 impl Remote {
@@ -126,7 +133,7 @@ impl Remote {
             }
             _ => return Err(unsupported().into()),
         };
-        let (store, prefix) = match &cfg.backend {
+        let (store, prefix, local) = match &cfg.backend {
             BackendConfig::S3 { bucket, prefix, .. } => {
                 let endpoint = config.endpoint.as_deref().ok_or(Error::EndpointRequired)?;
                 let store = backend::store::build_strict_s3(
@@ -139,14 +146,46 @@ impl Remote {
                     Some(backend::Error::CredentialsMissing) => Error::CredentialsMissing.into(),
                     _ => err.context(unusable()),
                 })?;
-                (Store::from_object_store(store.into()), prefix.clone())
+                let store = Store::from_object_store(store.into());
+                (store, prefix.clone(), None)
             }
-            BackendConfig::Local { .. } | BackendConfig::Rclone { .. } => {
-                (Store::open(&cfg).with_context(unusable)?, String::new())
+            BackendConfig::Local { path } => {
+                let store = Store::open(&cfg).with_context(unusable)?;
+                let local = std::fs::canonicalize(path).with_context(unusable)?;
+                (store, String::new(), Some(local))
             }
+            BackendConfig::Rclone { .. } => (
+                Store::open(&cfg).with_context(unusable)?,
+                String::new(),
+                None,
+            ),
             _ => return Err(unsupported().into()),
         };
-        Ok(Self { store, prefix })
+        Ok(Self {
+            store,
+            prefix,
+            local,
+        })
+    }
+
+    /// The directory of this `local://` remote, which [`Link::Place`]
+    /// needs; for any other remote [`Refusal::PlaceNeedsLocalRemote`] of
+    /// `path`, the output.
+    fn local_root(&self, path: &Path) -> Result<&Path> {
+        self.local.as_deref().ok_or_else(|| {
+            Error::Refused {
+                path: path.to_path_buf(),
+                reason: Refusal::PlaceNeedsLocalRemote,
+            }
+            .into()
+        })
+    }
+
+    /// Where the object `md5` is (or goes) in the local store at `root`.
+    fn object_path(&self, root: &Path, md5: &Hexdigest) -> PathBuf {
+        let mut path = root.to_path_buf();
+        path.extend(self.object_key(md5).split('/'));
+        path
     }
 
     fn key(&self, rel: &str) -> String {
@@ -454,12 +493,25 @@ pub struct PushOptions {
     /// objects restored as `uploaded`. Otherwise a push as usual. Status
     /// with it counts what such a push would upload. Off by default.
     pub repair: bool,
+    /// How objects reach the remote. [`Link::Copy`] (the default): each
+    /// file is snapshotted to a private temp copy while hashed, and the
+    /// copy uploaded. [`Link::Place`]: each file is hashed where it is,
+    /// with no copy, and its length and modification time checked again
+    /// after ([`Error::OutputChanged`] if they keep changing); each object
+    /// the remote lacks is then created as a new file beside its name in
+    /// the store, by reflink, hard link or copy (a symlink inside the
+    /// output always by copy of its target), read back, and renamed into
+    /// place without replacing anything (an object already there is left
+    /// alone). Only for a `local://` remote; any other is
+    /// [`Refusal::PlaceNeedsLocalRemote`]. Status with it hashes in place
+    /// too.
+    pub link: Link,
 }
 
 impl PushOptions {
     /// Push to `history` with 8 jobs, the default excludes, a token nobody
     /// else can cancel, no progress reports, forks refused, as this host,
-    /// with no root and no repair.
+    /// with no root, no repair and [`Link::Copy`].
     pub fn new(history: HistoryKey) -> Self {
         Self {
             history,
@@ -471,6 +523,7 @@ impl PushOptions {
             writer: gethostname::gethostname().to_string_lossy().into_owned(),
             root: None,
             repair: false,
+            link: Link::Copy,
         }
     }
 }
@@ -501,10 +554,16 @@ pub struct PushReport {
     /// The `.dvc` file written (or already identical) next to the output.
     pub pointer_path: PathBuf,
     pub files: usize,
-    /// Distinct contents uploaded (files with the same content count once).
+    /// Distinct contents uploaded (files with the same content count once),
+    /// or under [`Link::Place`] placed into the store.
     pub uploaded: usize,
     /// Distinct contents the remote already had.
     pub already_present: usize,
+    /// Under [`Link::Place`], of the contents placed, those placed by
+    /// reflink or hard link (the rest were copied).
+    pub linked: usize,
+    /// Of `linked`, those placed by reflink.
+    pub cloned: usize,
     /// Empty directories, which DVC cannot record.
     pub empty_dirs: usize,
     /// Non-fatal observations, e.g. a `.jsonl` without a final newline.
@@ -560,7 +619,9 @@ impl Pushed {
 /// behind, or a record the next push adopts. Last, history is listed again
 /// to report a push that raced this one ([`Pushed::Forked`]).
 /// Files are snapshotted while hashed, so an append during the push can
-/// never produce an object whose content does not match its key.
+/// never produce an object whose content does not match its key; under
+/// [`Link::Place`] they are hashed in place, and every object placed is
+/// read back and checked against its key before it gets its name.
 ///
 /// Anything push will not back up is refused as [`Error::Refused`] before
 /// anything is published; an output that keeps changing through every retry
@@ -572,8 +633,11 @@ pub fn push(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushRe
 /// [`push`] on the caller's tokio runtime (see [the module docs](self)).
 pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<PushReport> {
     let output = &confine(opts.root.as_deref(), output).await?;
+    if let Link::Place { .. } = opts.link {
+        remote.local_root(output)?;
+    }
     let (name, pointer_path, local) = locate(output).await?;
-    let mut scratch = stage(output, name, opts, |s| s).await?;
+    let mut scratch = stage(output, name, opts, |t| t).await?;
     let published = publish(
         remote,
         &mut scratch.get_mut().0,
@@ -590,6 +654,8 @@ pub async fn push_async(remote: &Remote, output: &Path, opts: &PushOptions) -> R
         files: staged.files,
         uploaded: p.uploaded,
         already_present: p.already_present,
+        linked: p.placed.linked,
+        cloned: p.placed.cloned,
         empty_dirs: staged.empty_dirs,
         warnings: staged.warnings.clone(),
         version: p.version,
@@ -604,6 +670,7 @@ struct Published {
     pointer: DvcPointer,
     uploaded: usize,
     already_present: usize,
+    placed: place::Tally,
     version: RecordId,
 }
 
@@ -612,7 +679,7 @@ struct Published {
 /// then look for a push that raced this one.
 async fn publish(
     remote: &Remote,
-    staged: &mut Staged<Snapshot>,
+    staged: &mut Staged<Taken>,
     pointer_path: &Path,
     local: Option<&DvcPointer>,
     opts: &PushOptions,
@@ -628,7 +695,7 @@ async fn publish(
     )
     .await?;
     let plan = plan(remote, staged, jobs, opts.repair).await?;
-    upload_all(remote, &plan.upload, opts).await?;
+    let placed = upload_all(remote, &plan.upload, opts).await?;
     let (uploaded, already_present, upload_manifest) =
         (plan.upload.len(), plan.present.len(), plan.manifest);
     if upload_manifest {
@@ -678,6 +745,7 @@ async fn publish(
         pointer,
         uploaded,
         already_present,
+        placed,
         version,
     })
 }
@@ -750,7 +818,8 @@ pub enum SyncState {
 /// and hashed exactly as push does, and the remote is asked which contents
 /// it has and what the heads of the history are (one listing, then the
 /// heads fetched). Nothing is written to the remote or beside the output;
-/// snapshots go to a private temp directory, one file at a time. Refuses
+/// snapshots go to a private temp directory, one file at a time, except
+/// under [`Link::Place`], which hashes each file where it is. Refuses
 /// whatever push refuses.
 pub fn status(remote: &Remote, output: &Path, opts: &PushOptions) -> Result<StatusReport> {
     block_on("status", status_async(remote, output, opts))?
@@ -763,6 +832,9 @@ pub async fn status_async(
     opts: &PushOptions,
 ) -> Result<StatusReport> {
     let output = &confine(opts.root.as_deref(), output).await?;
+    if let Link::Place { .. } = opts.link {
+        remote.local_root(output)?;
+    }
     let (name, _, local) = locate(output).await?;
     let scratch = stage(output, name, opts, |s| Hashed {
         md5: s.md5().clone(),
@@ -950,13 +1022,49 @@ trait Content {
     fn md5(&self) -> &Hexdigest;
 }
 
-impl Content for Snapshot {
-    fn md5(&self) -> &Hexdigest {
-        Snapshot::md5(self)
+/// A file of an output as push holds it once hashed: a private snapshot
+/// copy ([`Link::Copy`]), or the file itself, hashed where it is
+/// ([`Link::Place`]).
+enum Taken {
+    Snapshot(Snapshot),
+    InPlace(InPlace),
+}
+
+impl Taken {
+    /// Hash the file at `path`: into a snapshot in `tmp`, or with no
+    /// `tmp`, in place.
+    fn take(path: &Path, tmp: Option<&Path>) -> std::result::Result<Self, SnapshotError> {
+        match tmp {
+            Some(tmp) => snapshot::snapshot(path, tmp).map(Self::Snapshot),
+            None => snapshot::hash_in_place(path).map(Self::InPlace),
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Self::Snapshot(s) => s.size(),
+            Self::InPlace(f) => f.size(),
+        }
+    }
+
+    fn unterminated_line(&self) -> bool {
+        match self {
+            Self::Snapshot(s) => s.unterminated_line(),
+            Self::InPlace(f) => f.unterminated_line(),
+        }
     }
 }
 
-/// A snapshot's digest and size, the copy itself already deleted: all
+impl Content for Taken {
+    fn md5(&self) -> &Hexdigest {
+        match self {
+            Self::Snapshot(s) => s.md5(),
+            Self::InPlace(f) => f.md5(),
+        }
+    }
+}
+
+/// A file's digest and size, any snapshot copy already deleted: all
 /// status needs.
 struct Hashed {
     md5: Hexdigest,
@@ -992,37 +1100,41 @@ impl<C> Staged<C> {
     }
 }
 
-/// Snapshot `output` (named `name`) into a private temp directory, on the
-/// blocking pool; see [`stage_in`]. The snapshots and their directory are
-/// deleted with the [`Scratch`].
+/// Hash `output` (named `name`) on the blocking pool; see [`stage_in`].
+/// Under [`Link::Copy`] files are snapshotted into a private temp
+/// directory, deleted with the [`Scratch`]; under [`Link::Place`] they are
+/// hashed where they are.
 async fn stage<C: Send + 'static>(
     output: &Path,
     name: String,
     opts: &PushOptions,
-    keep: fn(Snapshot) -> C,
-) -> Result<Scratch<(Staged<C>, tempfile::TempDir)>> {
+    keep: fn(Taken) -> C,
+) -> Result<Scratch<(Staged<C>, Option<tempfile::TempDir>)>> {
     let (output, owned) = (output.to_path_buf(), opts.clone());
     unblock(&opts.cancel, move |cancel| {
         let opts = PushOptions {
             cancel: cancel.clone(),
             ..owned
         };
-        let tmp = snapshot_tmpdir()?;
-        let staged = stage_in(&output, &name, tmp.path(), &opts, keep)?;
+        let tmp = match opts.link {
+            Link::Copy => Some(snapshot_tmpdir()?),
+            Link::Place { .. } => None,
+        };
+        let staged = stage_in(&output, &name, tmp.as_ref().map(|t| t.path()), &opts, keep)?;
         Ok(Scratch(Some((staged, tmp))))
     })
     .await
 }
 
-/// Snapshot `output` (named `name`) into `tmp`, restarting while files
-/// change under it; `keep` turns each snapshot into what the caller holds.
-/// Blocks.
+/// Hash `output` (named `name`), snapshotting into `tmp` or with none in
+/// place, restarting while files change under it; `keep` turns each file
+/// taken into what the caller holds. Blocks.
 fn stage_in<C>(
     output: &Path,
     name: &str,
-    tmp: &Path,
+    tmp: Option<&Path>,
     opts: &PushOptions,
-    keep: fn(Snapshot) -> C,
+    keep: fn(Taken) -> C,
 ) -> Result<Staged<C>> {
     let meta = std::fs::symlink_metadata(output)
         .with_context(|| format!("failed to stat {}", output.display()))?;
@@ -1051,16 +1163,16 @@ fn stage_in<C>(
     .into())
 }
 
-fn hashed(s: &Snapshot) -> ProgressEvent {
+fn hashed(t: &Taken) -> ProgressEvent {
     ProgressEvent::Advanced {
         phase: Phase::Hashing,
         files: 1,
-        bytes: s.size(),
+        bytes: t.size(),
     }
 }
 
-fn warn_unterminated(relpath: &str, s: &Snapshot, warnings: &mut Vec<String>) {
-    if relpath.ends_with(".jsonl") && s.unterminated_line() {
+fn warn_unterminated(relpath: &str, t: &Taken, warnings: &mut Vec<String>) {
+    if relpath.ends_with(".jsonl") && t.unterminated_line() {
         warnings.push(format!(
             "{relpath} does not end in a newline (a line was being written)"
         ));
@@ -1070,9 +1182,9 @@ fn warn_unterminated(relpath: &str, s: &Snapshot, warnings: &mut Vec<String>) {
 fn snapshot_dir<C>(
     dir: &Path,
     name: &str,
-    tmp: &Path,
+    tmp: Option<&Path>,
     opts: &PushOptions,
-    keep: fn(Snapshot) -> C,
+    keep: fn(Taken) -> C,
 ) -> std::result::Result<Staged<C>, Retry> {
     let walk = match walk::walk(dir, &opts.exclude) {
         Ok(w) => w,
@@ -1096,7 +1208,7 @@ fn snapshot_dir<C>(
     let mut size = 0;
     for f in walk.files {
         opts.cancel.check().map_err(Retry::Fatal)?;
-        let s = snapshot::snapshot(&f.path, tmp)?;
+        let s = Taken::take(&f.path, tmp)?;
         warn_unterminated(f.relpath.as_str(), &s, &mut warnings);
         opts.progress.emit(|| hashed(&s));
         size += s.size();
@@ -1130,9 +1242,9 @@ fn snapshot_dir<C>(
 fn snapshot_file<C>(
     file: &Path,
     name: &str,
-    tmp: &Path,
+    tmp: Option<&Path>,
     opts: &PushOptions,
-    keep: fn(Snapshot) -> C,
+    keep: fn(Taken) -> C,
 ) -> std::result::Result<Staged<C>, Retry> {
     opts.cancel.check().map_err(Retry::Fatal)?;
     opts.progress.emit(|| ProgressEvent::Started {
@@ -1140,7 +1252,7 @@ fn snapshot_file<C>(
         files: 1,
         bytes: std::fs::metadata(file).ok().map(|m| m.len()),
     });
-    let s = snapshot::snapshot(file, tmp)?;
+    let s = Taken::take(file, tmp)?;
     opts.progress.emit(|| hashed(&s));
     let mut warnings = Vec::new();
     warn_unterminated(&file.to_string_lossy(), &s, &mut warnings);
@@ -1215,34 +1327,112 @@ async fn plan<'a, C: Content + Sync>(
     })
 }
 
-/// Upload `snaps`, `jobs` at a time. Once `cancel` is cancelled no upload
-/// starts; those under way finish (dropping one could orphan a multipart
-/// upload) and the push stops.
-async fn upload_all(remote: &Remote, snaps: &[&Snapshot], opts: &PushOptions) -> Result<()> {
+/// Upload `contents`, `jobs` at a time: a snapshot by uploading it, a file
+/// hashed in place by placing it into the local store ([`place_object`]).
+/// Once `cancel` is cancelled no upload starts; those under way finish
+/// (dropping one could orphan a multipart upload) and the push stops.
+async fn upload_all(
+    remote: &Remote,
+    contents: &[&Taken],
+    opts: &PushOptions,
+) -> Result<place::Tally> {
     let cancel = &opts.cancel;
     opts.progress.emit(|| ProgressEvent::Started {
         phase: Phase::Uploading,
-        files: snaps.len() as u64,
-        bytes: Some(snaps.iter().map(|s| s.size()).sum()),
+        files: contents.len() as u64,
+        bytes: Some(contents.iter().map(|c| c.size()).sum()),
     });
-    each_unordered(snaps, opts.jobs, |s| async move {
+    let link = opts.link;
+    let tallies = each_unordered(contents, opts.jobs, |c| async move {
+        let mut tally = place::Tally::default();
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(tally);
         }
-        remote
-            .store
-            .put_file(&remote.object_key(s.md5()), s.path())
-            .await
-            .with_context(|| format!("upload of {} failed", s.md5()))?;
+        let key = remote.object_key(c.md5());
+        match c {
+            Taken::Snapshot(s) => remote
+                .store
+                .put_file(&key, s.path())
+                .await
+                .with_context(|| format!("upload of {} failed", s.md5()))?,
+            Taken::InPlace(f) => {
+                let dest = remote.object_path(remote.local_root(f.path())?, f.md5());
+                let f = f.clone();
+                let placed = backend::blocking(move || place_object(&dest, &key, &f, link)).await?;
+                if let Some(method) = placed {
+                    tally.add(method);
+                }
+            }
+        }
         opts.progress.emit(|| ProgressEvent::Advanced {
             phase: Phase::Uploading,
             files: 1,
-            bytes: s.size(),
+            bytes: c.size(),
         });
-        Ok(())
+        Ok(tally)
     })
     .await?;
-    cancel.check()
+    cancel.check()?;
+    Ok(place::Tally::sum(tallies))
+}
+
+/// Place `file`, hashed in place, as the store object `key` at `dest`: a
+/// new file beside `dest` (`<name>#<random>`, a temp name no scrub or
+/// transfer takes for a store file), placed as [`Link`] says, read back
+/// and checked against the digest, then renamed to `dest` without
+/// replacing anything. `None` if an object was already there: it is left
+/// alone. A read back that differs is [`Error::OutputChanged`] if the file
+/// changed since it was hashed, else [`Error::Integrity`]; nothing gets
+/// the name either way. Blocks.
+fn place_object(
+    dest: &Path,
+    key: &str,
+    file: &InPlace,
+    link: Link,
+) -> Result<Option<place::Method>> {
+    let (Some(dir), Some(name)) = (dest.parent(), dest.file_name()) else {
+        unreachable!("an object key has a directory and a name");
+    };
+    std::fs::create_dir_all(long_path(dir)?)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    let prefix = format!("{}#", name.to_string_lossy());
+    // A symlink inside the output may point at any file, one rewritten in
+    // place among them: its target's bytes are copied, never linked.
+    let links = link.links(file.size()) && !file.symlink();
+    let placed = place::beside(file.path(), dir, &prefix, links)?;
+    if placed.md5 != *file.md5() || placed.size != file.size() {
+        if !file.unchanged()? {
+            return Err(Error::OutputChanged {
+                detail: format!("{} changed while being placed", file.path().display()),
+            }
+            .into());
+        }
+        return Err(anyhow::anyhow!(
+            "{} placed as {} read back as {} ({} bytes)",
+            file.path().display(),
+            key,
+            placed.md5,
+            placed.size
+        )
+        .context(Error::Integrity {
+            key: key.to_string(),
+        }));
+    }
+    let method = placed.method;
+    match placed.tmp.persist_noclobber(long_path(dest)?) {
+        Ok(_) => {}
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(e) => {
+            return Err(anyhow::Error::from(e.error))
+                .with_context(|| format!("failed to place {key}"))
+        }
+    }
+    // The name durable, as the store's own writes are (`with_fsync`).
+    #[cfg(unix)]
+    std::fs::File::open(long_path(dir)?)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("failed to sync {}", dir.display()))?;
+    Ok(Some(method))
 }
 
 /// The output's name: one portable path component.
@@ -1319,14 +1509,12 @@ async fn write_pointer_file(path: &Path, pointer: &DvcPointer) -> Result<()> {
     .await
 }
 
+/// Move `tmp` to `dest` with the mode a new file gets (0666 less the
+/// umask), or on an ACL-governed file system the mode its ACL gave it
+/// (see `mode`).
 fn persist_with_normal_mode(tmp: tempfile::NamedTempFile, dest: &Path) -> Result<()> {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let umask_masked = 0o666 & !current_umask();
-        tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(umask_masked))?;
-    }
+    mode::set_file_mode(tmp.as_file(), 0o666 & !current_umask())?;
     tmp.persist(long_path(dest)?)
         .with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
@@ -1390,8 +1578,8 @@ pub enum Overwrite {
 }
 
 /// How to pull. `PullOptions::default()` restores beside the `.dvc`,
-/// refuses to replace differing files, runs 8 jobs, cannot be cancelled
-/// and has no root.
+/// refuses to replace differing files, runs 8 jobs, cannot be cancelled,
+/// has no root and copies ([`Link::Copy`]).
 #[derive(Debug, Clone)]
 pub struct PullOptions {
     /// Where to restore. Defaults to the `.dvc` file's `<dir>/<path>`;
@@ -1411,6 +1599,17 @@ pub struct PullOptions {
     /// must be a real one and every file a regular one. `None` (the
     /// default): paths are used as given.
     pub root: Option<PathBuf>,
+    /// How files reach the output. [`Link::Copy`] (the default): each
+    /// object is downloaded to a temp file beside its target. [`Link::Place`]:
+    /// each is placed from the store into a new temp file beside its
+    /// target, by reflink, hard link or copy (a file restored executable is
+    /// always copied, so its mode is its own). Either way the temp file is
+    /// read back and checked against its digest, then renamed into place
+    /// as [`PullOptions::overwrite`] allows. A hard-linked file is the
+    /// store's object: it keeps the object's mode, and writing it changes
+    /// the object. Only for a `local://` remote; any other is
+    /// [`Refusal::PlaceNeedsLocalRemote`].
+    pub link: Link,
 }
 
 impl Default for PullOptions {
@@ -1422,6 +1621,7 @@ impl Default for PullOptions {
             cancel: CancelToken::default(),
             progress: Progress::default(),
             root: None,
+            link: Link::Copy,
         }
     }
 }
@@ -1439,6 +1639,11 @@ pub struct PullReport {
     pub removed: usize,
     /// Local files not in the version pulled, left as they are.
     pub extra_local: usize,
+    /// Under [`Link::Place`], files written by reflink or hard link (the
+    /// rest of `written` were copied).
+    pub linked: usize,
+    /// Of `linked`, those written by reflink.
+    pub cloned: usize,
 }
 
 /// Restore an output. Every target is classified before anything is written:
@@ -1446,8 +1651,9 @@ pub struct PullReport {
 /// differing files are refused (as [`Error::PullConflict`]) unless
 /// [`PullOptions::overwrite`] allows replacing them; for a pull from
 /// history, so is a `.dvc` beside `into` that push would refuse to replace.
-/// Files are downloaded to a temp file beside their target, verified, then
-/// renamed into place — never linked. Local files not in the version are
+/// Files are downloaded to a temp file beside their target (or under
+/// [`Link::Place`] placed there from the store), verified, then renamed
+/// into place; only [`Link::Place`] links. Local files not in the version are
 /// left alone, except as [`Overwrite::IfUnchanged`] says. A pull from
 /// history writes its `.dvc` last, once every file is in place. A history
 /// selector that matches nothing is [`Error::NoSuchVersion`]; `Latest` in a
@@ -1487,6 +1693,9 @@ pub async fn pull_async(
         (None, Some(into), None) => into,
         (None, None, _) => return Err(Error::DestinationRequired.into()),
     };
+    if let Link::Place { .. } = opts.link {
+        remote.local_root(&into)?;
+    }
     // The `.dvc` a pull from history writes, checked before anything is,
     // and the base its old content records.
     let (beside, base) = match version {
@@ -1555,7 +1764,7 @@ pub async fn pull_async(
             DvcOutput::Dir { .. } => None,
         },
     });
-    let written = fetch_and_place(remote, checked.by_object, opts, mode).await?;
+    let (written, placed) = fetch_and_place(remote, checked.by_object, opts, mode).await?;
     opts.cancel.check()?;
     let remove = checked.remove;
     let removed = remove.len();
@@ -1576,6 +1785,8 @@ pub async fn pull_async(
         unchanged: checked.unchanged,
         removed,
         extra_local: checked.extra_local,
+        linked: placed.linked,
+        cloned: placed.cloned,
     })
 }
 
@@ -1984,20 +2195,32 @@ fn count_extra(
 }
 
 /// Download each object once and place it at every path that needs it,
-/// with `mode`, `opts.jobs` objects at a time. Once cancelled no download
-/// starts; those under way finish and are placed whole, and the pull stops.
-/// A downloaded object is placed on the blocking pool, and placed whole
-/// even if the future is dropped meanwhile.
+/// with `mode`, `opts.jobs` objects at a time; under [`Link::Place`],
+/// place it from the local store at each path instead ([`place_linked`]).
+/// Once cancelled no download starts; those under way finish and are
+/// placed whole, and the pull stops. A downloaded object is placed on the
+/// blocking pool, and placed whole even if the future is dropped
+/// meanwhile. Returns the files written and how they were placed.
 async fn fetch_and_place(
     remote: &Remote,
     by_object: BTreeMap<Hexdigest, Vec<(PathBuf, Replace)>>,
     opts: &PullOptions,
     mode: WorktreeMode,
-) -> Result<usize> {
+) -> Result<(usize, place::Tally)> {
     let cancel = &opts.cancel;
-    let counts: Vec<usize> = each_unordered(by_object, opts.jobs, |(md5, places)| async move {
+    let link = opts.link;
+    let counts = each_unordered(by_object, opts.jobs, |(md5, places)| async move {
         if cancel.is_cancelled() {
-            return Ok(0);
+            return Ok((0, place::Tally::default()));
+        }
+        let progress = opts.progress.clone();
+        if let Link::Place { .. } = link {
+            let source = remote.object_path(remote.local_root(&places[0].0)?, &md5);
+            let key = remote.object_key(&md5);
+            return backend::blocking(move || {
+                place_linked(&source, &key, &md5, &places, mode, link, &progress)
+            })
+            .await;
         }
         let dir = places[0].0.parent().context("target has no parent")?;
         tokio::fs::create_dir_all(dir).await?;
@@ -2006,12 +2229,58 @@ async fn fetch_and_place(
             .download_verified(&remote.object_key(&md5), &md5, &long_path(dir)?)
             .await
             .map_err(archived)?;
-        let progress = opts.progress.clone();
-        backend::blocking(move || place_all(tmp, &places, mode, &progress)).await
+        let written = backend::blocking(move || place_all(tmp, &places, mode, &progress)).await?;
+        Ok((written, place::Tally::default()))
     })
     .await?;
     cancel.check()?;
-    Ok(counts.into_iter().sum())
+    let (written, tallies): (Vec<usize>, Vec<place::Tally>) = counts.into_iter().unzip();
+    Ok((written.into_iter().sum(), place::Tally::sum(tallies)))
+}
+
+/// Place the store object `key` (content `md5`), the file `source` of a
+/// local store, at every path in `places`: each as a new temp file beside
+/// its path, made as `link` says (an executable always by copy: a hard
+/// link would share its mode with the store), read back and checked
+/// against `md5`, then moved into place. Blocks.
+fn place_linked(
+    source: &Path,
+    key: &str,
+    md5: &Hexdigest,
+    places: &[(PathBuf, Replace)],
+    mode: WorktreeMode,
+    link: Link,
+    progress: &Progress,
+) -> Result<(usize, place::Tally)> {
+    let bytes = match std::fs::metadata(long_path(source)?) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("{key} is not on the remote")
+        }
+        Err(e) => return Err(e).with_context(|| format!("failed to stat {}", source.display())),
+    };
+    let links = link.links(bytes) && mode == WorktreeMode::Regular;
+    let mut tally = place::Tally::default();
+    for (path, replace) in places {
+        let parent = path.parent().context("target has no parent")?;
+        std::fs::create_dir_all(long_path(parent)?)?;
+        let placed = place::beside(source, parent, ".tmp", links)?;
+        anyhow::ensure!(
+            placed.md5 == *md5 && placed.size == bytes,
+            "integrity check failed for {key}: expected {md5}, got {}",
+            placed.md5
+        );
+        // A hard link is the store's object: its mode is not ours to set.
+        let own_mode = placed.method != place::Method::Linked;
+        place(placed.tmp, path, replace, mode, own_mode)?;
+        tally.add(placed.method);
+    }
+    progress.emit(|| ProgressEvent::Advanced {
+        phase: Phase::Downloading,
+        files: places.len() as u64,
+        bytes,
+    });
+    Ok((places.len(), tally))
 }
 
 /// Place a verified download at every path in `places`: copies from it
@@ -2028,10 +2297,10 @@ fn place_all(
         std::fs::create_dir_all(parent)?;
         let mut copy = tempfile::NamedTempFile::new_in(long_path(parent)?)?;
         std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut copy)?;
-        place(copy, path, replace, mode)?;
+        place(copy, path, replace, mode, true)?;
     }
     let (first, replace) = &places[0];
-    place(tmp, first, replace, mode)?;
+    place(tmp, first, replace, mode, true)?;
     progress.emit(|| ProgressEvent::Advanced {
         phase: Phase::Downloading,
         files: places.len() as u64,
@@ -2040,29 +2309,28 @@ fn place_all(
     Ok(places.len())
 }
 
-/// Move a verified temp file into place with `mode`'s permissions (the
-/// umask applies): never replacing a file that appeared since
-/// classification, nor one that changed since, unless the caller forced
-/// replacement.
+/// Move a verified temp file into place, with `mode`'s permissions (the
+/// umask applies) when `set_mode`: never replacing a file that appeared
+/// since classification, nor one that changed since, unless the caller
+/// forced replacement.
 fn place(
     tmp: tempfile::NamedTempFile,
     path: &Path,
     replace: &Replace,
     mode: WorktreeMode,
+    set_mode: bool,
 ) -> Result<()> {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    if set_mode {
         let bits = match mode {
             WorktreeMode::Regular => 0o666,
             WorktreeMode::Executable => 0o777,
         };
-        tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(bits & !current_umask()))?;
+        mode::set_file_mode(tmp.as_file(), bits & !current_umask())?;
     }
     // Windows has no execute bit.
     #[cfg(not(unix))]
-    let _ = mode;
+    let _ = (mode, set_mode);
     if let Replace::Unchanged(md5) = replace {
         still_unchanged(path, md5)?;
     }
@@ -2088,15 +2356,17 @@ fn place(
 
 /// Give a file already in place, which a `.dvc` marks executable, the
 /// execute bits the umask allows, as a new executable would get. No-op off
-/// unix (no execute bit) or if the owner can already execute it.
+/// unix (no execute bit) or if the owner can already execute it. On an
+/// ACL-governed file system that refuses it, a file this user owns keeps
+/// its mode; one owned by someone else still fails (see `mode`).
 fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode();
-        if mode & 0o100 == 0 {
-            let mode = mode | (0o111 & !current_umask());
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(path)?;
+        let bits = meta.permissions().mode();
+        if bits & 0o100 == 0 {
+            mode::set_path_mode(path, bits | (0o111 & !current_umask()), meta.uid())
                 .with_context(|| format!("failed to make {} executable", path.display()))?;
         }
     }
@@ -2117,5 +2387,173 @@ mod tests {
         let dir = snapshot_tmpdir().unwrap();
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
+
+    fn md5(bytes: &[u8]) -> Hexdigest {
+        crate::hash::hash_reader(&mut &bytes[..], crate::types::HashFunction::Md5).unwrap()
+    }
+
+    /// Where the object `md5` goes under `store`, and its key.
+    fn object_at(store: &Path, md5: &Hexdigest) -> (PathBuf, String) {
+        let key = Layout::default().object_key(md5).unwrap();
+        let mut path = store.to_path_buf();
+        path.extend(key.split('/'));
+        (path, key)
+    }
+
+    /// The names in `dir`, if it exists.
+    fn names(dir: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    const PLACE: Link = Link::Place { min_bytes: 0 };
+
+    #[test]
+    fn a_file_rewritten_after_it_was_hashed_is_never_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("table.parquet");
+        std::fs::write(&work, b"PAR1 aaaa").unwrap();
+        let hashed = snapshot::hash_in_place(&work).unwrap();
+        let (dest, key) = object_at(&dir.path().join("store"), hashed.md5());
+        let stamp = std::fs::metadata(&work).unwrap().modified().unwrap();
+
+        // Same length, mtime set back: only the read back can tell.
+        let rewrite = |bytes: &[u8], mtime| {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+            f.write_all(bytes).unwrap();
+            f.set_modified(mtime).unwrap();
+        };
+        rewrite(b"PAR1 bbbb", stamp);
+        let err = place_object(&dest, &key, &hashed, PLACE).unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<Error>(), Some(Error::Integrity { key: k }) if *k == key),
+            "{err:#}"
+        );
+        assert!(names(dest.parent().unwrap()).is_empty());
+
+        // A stamp that moved: the file changed.
+        rewrite(b"PAR1 cccc", stamp + std::time::Duration::from_secs(10));
+        let err = place_object(&dest, &key, &hashed, PLACE).unwrap_err();
+        let Some(Error::OutputChanged { detail }) = err.downcast_ref::<Error>() else {
+            panic!("{err:#}")
+        };
+        assert_eq!(
+            *detail,
+            format!("{} changed while being placed", work.display())
+        );
+        assert!(names(dest.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn an_object_already_in_the_store_is_left_alone_and_the_temp_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("table.parquet");
+        std::fs::write(&work, b"PAR1 rows").unwrap();
+        let hashed = snapshot::hash_in_place(&work).unwrap();
+        let (dest, key) = object_at(&dir.path().join("store"), hashed.md5());
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"PAR1 rows").unwrap();
+        let before = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        assert_eq!(place_object(&dest, &key, &hashed, PLACE).unwrap(), None);
+        let name = dest.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(names(dest.parent().unwrap()), vec![name]);
+        let after = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_damaged_store_object_is_never_placed_into_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = md5(b"PAR1 rows");
+        let (source, key) = object_at(&dir.path().join("store"), &good);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"PAR1 rowz").unwrap();
+        let out = dir.path().join("out");
+        let target = out.join("table.parquet");
+        let places = [(target.clone(), Replace::Nothing)];
+        let err = place_linked(
+            &source,
+            &key,
+            &good,
+            &places,
+            WorktreeMode::Regular,
+            PLACE,
+            &Progress::default(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("integrity check failed"),
+            "{err:#}"
+        );
+        assert!(names(&out).is_empty(), "{:?}", names(&out));
+    }
+
+    const EACCES: i32 = 13;
+    const EPERM: i32 = 1;
+
+    fn temp_with(dir: &Path, bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut tmp = tempfile::NamedTempFile::new_in(dir).unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn an_acl_that_refuses_chmod_with_eperm_leaves_the_mode_it_gave() {
+        // As a TrueNAS SMB share (NFSv4 ACL, aclmode=restricted) does: the
+        // file is placed with the mode the file system gave it.
+        let dir = tempfile::tempdir().unwrap();
+        let _eperm = mode::fail_chmod(EPERM);
+        let pointer = dir.path().join("out.dvc");
+        persist_with_normal_mode(temp_with(dir.path(), b"p"), &pointer).unwrap();
+        assert_eq!(std::fs::read(&pointer).unwrap(), b"p");
+
+        let pulled = dir.path().join("pulled");
+        let tmp = temp_with(dir.path(), b"x");
+        place(
+            tmp,
+            &pulled,
+            &Replace::Nothing,
+            WorktreeMode::Executable,
+            true,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&pulled).unwrap(), b"x");
+
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"y").unwrap();
+        let before = std::fs::metadata(&plain).unwrap().permissions().mode();
+        make_executable(&plain).unwrap();
+        let after = std::fs::metadata(&plain).unwrap().permissions().mode();
+        assert_eq!(after, before, "{after:o}");
+    }
+
+    #[test]
+    fn any_other_chmod_error_still_fails_and_places_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _eacces = mode::fail_chmod(EACCES);
+        let pointer = dir.path().join("out.dvc");
+        let err = persist_with_normal_mode(temp_with(dir.path(), b"p"), &pointer).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().raw_os_error(),
+            Some(EACCES),
+            "{err:#}"
+        );
+        assert!(!pointer.exists());
+
+        let pulled = dir.path().join("pulled");
+        let tmp = temp_with(dir.path(), b"x");
+        place(tmp, &pulled, &Replace::Nothing, WorktreeMode::Regular, true).unwrap_err();
+        assert!(!pulled.exists());
+
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"y").unwrap();
+        make_executable(&plain).unwrap_err();
     }
 }

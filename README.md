@@ -475,6 +475,24 @@ What it guarantees:
   snapshot while being hashed, so an uploaded object always matches its key.
   Files that change or vanish mid-push are retried; after 3 tries push fails.
   A `.jsonl` without a final newline is a warning.
+- **Single storage for write-once files** (library only:
+  `Link::Place { min_bytes }` on `PushOptions`/`PullOptions`, `local://`
+  remotes only). Push hashes each file where it is, with no snapshot, and
+  places it into the store as a new file: a reflink (APFS `clonefile`,
+  Linux `FICLONE` on btrfs, XFS or ZFS ≥ 2.2 with block cloning, ReFS)
+  when it is at least `min_bytes`, else a hard link, else a copy; a
+  symlink inside the output is always copied (its target's bytes). Pull
+  places store objects into the output the same way. Every placed file is
+  read back and checked before it gets its name, and nothing is ever
+  cloned into an existing file. A hard link is one file under two names:
+  write it in place and the store's object changes too (a scrub then finds
+  it damaged), so use it only for files nothing rewrites.
+- **Uploads are checked.** Objects up to 1 GiB go up in one PUT, whose S3
+  ETag is their md5: that proves the write, and later scrubs prove the
+  object from the listing alone. Larger objects go up in parts and are
+  read back whole, after the upload and on every S3 scrub. A single PUT
+  holds its object in memory; all of them share a 1 GiB budget per
+  process, so a push needs about 1 GiB of RAM at most, whatever `--jobs`.
 - **History without git.** Every push that changes an output records a
   version under `bigstore-history/<key>/` on the remote; a push that changes
   nothing adds nothing. History is a graph, not a timeline: each version
@@ -489,9 +507,9 @@ What it guarantees:
   `.dvc`'s base has them; `--force` replaces any), deletes nothing but what
   `--if-unchanged` proves unchanged since the base (it is in that version
   on the remote), never writes through a symlink, and writes via temp file
-  plus rename (never a link). A single file DVC marked executable
-  (`isexec: true` in its `.dvc`) is restored executable on unix (0777
-  minus umask), and an identical copy
+  plus rename (never a link, unless `Link::Place` asks for one). A single
+  file DVC marked executable (`isexec: true` in its `.dvc`) is restored
+  executable on unix (0777 minus umask), and an identical copy
   already there is made executable. Push records no modes, so a version
   pulled from history never is. DVC's `dvc add` writes no modes into a
   `.dir` manifest; an entry that has one (a manifest hashed with per-file

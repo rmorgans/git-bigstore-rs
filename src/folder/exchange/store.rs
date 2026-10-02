@@ -301,12 +301,10 @@ impl Incoming {
     fn place(self) -> Result<Landed> {
         let (path, key) = (self.path.clone(), self.key.clone());
         let tmp = self.checked()?;
+        // On an ACL-governed file system that refuses it, the file keeps
+        // the mode its ACL gave it.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tmp.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o666 & !umask()))?;
-        }
+        crate::folder::mode::set_file_mode(tmp.as_file(), 0o666 & !umask())?;
         match tmp.persist_noclobber(long_path(&path)?) {
             Ok(_) => Ok(Landed::Stored),
             Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Landed::Present),
@@ -332,4 +330,48 @@ impl Incoming {
 fn umask() -> u32 {
     static UMASK: LazyLock<u32> = LazyLock::new(crate::folder::current_umask);
     *UMASK
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A received object, placed while every `chmod` fails with `errno`.
+    fn receive_with_chmod_failing(errno: i32) -> (tempfile::TempDir, String, Result<Landed>) {
+        let body = b"labels\n";
+        let md5 = crate::hash::hash_reader(&mut &body[..], crate::types::HashFunction::Md5)
+            .unwrap()
+            .to_string();
+        let key = format!("files/md5/{}/{}", &md5[..2], &md5[2..]);
+        let root = tempfile::tempdir().unwrap();
+        let _chmod = crate::folder::mode::fail_chmod(errno);
+        let mut incoming = Incoming::begin(root.path(), &key, body.len() as u64).unwrap();
+        incoming.write(body).unwrap();
+        let landed = incoming.place();
+        (root, key, landed)
+    }
+
+    #[test]
+    fn a_received_file_is_placed_where_an_acl_refuses_chmod_with_eperm() {
+        let (root, key, landed) = receive_with_chmod_failing(1);
+        assert!(matches!(landed, Ok(Landed::Stored)));
+        assert_eq!(
+            std::fs::read(path_of(root.path(), &key)).unwrap(),
+            b"labels\n"
+        );
+    }
+
+    #[test]
+    fn any_other_chmod_error_refuses_the_file_and_leaves_nothing() {
+        let (root, key, landed) = receive_with_chmod_failing(13);
+        let err = landed.err().expect("refused");
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().raw_os_error(),
+            Some(13),
+            "{err:#}"
+        );
+        let dir = path_of(root.path(), &key);
+        let dir = dir.parent().unwrap();
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+    }
 }

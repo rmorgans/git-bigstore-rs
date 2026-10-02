@@ -148,14 +148,18 @@ impl Store {
         }
     }
 
-    /// Store `bytes` at `key` (small objects: manifests, pointers).
+    /// Store `bytes` at `key` (small objects: manifests, records), in one
+    /// PUT checked as [`Store::put_file`] checks one: an ETag equal to the
+    /// md5 of `bytes` proves it, else the object is read back.
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         match &self.transport {
             Transport::ObjectStore(store) => {
-                store
-                    .put(&object_store::path::Path::from(key), bytes.into())
-                    .await?;
-                Ok(())
+                let (bytes, md5) = blocking(move || {
+                    let md5 = md5_of(&bytes);
+                    Ok((bytes, md5))
+                })
+                .await?;
+                put_once(store.as_ref(), key, bytes, &md5).await
             }
             Transport::Rclone(r) => {
                 let tmp = tempfile::NamedTempFile::new()?;
@@ -165,14 +169,21 @@ impl Store {
         }
     }
 
-    /// Store the file at `path` at `key`, streaming it: large files go up
-    /// in parts, and a failed read aborts the upload (see `put_streaming`).
+    /// Store the file at `path` at `key`, checked. Up to
+    /// [`SINGLE_PUT_MAX`] it goes up in one PUT, held in memory meanwhile
+    /// within the process's single-PUT budget (see [`SINGLE_PUT_MAX`]),
+    /// and an ETag equal to the md5 of the bytes sent (what S3 gives a
+    /// single PUT) proves the write; larger files stream up in parts (a
+    /// failed read aborts the upload, see `put_streaming`), and their ETag
+    /// never is their md5. Without that proof the object is read back
+    /// whole and hashed: not the bytes sent (or gone) is
+    /// [`folder::Error::WriteUnverified`](crate::folder::Error::WriteUnverified),
+    /// a read back that fails is
+    /// [`folder::Error::Unreadable`](crate::folder::Error::Unreadable). An
+    /// `rclone://` store's upload is rclone's own, unchanged.
     pub async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
         match &self.transport {
-            Transport::ObjectStore(store) => {
-                let file = tokio::fs::File::open(path).await?;
-                put_streaming(Arc::clone(store), object_store::path::Path::from(key), file).await
-            }
+            Transport::ObjectStore(store) => put_checked(store, key, path, SINGLE_PUT_MAX).await,
             Transport::Rclone(r) => r.upload(path, key).await,
         }
     }
@@ -342,6 +353,167 @@ async fn rclone_into(
         Ok(tempfile::NamedTempFile::from_parts(file, path))
     })
     .await
+}
+
+/// Objects up to this size are written with one PUT, whose S3 ETag is the
+/// md5 of the bytes, so the write (and every later S3 scrub of it) is
+/// proven without reading it back; larger ones by multipart upload, read
+/// back whole after writing and on every S3 scrub. A PUT holds the object
+/// in memory, so this stays well below S3's 5 GiB limit, and the bodies of
+/// single PUTs that bigstore reads into memory (by
+/// [`Store::put_file`] and `folder::integrity::replace`) share one budget
+/// of this many bytes across the process, whatever the job count: small
+/// objects go up side by side, large ones one after another.
+pub const SINGLE_PUT_MAX: u64 = 1 << 30;
+
+/// The single-PUT budget: one permit per byte.
+static PUT_BUDGET: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(SINGLE_PUT_MAX as usize);
+
+/// Room in the single-PUT budget for a body of `size` bytes (at most
+/// [`SINGLE_PUT_MAX`]), held until the permit drops.
+pub(crate) async fn put_budget(size: u64) -> tokio::sync::SemaphorePermit<'static> {
+    let permits = u32::try_from(size.min(SINGLE_PUT_MAX)).expect("1 GiB fits in u32");
+    PUT_BUDGET
+        .acquire_many(permits)
+        .await
+        .expect("the budget is never closed")
+}
+
+/// An ETag as a bare value: quotes and a weak marker gone.
+pub(crate) fn etag_value(etag: &str) -> &str {
+    etag.strip_prefix("W/").unwrap_or(etag).trim_matches('"')
+}
+
+fn md5_of(bytes: &[u8]) -> Hexdigest {
+    let mut hasher = crate::hash::Hasher::new(crate::types::HashFunction::Md5);
+    hasher.update(bytes);
+    hasher.finalize()
+}
+
+/// PUT `bytes`, whose md5 is `md5`, at `key`: proven by an ETag equal to
+/// `md5`, else read back.
+async fn put_once(
+    store: &dyn ObjectStore,
+    key: &str,
+    bytes: Vec<u8>,
+    md5: &Hexdigest,
+) -> Result<()> {
+    let location = object_store::path::Path::from(key);
+    let put = store.put(&location, bytes.into()).await?;
+    let proven = put
+        .e_tag
+        .is_some_and(|etag| etag_value(&etag).eq_ignore_ascii_case(&md5.to_string()));
+    if proven {
+        return Ok(());
+    }
+    read_back(store, key, &location, md5).await
+}
+
+/// [`Store::put_file`] on an object_store client, with files over
+/// `single_max` bytes uploaded in parts.
+async fn put_checked(
+    store: &Arc<dyn ObjectStore>,
+    key: &str,
+    path: &Path,
+    single_max: u64,
+) -> Result<()> {
+    use crate::types::HashFunction;
+
+    let file = tokio::fs::File::open(path).await?;
+    let size = file.metadata().await?.len();
+    if size <= single_max {
+        drop(file);
+        let _budget = put_budget(size).await;
+        let path = path.to_path_buf();
+        let (bytes, md5) = blocking(move || {
+            use std::io::Read;
+            let mut bytes = Vec::with_capacity(size as usize);
+            std::fs::File::open(&path)?
+                .take(size + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 == size,
+                "{} changed while being uploaded",
+                path.display()
+            );
+            let md5 = md5_of(&bytes);
+            Ok((bytes, md5))
+        })
+        .await?;
+        return put_once(store.as_ref(), key, bytes, &md5).await;
+    }
+    // Hashed first, on the blocking pool; a file that changes before its
+    // upload reads back as other bytes.
+    let hashed = path.to_path_buf();
+    let md5 = blocking(move || crate::hash::hash_file(&hashed, HashFunction::Md5)).await?;
+    let location = object_store::path::Path::from(key);
+    put_streaming(Arc::clone(store), location.clone(), file).await?;
+    read_back(store.as_ref(), key, &location, &md5).await
+}
+
+/// Read the object just written at `location` whole and check it is the
+/// bytes `md5` names: [`folder::Error::WriteUnverified`] if not (or gone),
+/// [`folder::Error::Unreadable`] if it cannot be read whole. Hashed on the
+/// blocking pool, a mebibyte at a time.
+///
+/// [`folder::Error::WriteUnverified`]: crate::folder::Error::WriteUnverified
+/// [`folder::Error::Unreadable`]: crate::folder::Error::Unreadable
+async fn read_back(
+    store: &dyn ObjectStore,
+    key: &str,
+    location: &object_store::path::Path,
+    md5: &Hexdigest,
+) -> Result<()> {
+    use crate::folder::Error as FolderError;
+    use futures::StreamExt;
+
+    let unverified = || FolderError::WriteUnverified { key: key.into() }.into();
+    let unreadable = |reason: String| -> anyhow::Error {
+        FolderError::Unreadable {
+            key: key.into(),
+            reason,
+        }
+        .into()
+    };
+    let result = match store.get(location).await {
+        Ok(result) => result,
+        Err(object_store::Error::NotFound { .. }) => return Err(unverified()),
+        Err(e) => return Err(unreadable(e.to_string())),
+    };
+    let length = result.range.end - result.range.start;
+    let mut stream = result.into_stream();
+    let mut hasher = crate::hash::Hasher::new(md5.hash_fn());
+    let mut pending: Vec<u8> = Vec::new();
+    let mut got = 0u64;
+    loop {
+        let chunk = stream.next().await;
+        if let Some(chunk) = &chunk {
+            let chunk = chunk.as_ref().map_err(|e| unreadable(e.to_string()))?;
+            got += chunk.len() as u64;
+            pending.extend_from_slice(chunk);
+        }
+        if pending.len() >= 1 << 20 || (chunk.is_none() && !pending.is_empty()) {
+            let bytes = std::mem::take(&mut pending);
+            hasher = blocking(move || {
+                hasher.update(&bytes);
+                Ok(hasher)
+            })
+            .await?;
+        }
+        if chunk.is_none() {
+            break;
+        }
+    }
+    if got != length {
+        return Err(unreadable(format!(
+            "read {got} bytes of the {length} written"
+        )));
+    }
+    if hasher.finalize() != *md5 {
+        return Err(unverified());
+    }
+    Ok(())
 }
 
 /// Stream `reader` into `path`. A failed read aborts any multipart upload
@@ -673,5 +845,127 @@ mod tests {
                 format!("incomplete download of {KEY} (32/64 bytes)")
             );
         }
+    }
+
+    /// `put_checked` of a file of `size` patterned bytes into `store`,
+    /// going multipart over `single_max`; the object written, as read back.
+    async fn put_through(
+        store: &Arc<testing::WriteFaults>,
+        size: usize,
+        single_max: u64,
+    ) -> (Result<()>, Option<Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("object");
+        let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file, &body).unwrap();
+        let as_dyn: Arc<dyn ObjectStore> = store.clone();
+        let put = put_checked(&as_dyn, KEY, &file, single_max).await;
+        let stored = match store.inner.get(&StorePath::from(KEY)).await {
+            Ok(got) => Some(got.bytes().await.unwrap().to_vec()),
+            Err(_) => None,
+        };
+        (put, stored)
+    }
+
+    fn write_unverified(err: &anyhow::Error) -> bool {
+        matches!(
+            err.downcast_ref::<crate::folder::Error>(),
+            Some(crate::folder::Error::WriteUnverified { key }) if key == KEY
+        )
+    }
+
+    #[tokio::test]
+    async fn a_single_put_whose_etag_is_its_md5_needs_no_read_back() {
+        let store = Arc::new(testing::WriteFaults {
+            md5_etags: true,
+            ..Default::default()
+        });
+        let (put, stored) = put_through(&store, 3 << 20, SINGLE_PUT_MAX).await;
+        put.unwrap();
+        assert_eq!(stored.unwrap().len(), 3 << 20);
+        assert_eq!(store.multiparts.load(Ordering::SeqCst), 0);
+        assert_eq!(store.gets.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_single_put_whose_etag_is_not_its_md5_is_read_back() {
+        // Over BufWriter's 10 MiB, which went multipart before 0.7.
+        let store = Arc::new(testing::WriteFaults::default());
+        let (put, _) = put_through(&store, 11 << 20, SINGLE_PUT_MAX).await;
+        put.unwrap();
+        assert_eq!(store.multiparts.load(Ordering::SeqCst), 0);
+        assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+
+        let damaging = Arc::new(testing::WriteFaults {
+            corrupt: true,
+            ..Default::default()
+        });
+        let (put, _) = put_through(&damaging, 4096, SINGLE_PUT_MAX).await;
+        let err = put.unwrap_err();
+        assert!(write_unverified(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn an_object_over_the_single_put_ceiling_goes_in_parts_and_is_read_back() {
+        let store = Arc::new(testing::WriteFaults::default());
+        let (put, stored) = put_through(&store, 11 << 20, 1 << 20).await;
+        put.unwrap();
+        assert_eq!(stored.unwrap().len(), 11 << 20);
+        assert_eq!(store.multiparts.load(Ordering::SeqCst), 1);
+        assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+
+        let damaging = Arc::new(testing::WriteFaults {
+            corrupt: true,
+            ..Default::default()
+        });
+        let (put, _) = put_through(&damaging, 11 << 20, 1 << 20).await;
+        let err = put.unwrap_err();
+        assert!(write_unverified(&err), "{err:#}");
+        assert_eq!(damaging.multiparts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_manifest_or_record_put_is_proven_by_its_etag_or_read_back() {
+        let proven = Arc::new(testing::WriteFaults {
+            md5_etags: true,
+            ..Default::default()
+        });
+        Store::from_object_store(proven.clone())
+            .put(KEY, BODY.to_vec())
+            .await
+            .unwrap();
+        assert_eq!(proven.gets.load(Ordering::SeqCst), 0);
+
+        let unproven = Arc::new(testing::WriteFaults::default());
+        Store::from_object_store(unproven.clone())
+            .put(KEY, BODY.to_vec())
+            .await
+            .unwrap();
+        assert_eq!(unproven.gets.load(Ordering::SeqCst), 1);
+
+        let damaging = Arc::new(testing::WriteFaults {
+            corrupt: true,
+            ..Default::default()
+        });
+        let err = Store::from_object_store(damaging)
+            .put(KEY, BODY.to_vec())
+            .await
+            .unwrap_err();
+        assert!(write_unverified(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn single_put_bodies_share_one_budget_across_the_process() {
+        // A body as large as the budget leaves no room for another byte
+        // until it is sent, however many jobs run.
+        let full = put_budget(SINGLE_PUT_MAX).await;
+        let waiting = tokio::spawn(async { drop(put_budget(1).await) });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        drop(full);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

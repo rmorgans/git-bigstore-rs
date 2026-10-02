@@ -964,6 +964,7 @@ fn cmd_folder(cmd: FolderCommand) -> Result<()> {
                     cancel: cancel_on_ctrl_c()?,
                     progress: progress_bars(),
                     root: None,
+                    link: folder::Link::Copy,
                 },
             )?;
             eprintln!(
