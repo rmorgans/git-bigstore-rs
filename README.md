@@ -1025,8 +1025,8 @@ integrity::quarantine(&*store, &damaged_object)?; // objects and manifests only:
   `quarantine/<key>.<UTC time>` in the same store (on a
   `LocalFileSystem` a hard link, so not on FAT or exFAT), then writes the
   new bytes in one atomic PUT (on a `LocalFileSystem`, a temp file renamed
-  over the name; files over 10 MiB by multipart upload, checked as they
-  go, aborted if any part fails). Last it checks the write: an ETag equal
+  over the name; objects over 4 GiB, `SINGLE_PUT_MAX`, by multipart upload,
+  checked as they go, aborted if any part fails). Last it checks the write: an ETag equal
   to the md5, else a read back: not what its name says,
   `Error::WriteUnverified`; unreadable, `Error::Unreadable` (the write may
   be fine). Concurrent heals of one key converge on good bytes.
