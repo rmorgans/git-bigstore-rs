@@ -667,7 +667,8 @@ mod tests {
     type BoxFut<'a, T> = Pin<Box<dyn Future<Output = object_store::Result<T>> + Send + 'a>>;
 
     /// `InMemory` recording every GET (not HEAD) of a history record, and
-    /// cancelling `cancel_on_get` at each.
+    /// cancelling `cancel_on_get` at each. A PUT answers with the md5 of
+    /// its bytes as its ETag, as S3 does, so writes need no read back.
     #[derive(Debug, Default)]
     struct CountingStore {
         inner: InMemory,
@@ -699,7 +700,15 @@ mod tests {
             'l: 'a,
             Self: 'a,
         {
-            self.inner.put_opts(location, payload, opts)
+            Box::pin(async move {
+                let bytes: Vec<u8> = payload.iter().flat_map(|b| b.to_vec()).collect();
+                let mut hasher = crate::hash::Hasher::new(crate::types::HashFunction::Md5);
+                hasher.update(&bytes);
+                let md5 = hasher.finalize();
+                let mut put = self.inner.put_opts(location, bytes.into(), opts).await?;
+                put.e_tag = Some(format!("\"{md5}\""));
+                Ok(put)
+            })
         }
 
         fn put_multipart_opts<'s, 'l, 'a>(

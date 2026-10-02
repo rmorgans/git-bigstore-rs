@@ -52,9 +52,6 @@ hex = "0.4"
 indicatif = { version = "0.18.4", optional = true }
 md-5 = "0.10.6"
 object_store = { version = "0.14", features = ["aws-base", "reqwest"] }
-# Folder push and pull with `Link::Place`: clonefile (macOS), FICLONE (Linux),
-# block cloning (Windows ReFS).
-reflink-copy = "0.1.30"
 # Direct only to choose reqwest's TLS crypto: object_store needs rustls, and
 # `rustls-no-provider` leaves the provider to the aws-lc-rs / ring features.
 # object_store already depends on it.
@@ -78,6 +75,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 unicode-normalization = "0.1.25"
 url = "2"
 walkdir = "2.5.0"
+
+# Linux `FICLONE` for `Link::Place`, made with no chmod after it (an ACL that
+# refuses chmod would otherwise fail the clone), and `geteuid`.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+
+# `Link::Place` reflinks elsewhere: clonefile (macOS), block cloning (Windows
+# ReFS).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+reflink-copy = "0.1.30"
 
 [profile.release]
 lto = true

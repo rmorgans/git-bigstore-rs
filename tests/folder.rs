@@ -4209,6 +4209,48 @@ fn place_links_large_files_into_the_store_and_back_and_copies_small_ones() {
         .filter(|(k, _)| k.contains(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // Re-place a differing file, as a heal does: Force, Place. The bad file
+    // is replaced by temp + rename (never written through, which would
+    // write a hard-linked store object too).
+    let staged = e.data.join("bad.tmp");
+    std::fs::write(&staged, vec![9u8; table.len()]).unwrap();
+    std::fs::rename(&staged, &restored).unwrap();
+    let replaced = folder::pull(
+        &e.remote,
+        &history("runs/1", Selector::Latest),
+        &PullOptions {
+            overwrite: Overwrite::Force,
+            link: Link::Place {
+                min_bytes: MIB as u64,
+            },
+            ..pull_opts(Some(into.clone()))
+        },
+    )
+    .unwrap();
+    assert_eq!((replaced.written, replaced.linked), (1, 1));
+    assert_eq!(std::fs::read(&restored).unwrap(), table);
+    assert_eq!(std::fs::read(&table_obj).unwrap(), table);
+    assert_eq!(same_file(&restored, &table_obj), replaced.cloned == 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_a_placed_output_is_copied_never_linked() {
+    // A link to a file outside the run (say a cache rewritten in place):
+    // its bytes are backed up, but the store never shares its blocks.
+    let e = env();
+    let outside = e.data.join("cache/x.parquet");
+    let table: Vec<u8> = (0..2 * MIB).map(|i| (i % 241) as u8).collect();
+    write(&outside, &table);
+    let run = e.data.join("pipeline_run=2");
+    std::fs::create_dir_all(&run).unwrap();
+    std::os::unix::fs::symlink(&outside, run.join("link.parquet")).unwrap();
+    let report = folder::push(&e.remote, &run, &place_opts("runs/2")).unwrap();
+    assert_eq!((report.uploaded, report.linked, report.cloned), (1, 0, 0));
+    let object = object_file(&e.store, &table);
+    assert_eq!(std::fs::read(&object).unwrap(), table);
+    assert!(!same_file(&object, &outside));
 }
 
 #[test]

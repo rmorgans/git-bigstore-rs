@@ -13,14 +13,20 @@
     changes is `Error::OutputChanged` once the retries run out ("… changed
     while being hashed"). Each object the store lacks is created as a new
     file (`<name>#<random>`, `O_CREAT | O_EXCL`) beside its name: a
-    reflink of the working file (macOS `clonefile`, Linux `FICLONE`,
-    Windows ReFS block cloning, through `reflink-copy`) when it is at least
-    `min_bytes`, else a hard link, else a copy; smaller files are copied.
-    The new file is read back and checked against the digest (a file that
-    changed since is `Error::OutputChanged`, other bytes `Error::Integrity`),
-    then renamed into place without replacing anything: an object already
-    there is left alone. Nothing is ever cloned into an existing or
-    truncated file.
+    reflink of the working file (macOS `clonefile` and Windows ReFS block
+    cloning through `reflink-copy`; Linux `FICLONE` called directly, with
+    no chmod after it, so on an ACL dataset that refuses chmod the clone
+    keeps its ACL mode) when it is at least `min_bytes`, else a hard
+    link, else a copy; smaller files are copied, and so is a symlink
+    inside the output (its target's bytes, never linked). Whatever a
+    failed method leaves at the temp name is removed before the next is
+    tried. The new file is read back and checked against the digest (a
+    file that changed since is `Error::OutputChanged`, other bytes
+    `Error::Integrity`), then renamed into place without replacing
+    anything: an object already there is left alone. Nothing is ever
+    cloned into an existing or truncated file. On Windows a clone's
+    read-only attribute is cleared (the temp is ours), and a read-only
+    working file is copied rather than hard-linked.
   - pull places each object from the store into a new temp file beside its
     target the same way (an executable is always copied), reads it back,
     checks it, and renames it into place under the usual overwrite rules.
@@ -38,20 +44,27 @@
   ETag is the object's md5: that proves the write, and every later S3
   scrub proves the object from the listing alone. Before, `put_file` went
   multipart above 10 MiB and `replace` above 10 MiB. A PUT holds the
-  object in memory, one per job. Larger objects go multipart, are read
-  back whole after writing, and are read whole on every S3 scrub (their
-  ETag never is their md5). `put_file` now checks its writes as `replace`
-  does: an ETag that is not the md5 of the bytes sent (a `LocalFileSystem`
-  store's never is) means a read back, and a read back that is not those
-  bytes is `folder::Error::WriteUnverified`, one that fails
+  object in memory; the bodies bigstore reads into memory for single PUTs
+  share one budget of `SINGLE_PUT_MAX` bytes across the process, so small
+  objects go up side by side and large ones one after another, whatever
+  the job count (peak about 1 GiB). Larger objects go multipart (from a
+  file, or from `Source::Bytes` a part at a time), are read back whole
+  after writing, and are read whole on every S3 scrub (their ETag never
+  is their md5). `put_file` and `Store::put` (manifests, history records)
+  now check their writes as `replace` does: an ETag that is not the md5
+  of the bytes sent (a `LocalFileSystem` store's never is) means a read
+  back, and a read back that is not those bytes is
+  `folder::Error::WriteUnverified`, one that fails
   `folder::Error::Unreadable`. An `rclone://` upload is unchanged.
 - **A file system that refuses `chmod` with `EPERM` keeps its own mode.**
   Where bigstore sets the mode of a file it just created (a `.dvc`, a
-  pulled file, a file received by the exchange) or makes a pulled file
-  executable, `EPERM` leaves the mode the file system gave it (a TrueNAS
-  NFSv4-ACL dataset with `aclmode=restricted`, as an SMB share, refuses
-  every `chmod` and gives new files their mode by ACL), so a store can
-  live there. Every other error still fails.
+  pulled file, a file received by the exchange), `EPERM` leaves the mode
+  the file system gave it (a TrueNAS NFSv4-ACL dataset with
+  `aclmode=restricted`, as an SMB share, refuses every `chmod` and gives
+  new files their mode by ACL), so a store can live there. Making an
+  existing pulled file executable tolerates `EPERM` only when this user
+  owns the file (otherwise `EPERM` means it is someone else's, and still
+  fails). Every other error still fails.
 
 ## 0.6.0 — 2026-10-01
 

@@ -123,14 +123,16 @@ fn try_snapshot(
     }))
 }
 
-/// A file hashed where it is, with no copy: its digest, and the length and
-/// modification time it had both before and after it was read.
+/// A file hashed where it is, with no copy: its digest, the length and
+/// modification time it had both before and after it was read, and
+/// whether the path is a symlink (read through).
 #[derive(Debug, Clone)]
 pub struct InPlace {
     path: PathBuf,
     md5: Hexdigest,
     stamp: Stamp,
     unterminated_line: bool,
+    symlink: bool,
 }
 
 impl InPlace {
@@ -151,6 +153,12 @@ impl InPlace {
         self.unterminated_line
     }
 
+    /// The path is a symlink, hashed through: its target may be anything
+    /// anywhere, so it is never linked, only copied.
+    pub fn symlink(&self) -> bool {
+        self.symlink
+    }
+
     /// Whether the file still has the length and modification time it had
     /// when hashed.
     pub fn unchanged(&self) -> std::result::Result<bool, SnapshotError> {
@@ -168,6 +176,20 @@ impl InPlace {
 /// restarts). Meant for write-once files: nothing protects the bytes
 /// between this and their use, so whoever uses them checks them again.
 pub fn hash_in_place(path: &Path) -> std::result::Result<InPlace, SnapshotError> {
+    let symlink = match std::fs::symlink_metadata(path) {
+        Ok(m) => m.file_type().is_symlink(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SnapshotError::Changed(format!(
+                "{} disappeared while being read",
+                path.display()
+            )))
+        }
+        Err(e) => {
+            return Err(SnapshotError::Io(
+                anyhow::Error::from(e).context(format!("failed to stat {}", path.display())),
+            ))
+        }
+    };
     let before = stamp(path)?;
     let mut source = open(path)?;
     let read = read_all(&mut source, |_| Ok(()))
@@ -184,6 +206,7 @@ pub fn hash_in_place(path: &Path) -> std::result::Result<InPlace, SnapshotError>
         md5: read.md5,
         stamp: after,
         unterminated_line: read.unterminated_line,
+        symlink,
     })
 }
 

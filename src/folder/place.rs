@@ -27,9 +27,10 @@ pub enum Link {
     /// hashes each file where it is and places it into the store, and pull
     /// places each object from the store into the output, with no second
     /// copy. Files of at least `min_bytes` are placed as a reflink, else a
-    /// hard link, else a copy; smaller ones are copied. A hard link shares
-    /// the file: writing the working file afterwards changes the store's
-    /// object, which a scrub then finds damaged.
+    /// hard link, else a copy; smaller ones are copied, and so is a symlink
+    /// inside the output (its target's bytes: it may point at any file).
+    /// A hard link shares the file: writing the working file afterwards
+    /// changes the store's object, which a scrub then finds damaged.
     Place { min_bytes: u64 },
 }
 
@@ -104,9 +105,32 @@ struct Ops {
 }
 
 const OS: Ops = Ops {
-    reflink: |from, to| reflink_copy::reflink(from, to),
+    reflink,
     hard_link: |from, to| std::fs::hard_link(from, to),
 };
+
+/// A reflink of `from` as the new file `to`: `FICLONE` into a file created
+/// here, and nothing else. No mode is copied or set, so the clone keeps the
+/// mode the file system gives a new file (an NFSv4 ACL that refuses every
+/// chmod gives it its own).
+#[cfg(target_os = "linux")]
+fn reflink(from: &Path, to: &Path) -> io::Result<()> {
+    let src = File::open(from)?;
+    let dest = File::options().write(true).create_new(true).open(to)?;
+    if let Err(e) = rustix::fs::ioctl_ficlone(&dest, &src) {
+        drop(dest);
+        let _ = discard(to);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// A reflink of `from` as the new file `to`: `clonefile` on macOS (which
+/// makes `to` atomically, or nothing), block cloning on Windows ReFS.
+#[cfg(not(target_os = "linux"))]
+fn reflink(from: &Path, to: &Path) -> io::Result<()> {
+    reflink_copy::reflink(from, to)
+}
 
 fn beside_with(src: &Path, dir: &Path, prefix: &str, link: bool, ops: &Ops) -> Result<Placed> {
     let src = std::fs::canonicalize(long_path(src)?)
@@ -142,19 +166,25 @@ fn beside_with(src: &Path, dir: &Path, prefix: &str, link: bool, ops: &Ops) -> R
 }
 
 /// Create `to`, which must not exist, from `from`. An error of kind
-/// `AlreadyExists` makes `make_in` try another name; nothing is left at
-/// `to` after any other error.
+/// `AlreadyExists` makes `make_in` try another name. After any other
+/// error, whatever a method left at `to` is removed before the next is
+/// tried (`to` did not exist before, so it is ours), so a failed attempt
+/// never turns the next one into `AlreadyExists`; if it cannot be
+/// removed, placing stops with that error. A new file is never read-only
+/// (see [`writable`]).
 fn create(from: &Path, to: &Path, link: bool, ops: &Ops) -> io::Result<Method> {
     if link {
-        match (ops.reflink)(from, to) {
+        match (ops.reflink)(from, to).and_then(|()| writable(to)) {
             Ok(()) => return Ok(Method::Cloned),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
-            Err(_) => {}
+            Err(_) => discard(to)?,
         }
-        match (ops.hard_link)(from, to) {
-            Ok(()) => return Ok(Method::Linked),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
-            Err(_) => {}
+        if hard_linkable(from) {
+            match (ops.hard_link)(from, to) {
+                Ok(()) => return Ok(Method::Linked),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+                Err(_) => discard(to)?,
+            }
         }
     }
     let mut source = File::open(from)?;
@@ -162,10 +192,57 @@ fn create(from: &Path, to: &Path, link: bool, ops: &Ops) -> io::Result<Method> {
     let copied = io::copy(&mut source, &mut copy).and_then(|_| copy.sync_all());
     if let Err(e) = copied {
         drop(copy);
-        let _ = std::fs::remove_file(to);
+        let _ = discard(to);
         return Err(e);
     }
     Ok(Method::Copied)
+}
+
+/// Remove what a failed method left at `to`, if anything. A failure to
+/// remove it is never `AlreadyExists`, so it stops `make_in`.
+fn discard(to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    let _ = writable(to);
+    match std::fs::remove_file(to) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io::Error::other(format!(
+            "cannot remove a failed placement: {e}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// On Windows, clear the read-only attribute a clone copied from its
+/// source (reflink-copy copies it), so the temp file can be removed if it
+/// is refused, and renamed over a target. A no-op elsewhere: a unix mode
+/// does not stop the owner removing or renaming a file.
+fn writable(to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut perms = std::fs::metadata(to)?.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(to, perms)?;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = to;
+    Ok(())
+}
+
+/// Whether `from` may be hard-linked. On Windows a read-only file is not:
+/// its link would be read-only too, and clearing that would change the
+/// working file, so a refused temp could not be removed. It is copied.
+fn hard_linkable(from: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        std::fs::metadata(from).is_ok_and(|m| !m.permissions().readonly())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = from;
+        true
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -241,5 +318,61 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
             assert_eq!(std::fs::read(&taken).unwrap(), b"old");
         }
+    }
+
+    /// A method that leaves a file at `to` and then fails, as reflink-copy
+    /// did on Linux when its chmod after the clone was refused.
+    fn leaves_and_fails(_: &Path, to: &Path) -> io::Result<()> {
+        std::fs::write(to, b"partial")?;
+        Err(io::Error::from_raw_os_error(1))
+    }
+
+    /// The files in `dir` other than `keep`.
+    fn others(dir: &Path, keep: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p != keep)
+            .collect()
+    }
+
+    #[test]
+    fn what_a_failed_method_leaves_is_removed_before_the_next_is_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("table.parquet");
+        std::fs::write(&src, b"PAR1 rows").unwrap();
+        let to = dir.path().join("to");
+
+        // Reflink leaves a file and fails: the hard link still lands.
+        let ops = Ops {
+            reflink: leaves_and_fails,
+            ..OS
+        };
+        assert_eq!(create(&src, &to, true, &ops).unwrap(), Method::Linked);
+        assert_eq!(others(dir.path(), &src), vec![to.clone()]);
+        std::fs::remove_file(&to).unwrap();
+
+        // Both links leave a file and fail: the copy lands, alone.
+        let ops = Ops {
+            reflink: leaves_and_fails,
+            hard_link: leaves_and_fails,
+        };
+        assert_eq!(create(&src, &to, true, &ops).unwrap(), Method::Copied);
+        assert_eq!(others(dir.path(), &src), vec![to.clone()]);
+        assert_eq!(std::fs::read(&to).unwrap(), b"PAR1 rows");
+        std::fs::remove_file(&to).unwrap();
+
+        // Everything fails (a directory cannot be copied): nothing is left.
+        let not_a_file = dir.path().join("d");
+        std::fs::create_dir(&not_a_file).unwrap();
+        create(&not_a_file, &to, true, &ops).unwrap_err();
+        assert!(!to.exists());
+
+        // Through `beside`, one temp file and no retries.
+        let placed = beside_with(&src, dir.path(), "table.parquet#", true, &ops).unwrap();
+        assert_eq!(placed.method, Method::Copied);
+        let mut left = others(dir.path(), &src);
+        left.retain(|p| p != &not_a_file);
+        assert_eq!(left, vec![placed.tmp.path().to_path_buf()]);
     }
 }

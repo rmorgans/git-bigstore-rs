@@ -499,9 +499,10 @@ pub struct PushOptions {
     /// with no copy, and its length and modification time checked again
     /// after ([`Error::OutputChanged`] if they keep changing); each object
     /// the remote lacks is then created as a new file beside its name in
-    /// the store, by reflink, hard link or copy, read back, and renamed
-    /// into place without replacing anything (an object already there is
-    /// left alone). Only for a `local://` remote; any other is
+    /// the store, by reflink, hard link or copy (a symlink inside the
+    /// output always by copy of its target), read back, and renamed into
+    /// place without replacing anything (an object already there is left
+    /// alone). Only for a `local://` remote; any other is
     /// [`Refusal::PlaceNeedsLocalRemote`]. Status with it hashes in place
     /// too.
     pub link: Link,
@@ -1395,7 +1396,10 @@ fn place_object(
     std::fs::create_dir_all(long_path(dir)?)
         .with_context(|| format!("failed to create {}", dir.display()))?;
     let prefix = format!("{}#", name.to_string_lossy());
-    let placed = place::beside(file.path(), dir, &prefix, link.links(file.size()))?;
+    // A symlink inside the output may point at any file, one rewritten in
+    // place among them: its target's bytes are copied, never linked.
+    let links = link.links(file.size()) && !file.symlink();
+    let placed = place::beside(file.path(), dir, &prefix, links)?;
     if placed.md5 != *file.md5() || placed.size != file.size() {
         if !file.unchanged()? {
             return Err(Error::OutputChanged {
@@ -2352,16 +2356,17 @@ fn place(
 
 /// Give a file already in place, which a `.dvc` marks executable, the
 /// execute bits the umask allows, as a new executable would get. No-op off
-/// unix (no execute bit) or if the owner can already execute it; on an
-/// ACL-governed file system that refuses it, the file keeps its mode (see
-/// `mode`).
+/// unix (no execute bit) or if the owner can already execute it. On an
+/// ACL-governed file system that refuses it, a file this user owns keeps
+/// its mode; one owned by someone else still fails (see `mode`).
 fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let bits = std::fs::metadata(path)?.permissions().mode();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(path)?;
+        let bits = meta.permissions().mode();
         if bits & 0o100 == 0 {
-            mode::set_path_mode(path, bits | (0o111 & !current_umask()))
+            mode::set_path_mode(path, bits | (0o111 & !current_umask()), meta.uid())
                 .with_context(|| format!("failed to make {} executable", path.display()))?;
         }
     }
@@ -2382,6 +2387,112 @@ mod tests {
         let dir = snapshot_tmpdir().unwrap();
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
+
+    fn md5(bytes: &[u8]) -> Hexdigest {
+        crate::hash::hash_reader(&mut &bytes[..], crate::types::HashFunction::Md5).unwrap()
+    }
+
+    /// Where the object `md5` goes under `store`, and its key.
+    fn object_at(store: &Path, md5: &Hexdigest) -> (PathBuf, String) {
+        let key = Layout::default().object_key(md5).unwrap();
+        let mut path = store.to_path_buf();
+        path.extend(key.split('/'));
+        (path, key)
+    }
+
+    /// The names in `dir`, if it exists.
+    fn names(dir: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    const PLACE: Link = Link::Place { min_bytes: 0 };
+
+    #[test]
+    fn a_file_rewritten_after_it_was_hashed_is_never_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("table.parquet");
+        std::fs::write(&work, b"PAR1 aaaa").unwrap();
+        let hashed = snapshot::hash_in_place(&work).unwrap();
+        let (dest, key) = object_at(&dir.path().join("store"), hashed.md5());
+        let stamp = std::fs::metadata(&work).unwrap().modified().unwrap();
+
+        // Same length, mtime set back: only the read back can tell.
+        let rewrite = |bytes: &[u8], mtime| {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+            f.write_all(bytes).unwrap();
+            f.set_modified(mtime).unwrap();
+        };
+        rewrite(b"PAR1 bbbb", stamp);
+        let err = place_object(&dest, &key, &hashed, PLACE).unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<Error>(), Some(Error::Integrity { key: k }) if *k == key),
+            "{err:#}"
+        );
+        assert!(names(dest.parent().unwrap()).is_empty());
+
+        // A stamp that moved: the file changed.
+        rewrite(b"PAR1 cccc", stamp + std::time::Duration::from_secs(10));
+        let err = place_object(&dest, &key, &hashed, PLACE).unwrap_err();
+        let Some(Error::OutputChanged { detail }) = err.downcast_ref::<Error>() else {
+            panic!("{err:#}")
+        };
+        assert_eq!(
+            *detail,
+            format!("{} changed while being placed", work.display())
+        );
+        assert!(names(dest.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn an_object_already_in_the_store_is_left_alone_and_the_temp_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("table.parquet");
+        std::fs::write(&work, b"PAR1 rows").unwrap();
+        let hashed = snapshot::hash_in_place(&work).unwrap();
+        let (dest, key) = object_at(&dir.path().join("store"), hashed.md5());
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"PAR1 rows").unwrap();
+        let before = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        assert_eq!(place_object(&dest, &key, &hashed, PLACE).unwrap(), None);
+        let name = dest.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(names(dest.parent().unwrap()), vec![name]);
+        let after = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_damaged_store_object_is_never_placed_into_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = md5(b"PAR1 rows");
+        let (source, key) = object_at(&dir.path().join("store"), &good);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"PAR1 rowz").unwrap();
+        let out = dir.path().join("out");
+        let target = out.join("table.parquet");
+        let places = [(target.clone(), Replace::Nothing)];
+        let err = place_linked(
+            &source,
+            &key,
+            &good,
+            &places,
+            WorktreeMode::Regular,
+            PLACE,
+            &Progress::default(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("integrity check failed"),
+            "{err:#}"
+        );
+        assert!(names(&out).is_empty(), "{:?}", names(&out));
     }
 
     const EACCES: i32 = 13;

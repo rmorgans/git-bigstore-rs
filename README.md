@@ -480,7 +480,8 @@ What it guarantees:
   remotes only). Push hashes each file where it is, with no snapshot, and
   places it into the store as a new file: a reflink (APFS `clonefile`,
   Linux `FICLONE` on btrfs, XFS or ZFS ≥ 2.2 with block cloning, ReFS)
-  when it is at least `min_bytes`, else a hard link, else a copy. Pull
+  when it is at least `min_bytes`, else a hard link, else a copy; a
+  symlink inside the output is always copied (its target's bytes). Pull
   places store objects into the output the same way. Every placed file is
   read back and checked before it gets its name, and nothing is ever
   cloned into an existing file. A hard link is one file under two names:
@@ -489,7 +490,9 @@ What it guarantees:
 - **Uploads are checked.** Objects up to 1 GiB go up in one PUT, whose S3
   ETag is their md5: that proves the write, and later scrubs prove the
   object from the listing alone. Larger objects go up in parts and are
-  read back whole, after the upload and on every S3 scrub.
+  read back whole, after the upload and on every S3 scrub. A single PUT
+  holds its object in memory; all of them share a 1 GiB budget per
+  process, so a push needs about 1 GiB of RAM at most, whatever `--jobs`.
 - **History without git.** Every push that changes an output records a
   version under `bigstore-history/<key>/` on the remote; a push that changes
   nothing adds nothing. History is a graph, not a timeline: each version
