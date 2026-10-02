@@ -27,7 +27,7 @@
 //! same store (time as `20261001T120000.123456789Z`): a [`Kind::Other`]
 //! key, which no scrub, listing or transfer touches.
 //!
-//! Objects up to [`SINGLE_PUT_MAX`](backend::SINGLE_PUT_MAX) (1 GiB) are
+//! Objects up to [`SINGLE_PUT_MAX`](backend::SINGLE_PUT_MAX) (4 GiB) are
 //! written with one PUT, so on S3 their ETag is their md5 and a scrub
 //! proves them from the listing alone. A larger object goes up in parts:
 //! its ETag never is its md5, so it is read back whole when written and
@@ -116,7 +116,7 @@ impl Unreadable {
 /// manifests whose listed ETag is their name's md5 are good unread, unless
 /// `opts.deep`; every other file (records, any other ETag, none) is read
 /// and checked against its name. So on S3 an object written by multipart
-/// upload (over 1 GiB, [the module docs](self)) is read whole on every
+/// upload (over 4 GiB, [the module docs](self)) is read whole on every
 /// scrub. A listing that fails is the error; a file that fails is
 /// [`Unreadable`] in the report. Reads only.
 pub fn scrub(store: &dyn ObjectStore, opts: &ScrubOptions) -> Result<ScrubReport> {
@@ -302,7 +302,7 @@ pub enum Replaced {
 /// [quarantine](self) first (on a `LocalFileSystem`, a hard link: the
 /// store must be on a filesystem that has them). Then `source` replaces it
 /// in one atomic write (on a `LocalFileSystem`, a temp file renamed over
-/// the name): one PUT up to 1 GiB, held in memory meanwhile within the
+/// the name): one PUT up to 4 GiB, held in memory meanwhile within the
 /// process's single-PUT budget ([`SINGLE_PUT_MAX`]), else a multipart
 /// upload, streamed from a file or sent from `Source::Bytes` a part at a
 /// time ([the module docs](self)). Last, the write is checked: an ETag
@@ -708,7 +708,7 @@ mod tests {
         format!("files/md5/{}/{}", &md5[..2], &md5[2..])
     }
 
-    /// Sources over the single-PUT ceiling (1 MiB here, 1 GiB for real)
+    /// Sources over the single-PUT ceiling (1 MiB here, 4 GiB for real)
     /// go up in parts, checked as they go and read back after.
     const CEILING: u64 = 1 << 20;
 
