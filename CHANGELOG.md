@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.1 — 2026-10-02
+
+### Fixed
+
+- **S3 requests no longer end after 30 seconds.** object_store's default
+  request timeout runs from connecting to the end of the response body,
+  so 0.7.0's single PUTs (up to 1 GiB) and any large GET failed on an
+  ordinary uplink: at 85 Mbit/s about 320 MB fits in 30 s, less with jobs
+  sharing it. Every S3 client bigstore builds now allows six hours per
+  request and keeps the 5-second connect limit, with no per-read limit
+  (a PUT's response read waits for the whole upload). A caller that builds
+  its own client for large transfers needs the same.
+
+### Changed
+
+- **Single PUTs go up to 4 GiB** (`backend::SINGLE_PUT_MAX`, was 1 GiB),
+  inside the 5 GB that S3 and Wasabi document. Tracking runs write tables
+  of up to 2 GB; at 1 GiB those went multipart, whose ETag is never the
+  md5, so every S3 scrub read them back whole. The process-wide budget
+  for single-PUT bodies held in memory is the same 4 GiB, counted in MiB
+  units so it fits the semaphore.
+
 ## 0.7.0 — 2026-10-02
 
 ### Added

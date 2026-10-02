@@ -487,12 +487,15 @@ What it guarantees:
   cloned into an existing file. A hard link is one file under two names:
   write it in place and the store's object changes too (a scrub then finds
   it damaged), so use it only for files nothing rewrites.
-- **Uploads are checked.** Objects up to 1 GiB go up in one PUT, whose S3
+- **Uploads are checked.** Objects up to 4 GiB go up in one PUT, whose S3
   ETag is their md5: that proves the write, and later scrubs prove the
   object from the listing alone. Larger objects go up in parts and are
   read back whole, after the upload and on every S3 scrub. A single PUT
-  holds its object in memory; all of them share a 1 GiB budget per
-  process, so a push needs about 1 GiB of RAM at most, whatever `--jobs`.
+  holds its object in memory; all of them share a 4 GiB budget per
+  process, so a push needs about 4 GiB of RAM at most, whatever `--jobs`.
+  An S3 request may take up to six hours (object_store's default is 30
+  seconds, which a large single PUT or GET cannot meet); the 5-second
+  connect limit stays.
 - **History without git.** Every push that changes an output records a
   version under `bigstore-history/<key>/` on the remote; a push that changes
   nothing adds nothing. History is a graph, not a timeline: each version

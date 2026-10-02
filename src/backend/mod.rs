@@ -358,22 +358,30 @@ async fn rclone_into(
 /// Objects up to this size are written with one PUT, whose S3 ETag is the
 /// md5 of the bytes, so the write (and every later S3 scrub of it) is
 /// proven without reading it back; larger ones by multipart upload, read
-/// back whole after writing and on every S3 scrub. A PUT holds the object
-/// in memory, so this stays well below S3's 5 GiB limit, and the bodies of
-/// single PUTs that bigstore reads into memory (by
-/// [`Store::put_file`] and `folder::integrity::replace`) share one budget
-/// of this many bytes across the process, whatever the job count: small
-/// objects go up side by side, large ones one after another.
-pub const SINGLE_PUT_MAX: u64 = 1 << 30;
+/// back whole after writing and on every S3 scrub. 4 GiB stays clearly
+/// inside the single-PUT limit S3 and Wasabi document as 5 GB, and holds
+/// every table a tracking run writes (the largest seen is 2 GB). A PUT
+/// holds the object in memory, so the bodies of single PUTs that bigstore
+/// reads into memory (by [`Store::put_file`] and
+/// `folder::integrity::replace`) share one budget of this many bytes
+/// across the process, whatever the job count: small objects go up side by
+/// side, large ones one after another.
+pub const SINGLE_PUT_MAX: u64 = 4 << 30;
 
-/// The single-PUT budget: one permit per byte.
+/// The budget's unit: a permit stands for this many bytes of body, so the
+/// whole budget fits the semaphore's `u32` count.
+const BUDGET_UNIT: u64 = 1 << 20;
+
+/// The single-PUT budget: one permit per [`BUDGET_UNIT`] of body.
 static PUT_BUDGET: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(SINGLE_PUT_MAX as usize);
+    tokio::sync::Semaphore::const_new((SINGLE_PUT_MAX / BUDGET_UNIT) as usize);
 
 /// Room in the single-PUT budget for a body of `size` bytes (at most
-/// [`SINGLE_PUT_MAX`]), held until the permit drops.
+/// [`SINGLE_PUT_MAX`], rounded up to whole [`BUDGET_UNIT`]s), held until
+/// the permit drops.
 pub(crate) async fn put_budget(size: u64) -> tokio::sync::SemaphorePermit<'static> {
-    let permits = u32::try_from(size.min(SINGLE_PUT_MAX)).expect("1 GiB fits in u32");
+    let units = size.min(SINGLE_PUT_MAX).div_ceil(BUDGET_UNIT);
+    let permits = u32::try_from(units).expect("the budget's units fit in u32");
     PUT_BUDGET
         .acquire_many(permits)
         .await

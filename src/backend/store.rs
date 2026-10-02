@@ -26,6 +26,25 @@ fn cloud_crypto() -> Result<()> {
     Ok(())
 }
 
+/// The time limits for an S3 client that moves whole store files.
+///
+/// object_store's default request timeout is 30 seconds from connecting to
+/// the end of the response body, which a single PUT of up to
+/// [`SINGLE_PUT_MAX`](super::SINGLE_PUT_MAX), or a GET of a large object,
+/// cannot meet on an ordinary uplink (85 Mbit/s moves ~320 MB in 30 s, and
+/// jobs share it). The whole-request limit is therefore six hours, which a
+/// 4 GiB transfer meets at about 1.6 Mbit/s; the 5-second connect limit
+/// stays. No per-read limit is set: while a PUT body is being sent the
+/// response read waits for the whole upload, and a per-read limit would end
+/// a slow upload that is making progress. A transfer that stops making
+/// progress is ended by the connection itself or by cancelling the run.
+/// Every S3 client bigstore builds uses these limits.
+fn with_transfer_limits(builder: AmazonS3Builder) -> AmazonS3Builder {
+    use object_store::aws::AmazonS3ConfigKey as Key;
+    use object_store::ClientConfigKey;
+    builder.with_config(Key::Client(ClientConfigKey::Timeout), "6h")
+}
+
 /// Build an ObjectStore client from backend config. Used by both bigstore
 /// and the LFS transfer adapter.
 pub fn build_object_store(backend: &BackendConfig) -> Result<Box<dyn ObjectStore>> {
@@ -37,7 +56,8 @@ pub fn build_object_store(backend: &BackendConfig) -> Result<Box<dyn ObjectStore
             ..
         } => {
             cloud_crypto()?;
-            let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+            let mut builder =
+                with_transfer_limits(AmazonS3Builder::from_env()).with_bucket_name(bucket);
 
             if let Some(ep) = endpoint {
                 builder = builder
@@ -152,7 +172,7 @@ pub fn build_strict_s3(
         (Some(k), Some(s)) if !k.is_empty() && !s.is_empty() => (k, s),
         _ => return Err(super::Error::CredentialsMissing.into()),
     };
-    let mut builder = AmazonS3Builder::new()
+    let mut builder = with_transfer_limits(AmazonS3Builder::new())
         .with_bucket_name(bucket)
         .with_endpoint(endpoint)
         .with_virtual_hosted_style_request(false)
