@@ -792,6 +792,7 @@ mod tests {
         let remote = Remote {
             store: Store::from_object_store(store.clone()),
             prefix: String::new(),
+            local: None,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -910,6 +911,7 @@ mod tests {
                 Fault::Forbidden("InvalidObjectState"),
             ))),
             prefix: String::new(),
+            local: None,
         };
         let archived_key = |err: anyhow::Error| match err.downcast_ref::<Error>() {
             Some(Error::Archived { key }) => key.clone(),

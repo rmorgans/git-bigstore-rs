@@ -4,7 +4,7 @@
 use bigstore::dvc::{BigstoreMeta, DvcOutput, DvcPointer, Manifest, ManifestEntry, RecordId};
 use bigstore::folder::{
     self, layout, CancelToken, Credentials, Error as FolderError, Excludes, HistoryKey,
-    HistoryRecord, LogOptions, Overwrite, Phase, PointerSource, Progress, ProgressEvent,
+    HistoryRecord, Link, LogOptions, Overwrite, Phase, PointerSource, Progress, ProgressEvent,
     PullOptions, PushOptions, Pushed, Refusal, Remote, RemoteConfig, Resolve, Selector, SyncState,
 };
 use bigstore::hash::{hash_file, hash_reader};
@@ -4110,4 +4110,174 @@ fn a_record_under_parents_its_bytes_do_not_name_does_not_verify() {
         matches!(folder_error(&err), FolderError::InvalidStoreKey { .. }),
         "{err:#}"
     );
+}
+
+// ──────────────────────────────────────────────────
+// Single storage: Link::Place
+// ──────────────────────────────────────────────────
+
+const MIB: usize = 1 << 20;
+
+fn place_opts(key: &str) -> PushOptions {
+    PushOptions {
+        link: Link::Place {
+            min_bytes: MIB as u64,
+        },
+        ..opts(key)
+    }
+}
+
+/// Where the object holding `bytes` lives in a local store.
+#[cfg(unix)]
+fn object_file(store: &Path, bytes: &[u8]) -> PathBuf {
+    let md5 = hash_reader(&mut &bytes[..], HashFunction::Md5).unwrap();
+    let md5 = md5.to_string();
+    store.join("files/md5").join(&md5[..2]).join(&md5[2..])
+}
+
+/// Whether `a` and `b` are one file (a hard link), by inode.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a).unwrap(), std::fs::metadata(b).unwrap());
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
+/// A run directory: one table of 2 MiB (linked) and a small product file
+/// (copied).
+fn run_dir(e: &Env) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    let run = e.data.join("pipeline_run=1");
+    let table: Vec<u8> = (0..2 * MIB).map(|i| (i % 251) as u8).collect();
+    let product = b"{\"tables\":[\"tracks\"]}\n".to_vec();
+    write(&run.join("tracks/part-0.parquet"), &table);
+    write(&run.join("product.json"), &product);
+    (run, table, product)
+}
+
+#[cfg(unix)]
+#[test]
+fn place_links_large_files_into_the_store_and_back_and_copies_small_ones() {
+    let e = env();
+    let (run, table, product) = run_dir(&e);
+    let report = folder::push(&e.remote, &run, &place_opts("runs/1")).unwrap();
+    assert!(matches!(report.outcome, Pushed::Published { .. }));
+    assert_eq!((report.uploaded, report.linked), (2, 1));
+    let (table_obj, product_obj) = (
+        object_file(&e.store, &table),
+        object_file(&e.store, &product),
+    );
+    assert_eq!(std::fs::read(&table_obj).unwrap(), table);
+    assert_eq!(std::fs::read(&product_obj).unwrap(), product);
+    let working = run.join("tracks/part-0.parquet");
+    // A reflink is a file of its own; a hard link is the working file.
+    assert_eq!(same_file(&working, &table_obj), report.cloned == 0);
+    assert!(!same_file(&run.join("product.json"), &product_obj));
+    // No temp file is left beside the objects.
+    assert!(remote_keys(&e.store).iter().all(|k| !k.contains('#')));
+
+    let status = folder::status(&e.remote, &run, &place_opts("runs/1")).unwrap();
+    assert!(
+        matches!(status.sync, SyncState::InSync),
+        "{:?}",
+        status.sync
+    );
+    assert!(status.based);
+    let again = folder::push(&e.remote, &run, &place_opts("runs/1")).unwrap();
+    assert_eq!(again.outcome, Pushed::AlreadyLatest);
+    assert_eq!((again.uploaded, again.linked), (0, 0));
+
+    // Pull it elsewhere the same way.
+    let into = e.data.join("restored");
+    let pulled = folder::pull(
+        &e.remote,
+        &history("runs/1", Selector::Latest),
+        &PullOptions {
+            link: Link::Place {
+                min_bytes: MIB as u64,
+            },
+            ..pull_opts(Some(into.clone()))
+        },
+    )
+    .unwrap();
+    assert_eq!((pulled.written, pulled.linked), (2, 1));
+    assert_eq!(tree(&into), tree(&run));
+    let restored = into.join("tracks/part-0.parquet");
+    assert_eq!(same_file(&restored, &table_obj), pulled.cloned == 0);
+    assert!(!same_file(&into.join("product.json"), &product_obj));
+    let leftovers: Vec<_> = tree(&into)
+        .into_iter()
+        .filter(|(k, _)| k.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn a_placed_push_fails_when_a_file_keeps_changing_while_hashed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let e = env();
+    let file = e.data.join("growing.bin");
+    write(&file, &vec![0u8; 2 * MIB]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (file, stop) = (file.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                std::io::Write::write_all(&mut f, b"x").unwrap();
+            }
+        })
+    };
+    let result = folder::push(&e.remote, &file, &place_opts("ds/growing"));
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let err = result.unwrap_err();
+    let FolderError::OutputChanged { detail } = folder_error(&err) else {
+        panic!("{err:#}")
+    };
+    assert_eq!(
+        *detail,
+        format!("{} changed while being hashed", file.display())
+    );
+    assert!(!e.data.join("growing.bin.dvc").exists());
+    assert!(remote_keys(&e.store).is_empty());
+}
+
+#[test]
+fn place_needs_a_local_remote() {
+    let e = env();
+    let (run, _, _) = run_dir(&e);
+    // A `.dvc` to pull from, pushed to the local remote.
+    let _ = folder::push(&e.remote, &run, &opts("runs/1")).unwrap();
+    let s3 = Remote::open(&RemoteConfig {
+        url: "s3://bucket/dvc".into(),
+        endpoint: Some("http://127.0.0.1:9".into()),
+        region: Some("ap-southeast-2".into()),
+        credentials: Credentials::Static {
+            access_key_id: "k".into(),
+            secret_access_key: "s".into(),
+        },
+    })
+    .unwrap();
+    let errs = [
+        folder::push(&s3, &run, &place_opts("runs/1")).map(drop),
+        folder::status(&s3, &run, &place_opts("runs/1")).map(drop),
+        folder::pull(
+            &s3,
+            &PointerSource::File(e.data.join("pipeline_run=1.dvc")),
+            &PullOptions {
+                link: Link::Place { min_bytes: 0 },
+                ..pull_opts(Some(run.clone()))
+            },
+        )
+        .map(drop),
+    ];
+    for result in errs {
+        let err = result.unwrap_err();
+        let (path, reason) = refused(&err);
+        assert_eq!(*reason, Refusal::PlaceNeedsLocalRemote, "{err:#}");
+        assert_eq!(path, run);
+    }
 }

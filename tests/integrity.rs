@@ -205,7 +205,7 @@ fn bytes_that_are_not_what_the_key_names_are_refused_before_anything_is_written(
 }
 
 #[test]
-fn a_large_object_is_replaced_by_a_checked_multipart_upload() {
+fn a_file_over_the_old_part_size_replaces_an_object_in_one_checked_put() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("store");
     let big: Vec<u8> = (0..(11u32 << 20)).map(|i| (i % 251) as u8).collect();
@@ -453,8 +453,7 @@ enum Etags {
 /// with `short_from`, every read from that one on (counting from 0) ends
 /// half way through, the size reported unchanged; with `truncate`, the
 /// local store's root, every file read is truncated on disk to half its
-/// size once it is open; with `fail_part`, that multipart part (counting
-/// from 0) fails, every part taking 100 ms.
+/// size once it is open.
 #[derive(Debug)]
 struct EtagStore {
     inner: Box<dyn ObjectStore>,
@@ -462,8 +461,6 @@ struct EtagStore {
     corrupt: bool,
     short_from: Option<usize>,
     truncate: Option<std::path::PathBuf>,
-    fail_part: Option<usize>,
-    aborted: Arc<AtomicUsize>,
     md5s: Mutex<HashMap<StorePath, String>>,
     gets: AtomicUsize,
 }
@@ -480,8 +477,6 @@ impl EtagStore {
             corrupt: false,
             short_from: None,
             truncate: None,
-            fail_part: None,
-            aborted: Arc::default(),
             md5s: Mutex::default(),
             gets: AtomicUsize::new(0),
         }
@@ -551,15 +546,7 @@ impl ObjectStore for EtagStore {
         'l: 'a,
         Self: 'a,
     {
-        Box::pin(async move {
-            let inner = self.inner.put_multipart_opts(location, opts).await?;
-            Ok(Box::new(FailingUpload {
-                inner,
-                part: 0,
-                fail: self.fail_part,
-                aborted: Arc::clone(&self.aborted),
-            }) as Box<dyn MultipartUpload>)
-        })
+        self.inner.put_multipart_opts(location, opts)
     }
 
     fn get_opts<'s, 'l, 'a>(
@@ -666,50 +653,6 @@ impl ObjectStore for EtagStore {
             }
             Ok(())
         })
-    }
-}
-
-/// A multipart upload whose part `fail` fails; every part takes 100 ms.
-#[derive(Debug)]
-struct FailingUpload {
-    inner: Box<dyn MultipartUpload>,
-    part: usize,
-    fail: Option<usize>,
-    aborted: Arc<AtomicUsize>,
-}
-
-impl MultipartUpload for FailingUpload {
-    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
-        let fails = self.fail == Some(self.part);
-        self.part += 1;
-        let inner = self.inner.put_part(data);
-        Box::pin(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if fails {
-                return Err(object_store::Error::Generic {
-                    store: "test",
-                    source: "part failed".into(),
-                });
-            }
-            inner.await
-        })
-    }
-
-    fn complete<'s, 'a>(&'s mut self) -> BoxFut<'a, PutResult>
-    where
-        's: 'a,
-        Self: 'a,
-    {
-        self.inner.complete()
-    }
-
-    fn abort<'s, 'a>(&'s mut self) -> BoxFut<'a, ()>
-    where
-        's: 'a,
-        Self: 'a,
-    {
-        self.aborted.fetch_add(1, Ordering::SeqCst);
-        self.inner.abort()
     }
 }
 
@@ -888,34 +831,6 @@ fn a_local_file_cut_short_while_read_is_unreadable() {
         "{err:#}"
     );
     assert!(quarantined(&root).is_empty());
-}
-
-#[test]
-fn a_failed_part_ends_a_multipart_replace_with_an_error_and_an_abort() {
-    let tmp = tempfile::tempdir().unwrap();
-    // Six 10 MiB parts: more than the four in flight at once.
-    let big: Vec<u8> = (0..(55u32 << 20)).map(|i| (i % 251) as u8).collect();
-    let key = object_key(&big);
-    let source = tmp.path().join("good");
-    std::fs::write(&source, &big).unwrap();
-    let mut store = EtagStore::new(Etags::Missing);
-    put_raw(&store, &key, b"damaged");
-    store.fail_part = Some(1);
-    let store = Arc::new(store);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let replacing = Arc::clone(&store);
-    let (k, s) = (key.clone(), source.clone());
-    std::thread::spawn(move || {
-        tx.send(integrity::replace(&*replacing, &k, Source::File(s)))
-            .unwrap()
-    });
-    let result = rx
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("replace returned");
-    let err = result.unwrap_err();
-    assert!(format!("{err:#}").contains("part failed"), "{err:#}");
-    assert_eq!(store.aborted.load(Ordering::SeqCst), 1);
-    assert_eq!(get_raw(&store, &key), b"damaged");
 }
 
 #[test]

@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.7.0 — 2026-10-02
+
+### Added
+
+- **Single storage: `folder::Link`, on `PushOptions::link` and
+  `PullOptions::link`.** `Link::Copy` (the default) is 0.6's behaviour.
+  `Link::Place { min_bytes }`, for write-once files and a `local://`
+  remote, keeps no second copy:
+  - push (and status) hash each file where it is, with no snapshot, and
+    check its length and modification time again after: a file that
+    changes is `Error::OutputChanged` once the retries run out ("… changed
+    while being hashed"). Each object the store lacks is created as a new
+    file (`<name>#<random>`, `O_CREAT | O_EXCL`) beside its name: a
+    reflink of the working file (macOS `clonefile`, Linux `FICLONE`,
+    Windows ReFS block cloning, through `reflink-copy`) when it is at least
+    `min_bytes`, else a hard link, else a copy; smaller files are copied.
+    The new file is read back and checked against the digest (a file that
+    changed since is `Error::OutputChanged`, other bytes `Error::Integrity`),
+    then renamed into place without replacing anything: an object already
+    there is left alone. Nothing is ever cloned into an existing or
+    truncated file.
+  - pull places each object from the store into a new temp file beside its
+    target the same way (an executable is always copied), reads it back,
+    checks it, and renames it into place under the usual overwrite rules.
+  - `PushReport` and `PullReport` gain `linked` (files placed by reflink or
+    hard link) and `cloned` (of those, by reflink).
+  - Any other remote is `Error::Refused` with the new
+    `Refusal::PlaceNeedsLocalRemote`, before anything is written.
+- **`backend::SINGLE_PUT_MAX`** (1 GiB).
+
+### Changed
+
+- **Objects up to 1 GiB go up in one PUT, and every object write is
+  checked.** `Store::put_file` (folder push, `transfer`, the LFS adapter)
+  and `integrity::replace` write up to 1 GiB with one PUT, so on S3 the
+  ETag is the object's md5: that proves the write, and every later S3
+  scrub proves the object from the listing alone. Before, `put_file` went
+  multipart above 10 MiB and `replace` above 10 MiB. A PUT holds the
+  object in memory, one per job. Larger objects go multipart, are read
+  back whole after writing, and are read whole on every S3 scrub (their
+  ETag never is their md5). `put_file` now checks its writes as `replace`
+  does: an ETag that is not the md5 of the bytes sent (a `LocalFileSystem`
+  store's never is) means a read back, and a read back that is not those
+  bytes is `folder::Error::WriteUnverified`, one that fails
+  `folder::Error::Unreadable`. An `rclone://` upload is unchanged.
+- **A file system that refuses `chmod` with `EPERM` keeps its own mode.**
+  Where bigstore sets the mode of a file it just created (a `.dvc`, a
+  pulled file, a file received by the exchange) or makes a pulled file
+  executable, `EPERM` leaves the mode the file system gave it (a TrueNAS
+  NFSv4-ACL dataset with `aclmode=restricted`, as an SMB share, refuses
+  every `chmod` and gives new files their mode by ACL), so a store can
+  live there. Every other error still fails.
+
 ## 0.6.0 — 2026-10-01
 
 ### Added
